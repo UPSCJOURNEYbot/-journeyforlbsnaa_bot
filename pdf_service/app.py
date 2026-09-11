@@ -41,7 +41,7 @@ logger = logging.getLogger("pdf_service")
 MAX_QUESTIONS = 2000
 MAX_OPTIONS = 10
 MIN_OPTIONS = 2
-MAX_BODY_BYTES = 12 * 1024 * 1024
+MAX_BODY_BYTES = 20 * 1024 * 1024  # room for base64 logo/watermark images
 MAX_ACTIVE_JOBS = 8
 MAX_STORED_JOBS = 500
 RENDER_WORKERS = 2
@@ -95,6 +95,10 @@ class GenerateIn(BaseModel):
     exam_title: str = Field(default="Mock Test", max_length=400)
     solution_display: str = Field(default="end", max_length=20)
     quiz_names: list[str] = Field(default_factory=list, max_length=50)
+    # Phase 4 M2: optional /newseries setup (identification, candidates,
+    # branding, watermark, key/solutions/visuals, marks). Absent/empty
+    # keeps the historical rendering untouched.
+    series_setup: dict = Field(default_factory=dict)
     # NOTE: the bot also sends "async": true -- accepted and ignored
     # (generation here is always asynchronous).
 
@@ -246,6 +250,7 @@ def _run_render(job_id: str, payload: dict) -> None:
             tagline=payload.get("tagline") or "Test Series",
             quiz_names=payload.get("quiz_names") or [],
             solution_display=payload.get("solution_display") or "end",
+            series_setup=payload.get("series_setup") or None,
             output_path=tmp_path,
             progress_cb=_progress,
         )

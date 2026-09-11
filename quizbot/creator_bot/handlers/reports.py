@@ -97,14 +97,17 @@ def _parse_testseries_args(raw: str) -> tuple[str, str, list[str]]:
 
 def _build_testseries_payload(quizzes: list[dict], mode: str, title: str, *,
                               institute_name: str | None = None,
-                              tagline: str | None = None) -> dict:
+                              tagline: str | None = None,
+                              series_setup: dict | None = None) -> dict:
     """Build the /api/generate JSON payload from validated quiz dicts.
 
     Pure helper (no network): skips questions without options, passes the
     correct answer id(s) through verbatim, and maps the bot's mode onto the
     service's `solution_display` contract ("inline" | "end"). The optional
     overrides only fill existing contract fields (used by /newseries);
-    omitting them keeps the historical defaults.
+    omitting them keeps the historical defaults. `series_setup` (also
+    /newseries only) is embedded verbatim when given; legacy callers omit
+    it and get the historical payload shape untouched.
     """
     questions_payload = []
     for quiz in quizzes:
@@ -123,7 +126,7 @@ def _build_testseries_payload(quizzes: list[dict], mode: str, title: str, *,
     if not questions_payload:
         raise RuntimeError("No usable questions (with options) found in the given quiz(es).")
 
-    return {
+    payload = {
         "questions_json": questions_payload,
         "institute_name": institute_name or "Quiz Creator",
         "tagline": tagline or "Test Series",
@@ -132,20 +135,27 @@ def _build_testseries_payload(quizzes: list[dict], mode: str, title: str, *,
         "quiz_names": [str(q.get("quiz_name") or q.get("qid") or "") for q in quizzes],
         "async": True,
     }
+    if series_setup is not None:
+        payload["series_setup"] = series_setup
+    return payload
 
 
 async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll_timeout: int = 180,
                                 tagline: str | None = None,
-                                institute_name: str | None = None) -> bytes:
+                                institute_name: str | None = None,
+                                series_setup: dict | None = None) -> bytes:
     """Delegate PDF rendering to the external microservice at
     `config.PDF_API_BASE`. Raises RuntimeError on any failure.
 
     `tagline` (used only by the direct-file flow) overrides the cover
     tagline; None keeps the default "Test Series". `institute_name`
     (used only by /newseries) overrides the cover institute line; None
-    keeps the default "Quiz Creator".
+    keeps the default "Quiz Creator". `series_setup` (also /newseries
+    only) carries the full wizard configuration to the renderer; None
+    keeps the historical request shape untouched.
     """
-    payload = _build_testseries_payload(quizzes, mode, title)
+    payload = _build_testseries_payload(quizzes, mode, title,
+                                        series_setup=series_setup)
     if tagline is not None:
         payload["tagline"] = tagline
     if institute_name is not None:

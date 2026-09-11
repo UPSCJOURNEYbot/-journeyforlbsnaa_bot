@@ -29,10 +29,18 @@ Base URL = value of `PDF_API_BASE` (trailing slash tolerated).
 - `correct_option_id` may be an int or a list (multi-correct renders as "A, C").
 - Visible branding is always **Journey for लबासना** (Hindi brand name); the
   payload's `institute_name` is accepted but does not override the brand.
+- Optional `series_setup` object (sent only by `/newseries`): applies the
+  wizard configuration to the PDF — test identification grid (subject,
+  paper, test/booklet numbers, test code, duration, totals, marks),
+  candidate-detail boxes, cover institute name + logo, per-page watermark
+  (`none` | `text` | `image` | `both`; images as base64, job-scoped, never
+  public), answer-key / detailed-solutions toggles, and visual-aids mode
+  (`auto` | `yes` | `no`). Unknown or mistyped values fall back to the
+  historical rendering; the field is omitted entirely by `/testseries`.
 
 ## Limits & safety
 
-- Max 2000 questions / 2–10 options per question / 12 MB request body.
+- Max 2000 questions / 2–10 options per question / 20 MB request body (headroom for base64 logo/watermark images).
 - At most 8 concurrent active jobs (`429` beyond that — the bot shows a clean
   "retry shortly" error); 2 render workers.
 - Job IDs are allow-listed (`[A-Za-z0-9_-]{8,64}`) and resolved inside

@@ -12,8 +12,9 @@ branding, watermark, settings, marks, identity) into a structured
 :class:`TestSeriesConfig`, shows a final preview, and generates the PDF
 through the EXISTING pipeline (:func:`reports._build_testseries_payload`
 + :func:`reports._generate_pdf_via_api`). The ``/testseries`` QID flow and
-the direct-file flow are untouched; no PDF API contract change; no second
-polling client (wired through the existing creator bridge).
+the direct-file flow are untouched; the PDF API contract is extended only
+additively (optional ``series_setup``); no second polling client (wired
+through the existing creator bridge).
 
 UX rule: buttons for every Yes/No or predefined choice; free text only
 where the user must actually type something; uploads only for images/files.
@@ -22,6 +23,7 @@ where the user must actually type something; uploads only for images/files.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import re
 import time
@@ -253,6 +255,44 @@ def build_config(session: dict) -> TestSeriesConfig:
     cfg.total_questions = total
     cfg.max_marks = maximum
     return cfg
+
+
+def _b64_or_none(data: bytes | None) -> str | None:
+    if not data:
+        return None
+    return base64.b64encode(bytes(data)).decode("ascii")
+
+
+def build_series_setup(cfg: TestSeriesConfig, assets: dict) -> dict:
+    """Map the wizard config + session images to the PDF `series_setup`.
+
+    Pure helper (JSON-safe): automatic numbers with no typed value map to
+    "" (the renderer omits those rows); images travel as base64 and stay
+    job-scoped on the service (never written to public paths).
+    """
+    assets = assets or {}
+    test_no = cfg.test_number if cfg.test_number_mode == "manual" else ""
+    booklet_no = cfg.booklet_number if cfg.booklet_number_mode == "manual" else ""
+    return {
+        "subject": cfg.subject,
+        "test_number": test_no,
+        "booklet_series": cfg.booklet_series,
+        "booklet_number": booklet_no,
+        "paper": cfg.paper,
+        "test_code": cfg.test_code,
+        "duration": cfg.duration,
+        "marks_correct": cfg.marks_correct,
+        "marks_negative": cfg.marks_negative,
+        "candidate_fields": cfg.enabled_candidate_fields(),
+        "institute_name": cfg.institute_name,
+        "logo_b64": _b64_or_none(assets.get("logo")),
+        "watermark_mode": cfg.watermark_mode,
+        "watermark_text": cfg.watermark_text,
+        "wm_image_b64": _b64_or_none(assets.get("wm_image")),
+        "answer_key": cfg.answer_key,
+        "solutions": cfg.solutions,
+        "visuals": cfg.visuals,
+    }
 
 
 # ─── Session helpers ────────────────────────────────────────────────
@@ -1121,7 +1161,8 @@ async def _do_generate(c: Client, target, uid: int) -> None:
     try:
         pdf_bytes = await _generate_pdf_via_api(
             sess["quizzes"], "keyonly", cfg.title,
-            tagline=tagline, institute_name=cfg.institute_name.strip() or None)
+            tagline=tagline, institute_name=cfg.institute_name.strip() or None,
+            series_setup=build_series_setup(cfg, sess.get("assets", {})))
     except Exception as exc:
         logger.exception("newseries PDF generation failed")
         sess["step"] = "preview"
