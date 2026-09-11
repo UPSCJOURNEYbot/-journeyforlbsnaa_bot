@@ -104,6 +104,9 @@ async def cancel_cmd(c: Client, m: Message) -> None:
     elif uid in state.testseries_upload:
         state.testseries_upload.pop(uid, None)
         await m.reply("❌ Test-series upload cancelled.")
+    elif uid in state.testseries_create:
+        state.testseries_create.pop(uid, None)
+        await m.reply("❌ Test-series setup cancelled.")
     else:
         await m.reply("⚠️ Nothing to cancel.")
 

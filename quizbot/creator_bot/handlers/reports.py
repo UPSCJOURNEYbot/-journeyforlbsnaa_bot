@@ -95,12 +95,16 @@ def _parse_testseries_args(raw: str) -> tuple[str, str, list[str]]:
     return mode, title, quiz_ids
 
 
-def _build_testseries_payload(quizzes: list[dict], mode: str, title: str) -> dict:
+def _build_testseries_payload(quizzes: list[dict], mode: str, title: str, *,
+                              institute_name: str | None = None,
+                              tagline: str | None = None) -> dict:
     """Build the /api/generate JSON payload from validated quiz dicts.
 
     Pure helper (no network): skips questions without options, passes the
     correct answer id(s) through verbatim, and maps the bot's mode onto the
-    service's `solution_display` contract ("inline" | "end").
+    service's `solution_display` contract ("inline" | "end"). The optional
+    overrides only fill existing contract fields (used by /newseries);
+    omitting them keeps the historical defaults.
     """
     questions_payload = []
     for quiz in quizzes:
@@ -121,8 +125,8 @@ def _build_testseries_payload(quizzes: list[dict], mode: str, title: str) -> dic
 
     return {
         "questions_json": questions_payload,
-        "institute_name": "Quiz Creator",
-        "tagline": "Test Series",
+        "institute_name": institute_name or "Quiz Creator",
+        "tagline": tagline or "Test Series",
         "exam_title": title,
         "solution_display": "inline" if mode == "inline" else "end",
         "quiz_names": [str(q.get("quiz_name") or q.get("qid") or "") for q in quizzes],
@@ -131,16 +135,21 @@ def _build_testseries_payload(quizzes: list[dict], mode: str, title: str) -> dic
 
 
 async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll_timeout: int = 180,
-                                tagline: str | None = None) -> bytes:
+                                tagline: str | None = None,
+                                institute_name: str | None = None) -> bytes:
     """Delegate PDF rendering to the external microservice at
     `config.PDF_API_BASE`. Raises RuntimeError on any failure.
 
     `tagline` (used only by the direct-file flow) overrides the cover
-    tagline; None keeps the default "Test Series".
+    tagline; None keeps the default "Test Series". `institute_name`
+    (used only by /newseries) overrides the cover institute line; None
+    keeps the default "Quiz Creator".
     """
     payload = _build_testseries_payload(quizzes, mode, title)
     if tagline is not None:
         payload["tagline"] = tagline
+    if institute_name is not None:
+        payload["institute_name"] = institute_name
 
     base = config.PDF_API_BASE.rstrip("/")
     status, job = await request_json("POST", f"{base}/api/generate", json_body=payload)
