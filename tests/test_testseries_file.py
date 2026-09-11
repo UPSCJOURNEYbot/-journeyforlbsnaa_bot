@@ -837,5 +837,72 @@ class CancelCases(unittest.TestCase):
         self.assertTrue(any("Nothing to cancel" in t for _, t in bot2.sent), bot2.sent)
 
 
+class MdFormatCases(unittest.TestCase):
+    """Same parser contract through .md uploads (Format A/B)."""
+
+    def test_md_format_a(self):
+        r = tsf.process_testseries_upload(FORMAT_A.encode(), "questions.md")
+        self.assertTrue(r.ok, r.problems or r.error)
+        self.assertFalse(r.is_pdf)
+        self.assertEqual(len(r.questions), 1)
+        self.assertEqual(r.questions[0].correct_index, 1)
+
+    def test_md_format_b(self):
+        doc = (FORMAT_B + "\n" + FORMAT_B_TEXT_ANSWER).encode()
+        r = tsf.process_testseries_upload(doc, "questions.md")
+        self.assertTrue(r.ok, r.problems or r.error)
+        self.assertEqual([q.correct_index for q in r.questions], [2, 1])
+        self.assertIn("Extra details:", r.questions[0].explanation)
+
+    def test_md_uppercase_extension(self):
+        r = tsf.process_testseries_upload(FORMAT_A.encode(), "Qs.MD")
+        self.assertTrue(r.ok, r.problems or r.error)
+        self.assertEqual(len(r.questions), 1)
+
+
+class NumberedStatementsCases(unittest.TestCase):
+    """Numbered 1./2./3. statements stay in the stem, never become options."""
+
+    def test_format_a_with_statements(self):
+        text = (
+            "Q.1. Consider the following statements:\n"
+            "1. Statement one.\n2. Statement two.\n3. Statement three.\n"
+            "A) 1 only\nB) 1 and 2 only \u2705\nC) 2 and 3 only\nD) 1, 2 and 3\n"
+            "Ex: Both 1 and 2 are correct.\n"
+        )
+        r = tsf.parse_testseries_text(text)
+        self.assertTrue(r.ok, r.problems)
+        q = r.questions[0]
+        self.assertEqual(len(q.options), 4)
+        self.assertEqual(q.correct_index, 1)
+        self.assertIn("2. Statement two.", q.question)
+
+    def test_format_b_with_statements_and_bullets(self):
+        text = (
+            "Q26. Consider:\n1. First.\n2. Second.\n"
+            "a) Only 1\nb) Only 2\nc) Both 1 and 2\nd) Neither\n"
+            "Answer: c\nSolution: Both are right.\n"
+            "Extra details:\n\u2022 Asked in 2023.\n\u2022 Topic: Polity.\n"
+        )
+        r = tsf.parse_testseries_text(text)
+        self.assertTrue(r.ok, r.problems)
+        q = r.questions[0]
+        self.assertEqual(len(q.options), 4)
+        self.assertEqual(q.correct_index, 2)
+        self.assertIn("1. First.", q.question)
+        self.assertIn("\u2022 Topic: Polity.", q.explanation)
+
+    def test_validation_counts_are_explicit(self):
+        r = tsf.parse_testseries_text(FORMAT_A + "\n" + FORMAT_B)
+        prompt = tsf.render_config_prompt(r, "qs.txt")
+        self.assertIn("Answers detected: **2**", prompt)
+        self.assertIn("Solutions detected: **2**", prompt)
+        broken = tsf.parse_testseries_text(FORMAT_A + "\nQ.99. Missing?\nA) a\nB) b\n")
+        report = tsf.render_problem_report(broken, "qs.txt")
+        self.assertIn("Blocks found: **2**", report)
+        self.assertIn("Answers detected: **1**", report)
+        self.assertIn("Q99 \u2014 answer not detected", report)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

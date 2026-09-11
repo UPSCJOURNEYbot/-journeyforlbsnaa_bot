@@ -552,6 +552,8 @@ def render_problem_report(result: FileParseResult, filename: str) -> str:
         "",
         f"Blocks found: **{result.total_blocks}** • "
         f"Usable: **{len(result.questions)}** • "
+        f"Answers detected: **{len(result.questions)}** • "
+        f"Solutions detected: **{result.with_explanations}** • "
         f"Problems: **{len(result.problems)}**",
         "",
     ]
@@ -581,7 +583,8 @@ def render_config_prompt(result: FileParseResult, filename: str) -> str:
     return (
         f"✅ **File parsed: `{md_escape(filename)}`**\n\n"
         f"Questions: **{len(result.questions)}** • "
-        f"With explanations: **{result.with_explanations}** • "
+        f"Answers detected: **{len(result.questions)}** • "
+        f"Solutions detected: **{result.with_explanations}** • "
         f"Problems: **0**"
         + (f"\nPDF pages: **{result.pages}**" + (" (OCR read)" if result.ocr_used else "") if result.is_pdf else "")
         + "\n\nNow send the paper settings in ONE message:\n"
