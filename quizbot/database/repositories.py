@@ -973,6 +973,42 @@ class BatchRepository:
         return [_clean(r) async for r in cursor]
 
 
+class PodcastKeyRepository:
+    """Per-user podcast Gemini API keys, stored as encrypted blobs.
+
+    Only ciphertext ever touches this collection -- encryption and
+    decryption happen in quizbot.runner_bot.podcast_security, server-side.
+    One row per Telegram user (user_id unique). Existing collections and
+    documents are untouched.
+    """
+
+    def __init__(self, db: Database):
+        self.db = db
+        self.col = db.collection("podcast_keys")
+
+    async def get_encrypted(self, user_id: int) -> Optional[str]:
+        row = await self.col.find_one({"user_id": user_id}, {"enc_key": 1})
+        return row.get("enc_key") if row else None
+
+    async def has(self, user_id: int) -> bool:
+        return await self.col.count_documents({"user_id": user_id}, limit=1) > 0
+
+    async def save(self, user_id: int, enc_key: str) -> None:
+        await self.col.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {"enc_key": enc_key, "updated_at": _now_iso()},
+                "$setOnInsert": {"created_at": _now_iso()},
+            },
+            upsert=True,
+        )
+
+    async def delete(self, user_id: int) -> bool:
+        """Permanently remove a user's stored key. Returns True if one existed."""
+        res = await self.col.delete_one({"user_id": user_id})
+        return res.deleted_count > 0
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
