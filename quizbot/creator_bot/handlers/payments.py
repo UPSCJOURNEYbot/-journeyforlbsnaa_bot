@@ -22,7 +22,7 @@ from ..ratelimit import ratelimit
 
 logger = logging.getLogger(__name__)
 
-PAYMENT_SESSION_SECONDS = 900  # 15 minutes
+PAYMENT_SESSION_SECONDS = 24 * 60 * 60  # payment links can take longer than a short Telegram session
 
 # quantity choices offered per plan
 _QTY_CHOICES: dict[str, list[int]] = {
@@ -114,6 +114,23 @@ async def buy_plan_cb(c: Client, cq: CallbackQuery) -> None:
         "link_id": link.get("id", ""),
         "expires_at": int(time.time()) + PAYMENT_SESSION_SECONDS,
     }
+
+    # Persist the payment session before showing the link. The in-memory
+    # cache remains only as a fast-path; MongoDB is the source of truth so a
+    # bot restart cannot orphan a legitimate payment callback.
+    from quizbot.database import PaymentRepository, get_db
+    try:
+        await PaymentRepository(get_db()).create(
+            user_id=uid, amount=info["price"], plan_days=info["days"],
+            token=token, link_id=link.get("id", ""),
+            plan_label=f"{info['label']} x{qty}",
+            expires_at=state.pending_payments[token]["expires_at"],
+        )
+    except Exception:
+        state.pending_payments.pop(token, None)
+        logger.exception("Failed to persist payment session for uid=%s", uid)
+        await cq.message.edit_text("Could not start the payment session. Please try again later.")
+        return
 
     disc_line = (
         f"\nDiscount: **{info['discount_pct']}% off** (Rs.{info['original']} -> Rs.{info['price']})"

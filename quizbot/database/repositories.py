@@ -12,6 +12,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from pymongo import ReturnDocument
+
 from .db import Database
 
 
@@ -93,17 +95,36 @@ class UserRepository:
             return False
         return expiry > datetime.now(timezone.utc)
 
-    async def set_premium(self, chat_id: int, days: Optional[int] = 30) -> None:
+    async def set_premium(self, chat_id: int, days: Optional[int] = 30) -> Optional[str]:
+        """Grant/extend premium and return the resulting expiry timestamp.
+
+        Paid renewals extend an already-active subscription instead of
+        overwriting its remaining time. Permanent premium (days=None) remains
+        permanent. The calculation is done from the later of the existing
+        expiry and now, so expired subscriptions start from the current time.
+        """
         await self.get_or_create(chat_id)
-        premium_until = None
-        if days is not None:
-            premium_until = (datetime.now(timezone.utc) + timedelta(days=days)).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+        if days is None:
+            premium_until = None
+        else:
+            row = await self.col.find_one({"chat_id": chat_id}, {"premium_until": 1})
+            base = datetime.now(timezone.utc)
+            existing = row.get("premium_until") if row else None
+            if existing:
+                try:
+                    existing_dt = datetime.strptime(existing, "%Y-%m-%d %H:%M:%S").replace(
+                        tzinfo=timezone.utc
+                    )
+                    if existing_dt > base:
+                        base = existing_dt
+                except (TypeError, ValueError):
+                    pass
+            premium_until = (base + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
         await self.col.update_one(
             {"chat_id": chat_id},
             {"$set": {"is_premium": True, "premium_until": premium_until}},
         )
+        return premium_until
 
     async def revoke_premium(self, chat_id: int) -> None:
         await self.col.update_one(
@@ -158,6 +179,10 @@ class QuizRepository:
             "correct_marks": kwargs.get("correct_marks", 1),
             "shuffle_questions": bool(kwargs.get("shuffle_questions", False)),
             "shuffle_options": bool(kwargs.get("shuffle_options", False)),
+            "show_explanation": bool(kwargs.get("show_explanation", False)),
+            "html_report": bool(kwargs.get("html_report", False)),
+            "pdf_report": bool(kwargs.get("pdf_report", False)),
+            "fixed_settings": bool(kwargs.get("fixed_settings", False)),
             "edit_permissions": [],
             "promo_message": kwargs.get("promo_message"),
             "search_indexed": True,
@@ -176,6 +201,7 @@ class QuizRepository:
         allowed = {
             "quiz_name", "questions", "sections", "timer", "quiz_type",
             "negative_marks", "correct_marks", "shuffle_questions", "shuffle_options",
+            "show_explanation", "html_report", "pdf_report", "fixed_settings",
             "edit_permissions", "promo_message", "search_indexed",
         }
         if field not in allowed:
@@ -342,20 +368,60 @@ class PaymentRepository:
         self.db = db
         self.col = db.collection("payments")
 
-    async def create(self, user_id: int, amount: int, plan_days: Optional[int] = None) -> dict:
+    async def create(
+        self,
+        user_id: int,
+        amount: int,
+        plan_days: Optional[int] = None,
+        token: Optional[str] = None,
+        link_id: Optional[str] = None,
+        plan_label: Optional[str] = None,
+        expires_at: Optional[int] = None,
+    ) -> dict:
         doc = {
             "user_id": user_id,
             "amount": amount,
             "status": "created",
-            "payment_method": None,
+            "payment_method": "razorpay",
             "transaction_id": None,
             "plan_days": plan_days,
+            "token": token,
+            "link_id": link_id,
+            "plan_label": plan_label,
+            "expires_at": expires_at,
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
         result = await self.col.insert_one(doc)
         row = await self.col.find_one({"_id": result.inserted_id})
         return _clean(row)
+
+    async def get_by_token(self, token: str) -> Optional[dict]:
+        return _clean(await self.col.find_one({"token": token}))
+
+    async def claim_for_activation(self, token: str, user_id: int) -> Optional[dict]:
+        """Atomically reserve a verified paid payment for one activation."""
+        row = await self.col.find_one_and_update(
+            {"token": token, "user_id": user_id, "status": "paid"},
+            {"$set": {"status": "processing", "updated_at": _now_iso()}},
+            return_document=ReturnDocument.AFTER,
+        )
+        return _clean(row)
+
+    async def mark_activated(self, token: str, transaction_id: Optional[str] = None) -> None:
+        update = {"status": "activated", "updated_at": _now_iso()}
+        if transaction_id:
+            update["transaction_id"] = transaction_id
+        await self.col.update_one({"token": token}, {"$set": update})
+
+    async def mark_paid(self, token: str, transaction_id: Optional[str] = None) -> None:
+        update = {"status": "paid", "updated_at": _now_iso()}
+        if transaction_id:
+            update["transaction_id"] = transaction_id
+        await self.col.update_one(
+            {"token": token, "status": {"$in": ["created", "paid", "processing"]}},
+            {"$set": update},
+        )
 
     async def get_for_user(self, user_id: int) -> list[dict]:
         cursor = self.col.find({"user_id": user_id}).sort("created_at", -1)
@@ -471,7 +537,7 @@ class AttemptRepository:
         return _clean(row)
 
     async def update(self, attempt_id: str, **fields) -> None:
-        allowed = {"current_question", "answers", "score", "paused"}
+        allowed = {"current_question", "answers", "score", "correct", "wrong", "total_time", "paused"}
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
             return
@@ -501,7 +567,7 @@ class AttemptRepository:
                     {"$set": {"paused": False, "pause_time": None}},
                 )
 
-    async def complete(self, attempt_id: str, score: int, username: str) -> Optional[dict]:
+    async def complete(self, attempt_id: str, score: float, username: str) -> Optional[dict]:
         attempt = await self.get(attempt_id)
         if attempt is None:
             return None
@@ -533,6 +599,14 @@ class AttemptRepository:
         except Exception:
             pass  # unique(qid, user_id) -- first attempt only, ignore duplicates
         return await self.get(attempt_id)
+
+    async def latest_completed_for_user(self, user_id: int) -> Optional[dict]:
+        """Return the user's most recently completed quiz attempt."""
+        row = await self.col.find_one(
+            {"user_id": user_id, "status": "completed"},
+            sort=[("time_ended", -1)],
+        )
+        return _clean(row)
 
     async def list_completed(self, qid: str) -> list[dict]:
         """All completed attempts for a quiz, newest first (by time_ended).

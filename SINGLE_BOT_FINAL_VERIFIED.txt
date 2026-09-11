@@ -1,0 +1,2 @@
+Single Telegram bot / single PTB polling client. Creator functionality is bridged into the Runner application.
+Critical fix: cws_* Creator wizard callbacks run in priority group -2.

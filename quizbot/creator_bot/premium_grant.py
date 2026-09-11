@@ -17,7 +17,9 @@ IST_OFFSET = timedelta(hours=5, minutes=30)
 async def grant_and_notify(user_id: int, days: int) -> str:
     """Grant `days` of premium to `user_id` and return the expiry timestamp
     formatted for display, e.g. '22-Aug-2026 06:30 PM'."""
-    await grant_premium(user_id, days)
-    expiry_utc = datetime.now(timezone.utc) + timedelta(days=days)
+    expiry_text = await grant_premium(user_id, days)
+    if expiry_text is None:
+        return "Permanent"
+    expiry_utc = datetime.strptime(expiry_text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     expiry_ist = expiry_utc + IST_OFFSET
     return expiry_ist.strftime("%d-%b-%Y %I:%M %p")

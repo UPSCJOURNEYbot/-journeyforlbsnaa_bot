@@ -118,7 +118,7 @@ async def resolve_quiz_access(
 
     Returns (allowed, batch_info_or_None). When quiz is free, or the
     requesting chat is the quiz creator's own private chat, access is
-    always allowed. For paid quizzes in groups, only the *group's* chat_id
+    always allowed. For quizzes in groups, only the *group's* chat_id
     being directly authorised (via auth_chats or a batch) grants access --
     individual user membership never grants group-run rights.
     """

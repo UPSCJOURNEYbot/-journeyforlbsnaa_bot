@@ -103,101 +103,155 @@ _ABCD_RE = re.compile(r"^[A-Da-d]\)")
 
 
 def parse_question_block(blk: str) -> Optional[dict]:
-    """Parse one question block (separated by a blank line in a larger
-    paste) into {question, options, correct_option_id, explanation}.
+    """Parse a human-friendly MCQ block.
 
-    `correct_option_id` is an int (single ✅) or a list[int] (multiple ✅).
-    Returns None if the block doesn't parse into a valid question.
+    Accepted answers:
+      * an option already marked with ``✅``
+      * ``Answer: b`` / ``Answer: B`` / ``उत्तर: b``
+      * ``Answer: 2`` / ``Answer: (b)`` / ``Answer: B, D``
 
-    Newlines inside the question text (e.g. a passage followed by a blank
-    line, followed by the actual question) are preserved exactly -- only
-    the separator/option/marker lines used to structurally locate the
-    options are stripped away, never the blank lines a user typed on
-    purpose for spacing within the question itself.
+    Accepted option labels include A-D, a-d, 1-4 and unlabeled options.
+    ``Solution:``, ``Explanation:`` and ``Extra details:`` are ignored after
+    the answer/options section.  This deliberately keeps the importer
+    tolerant of AI-generated and exam-style question files.
     """
     blk = clean_markdown(blk)
-    # Keep blank lines here (structure-preserving) -- they're only used
-    # for splitting on the caller side (blocks separated by "\n\n"); a
-    # blank line *inside* one block is an intentional paragraph break in
-    # the question and must survive into the final `question` string.
-    all_lines = blk.split("\n")
-    if not any(ln.strip() for ln in all_lines):
+    lines = blk.splitlines()
+    if not any(x.strip() for x in lines):
         return None
 
-    exp = None
-    filtered = []
-    for ln in all_lines:
-        if ln.strip().startswith("Ex:"):
-            exp = ln.strip()[3:].strip()
-        else:
-            filtered.append(ln)
-    all_lines = filtered
+    answer_spec: Optional[str] = None
+    exp_lines: list[str] = []
+    in_explanation = False
+    content: list[str] = []
+    for ln in lines:
+        st = ln.strip()
+        if not st:
+            if in_explanation and exp_lines and exp_lines[-1] != "":
+                exp_lines.append("")
+            else:
+                content.append(ln)
+            continue
+        # Tolerate leading decoration (💡, ✅, •, …) before label lines such
+        # as "💡 Explanation:" as produced by quiz-report layouts.
+        st = re.sub(r"^\W+", "", st) or st
 
-    # Structural scan (separator / A-D markers) only ever needs to look at
-    # non-blank lines, but indexes must map back into `all_lines` so the
-    # split point doesn't chop a preserved blank line in half.
+        m = re.match(r'^(?:correct\s+answer|correct\s+option|answer|ans|उत्तर|सही\s+उत्तर)\s*[:：]\s*(.+)$', st, re.I)
+        if m:
+            answer_spec = m.group(1).strip()
+            in_explanation = False
+            continue
+
+        m = re.match(r'^(?:ex|explanation|solution|व्याख्या|समाधान)\s*[:：]\s*(.*)$', st, re.I)
+        if m:
+            first = m.group(1).strip()
+            if first:
+                exp_lines.append(first)
+            in_explanation = True
+            continue
+
+        if re.match(r'^(?:extra\s+details?|अतिरिक्त\s+जानकारी)\s*[:：]', st, re.I):
+            label, _, rest = st.partition(":")
+            if rest.strip():
+                exp_lines.append(rest.strip())
+            in_explanation = True
+            continue
+
+        if re.match(r'^(?:source|reference)\s*[:：]', st, re.I):
+            in_explanation = False
+            continue
+
+        if in_explanation:
+            exp_lines.append(st)
+        else:
+            content.append(ln)
+
+    exp = "\n".join(exp_lines).strip() or None
+
+    all_lines = content
     non_blank_idx = [i for i, ln in enumerate(all_lines) if ln.strip()]
     if not non_blank_idx:
         return None
 
-    sep_line_idx = None
-    for i in non_blank_idx:
-        if _line_is_emoji_separator(all_lines[i]):
-            sep_line_idx = i
-            break
+    # Find first option-looking line. This works for both A) and A. styles.
+    option_re = re.compile(r'^[A-Da-d]\s*[\).:-]\s*\S')
+    first_option_idx = next((i for i in non_blank_idx if option_re.match(all_lines[i].strip())), None)
+    sep_line_idx = next((i for i in non_blank_idx if _line_is_emoji_separator(all_lines[i])), None)
 
-    abcd_line_idx = None
-    for i in non_blank_idx:
-        if _ABCD_RE.match(all_lines[i].strip()):
-            abcd_line_idx = i
-            break
-
-    first_nonblank = non_blank_idx[0]
     if sep_line_idx is not None:
         q_lines = all_lines[:sep_line_idx]
         opt_lines = all_lines[sep_line_idx + 1:]
-    elif abcd_line_idx is not None and abcd_line_idx > first_nonblank:
-        q_lines = all_lines[:abcd_line_idx]
-        opt_lines = all_lines[abcd_line_idx:]
+    elif first_option_idx is not None and first_option_idx > non_blank_idx[0]:
+        q_lines = all_lines[:first_option_idx]
+        opt_lines = all_lines[first_option_idx:]
     else:
-        # No structural marker found -- fall back to "first non-blank line
-        # is the question, everything after is options" (matches the
-        # original single-line-question behaviour).
-        q_lines = all_lines[: first_nonblank + 1]
-        opt_lines = all_lines[first_nonblank + 1:]
+        # Standard four-space-indented options: first line is the question.
+        q_lines = all_lines[:non_blank_idx[0] + 1]
+        opt_lines = all_lines[non_blank_idx[0] + 1:]
 
-    # Trim only leading/trailing wholly-blank lines from the question (so
-    # e.g. a stray blank line right before the separator doesn't leave a
-    # trailing "\n"), but keep every blank line that falls *between* two
-    # real content lines -- that's the intentional paragraph break.
     while q_lines and not q_lines[0].strip():
-        q_lines = q_lines[1:]
+        q_lines.pop(0)
     while q_lines and not q_lines[-1].strip():
-        q_lines = q_lines[:-1]
-    question = _pad_table_blocks("\n".join(q_lines))
+        q_lines.pop()
+    question = _pad_table_blocks("\n".join(q_lines).strip())
 
     opts: list[str] = []
     coids: list[int] = []
+    label_to_index: dict[str, int] = {}
     for ln in opt_lines:
-        if not ln.strip():
+        st = ln.strip()
+        if not st:
             continue
-        ln = ln.strip()
-        ln = re.sub(r"^[A-Da-d]\)\s*", "", ln)
-        if "✅" in ln:
+        st = re.sub(r"^\W+", "", st) or st
+        if re.match(r'^(?:answer|ans|उत्तर|ex|explanation|solution|व्याख्या|समाधान|extra\s+details?|अतिरिक्त\s+जानकारी|source|reference)\s*[:：]', st, re.I):
+            break
+        label_match = re.match(r'^([A-Da-d]|[1-9][0-9]?)\s*[\).:-]\s*(.*)$', st)
+        if label_match:
+            label = label_match.group(1).upper()
+            text = label_match.group(2).strip()
+            # Some generators put a clean option list first and repeat the
+            # same option with a trailing ✅ later. Treat that as an answer
+            # marker rather than creating a fifth option.
+            if label in label_to_index:
+                existing = label_to_index[label]
+                if '✅' in text:
+                    coids.append(existing)
+                continue
+            label_to_index[label] = len(opts)
+        else:
+            text = st
+        if not text:
+            continue
+        if '✅' in text:
             coids.append(len(opts))
-            ln = ln.replace("✅", "").strip()
-        opts.append(ln)
+            text = text.replace('✅', '').strip()
+        opts.append(text)
 
+    # Resolve an explicit Answer: line only when no/insufficient checkmarks.
+    if answer_spec:
+        for token in re.split(r'\s*(?:,|/|\band\b|और)\s*', answer_spec, flags=re.I):
+            token = token.strip().strip('()[]{}').rstrip('.').strip()
+            if not token:
+                continue
+            normalized = re.sub(r'^(?:OPTION|CHOICE)\s*', '', token, flags=re.I)
+            normalized = re.sub(r'\s*(?:OPTION|CHOICE)$', '', normalized, flags=re.I).strip()
+            ordinal = re.match(r'^(\d+)(?:st|nd|rd|th)?\s*(?:OPTION|CHOICE)?$', normalized, re.I)
+            key = normalized.upper()
+            if key in label_to_index:
+                coids.append(label_to_index[key])
+                continue
+            if ordinal:
+                n = int(ordinal.group(1))
+                if 1 <= n <= len(opts):
+                    coids.append(n - 1)
+
+    # De-duplicate while preserving order; reject invalid answer markers.
+    coids = list(dict.fromkeys(i for i in coids if 0 <= i < len(opts)))
     if not question or len(opts) < 2 or not coids:
         return None
 
     coid = coids[0] if len(coids) == 1 else coids
-    return {
-        "question": question,
-        "options": opts,
-        "correct_option_id": coid,
-        "explanation": exp,
-    }
+    return {"question": question, "options": opts, "correct_option_id": coid, "explanation": exp}
 
 
 def filter_words(text: Optional[str], remove_words: list[str]) -> Optional[str]:

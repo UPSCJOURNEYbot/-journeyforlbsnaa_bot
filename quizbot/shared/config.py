@@ -46,8 +46,9 @@ def _env_int_list(key: str) -> list[int]:
 API_ID: int | None = _env_int("API_ID")
 API_HASH: str | None = _env("API_HASH")
 
-CREATOR_BOT_TOKEN: str | None = _env("CREATOR_BOT_TOKEN")
-RUNNER_BOT_TOKEN: str | None = _env("RUNNER_BOT_TOKEN")
+BOT_TOKEN: str | None = _env("BOT_TOKEN")
+CREATOR_BOT_TOKEN: str | None = _env("CREATOR_BOT_TOKEN") or BOT_TOKEN
+RUNNER_BOT_TOKEN: str | None = _env("RUNNER_BOT_TOKEN") or CREATOR_BOT_TOKEN or BOT_TOKEN
 
 # ---------------------------------------------------------------------------
 # Database (MongoDB Atlas -- a hosted database reachable over the network,
@@ -76,7 +77,7 @@ REQUIRED_SUB_CHANNEL: str | None = _env("REQUIRED_SUB_CHANNEL")
 # ---------------------------------------------------------------------------
 # Feature flags
 # ---------------------------------------------------------------------------
-FREE_BOT: bool = _env_bool("FREE_BOT", False)
+FREE_BOT: bool = _env_bool("FREE_BOT", True)
 
 # ---------------------------------------------------------------------------
 # Payments (Razorpay)
@@ -85,9 +86,9 @@ RAZORPAY_KEY_ID: str | None = _env("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET: str | None = _env("RAZORPAY_KEY_SECRET")
 
 PLANS: dict[str, dict] = {
-    "1_month": {"days": 30, "amount": _env_int("PLAN_1_MONTH_AMOUNT", 9900), "label": "1 Month"},
-    "3_month": {"days": 90, "amount": _env_int("PLAN_3_MONTH_AMOUNT", 24900), "label": "3 Months"},
-    "1_year": {"days": 365, "amount": _env_int("PLAN_1_YEAR_AMOUNT", 79900), "label": "1 Year"},
+    "1_month": {"days": 30, "amount": _env_int("PLAN_1_MONTH_AMOUNT", 99), "label": "1 Month"},
+    "3_month": {"days": 90, "amount": _env_int("PLAN_3_MONTH_AMOUNT", 249), "label": "3 Months"},
+    "1_year": {"days": 365, "amount": _env_int("PLAN_1_YEAR_AMOUNT", 799), "label": "1 Year"},
 }
 
 # ---------------------------------------------------------------------------
@@ -192,12 +193,11 @@ def validate(bot: str = "both") -> list[str]:
         if not CREATOR_BOT_TOKEN and not RUNNER_BOT_TOKEN:
             problems.append("CREATOR_BOT_TOKEN or RUNNER_BOT_TOKEN must be set (Mini App verifies initData against one of them)")
         return problems
-    if not API_ID or not API_HASH:
-        problems.append("API_ID / API_HASH are required (get them from my.telegram.org)")
-    if bot in ("creator", "both") and not CREATOR_BOT_TOKEN:
-        problems.append("CREATOR_BOT_TOKEN is not set")
-    if bot in ("runner", "both") and not RUNNER_BOT_TOKEN:
-        problems.append("RUNNER_BOT_TOKEN is not set")
+    # Single-bot architecture uses python-telegram-bot only. API_ID/API_HASH
+    # are retained for backward compatibility with older optional modules,
+    # but they are not required to run the Telegram bot.
+    if bot in ("creator", "runner", "both") and not (BOT_TOKEN or RUNNER_BOT_TOKEN or CREATOR_BOT_TOKEN):
+        problems.append("No Telegram bot token is set. Set BOT_TOKEN (or CREATOR_BOT_TOKEN/RUNNER_BOT_TOKEN) in .env")
     if not OWNER_ID:
         problems.append("OWNER_ID is not set (owner-only commands will be unreachable)")
     return problems

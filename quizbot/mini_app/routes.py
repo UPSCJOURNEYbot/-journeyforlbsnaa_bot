@@ -156,7 +156,7 @@ async def create_session(
     x_telegram_init_data: Optional[str] = Header(default=None, alias="X-Telegram-Init-Data"),
 ) -> dict:
     """Start a new play session for a quiz. Verifies identity, checks
-    access (paid-quiz auth/batch), then returns the session's public state
+    access (quiz auth/batch), then returns the session's public state
     plus the per-session decryption key -- everything AFTER this point uses
     that key."""
     user_id, display_name = await _authenticate(x_telegram_init_data)

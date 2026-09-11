@@ -56,9 +56,6 @@ def _quiz_info_text(quiz: dict) -> str:
 async def edit_cmd(c: Client, m: Message) -> None:
     """/edit <quiz_id> -- open the inline quiz editor."""
     uid = m.from_user.id
-    if not await is_premium_user(uid):
-        await m.reply("🔒 Premium required: /pay")
-        return
     args = m.text.split()
     if len(args) < 2:
         await m.reply("Usage: `/edit <quiz_id>`")

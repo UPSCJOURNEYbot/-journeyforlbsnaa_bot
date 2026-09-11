@@ -14,6 +14,7 @@ from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from quizbot.database import QuizRepository, get_db
+from quizbot.shared.bot_links import get_runner_bot_username, runner_group_url, runner_start_url
 from quizbot.shared import config
 from quizbot.shared.utils import is_premium_user
 
@@ -44,7 +45,7 @@ async def _send_quiz_page(target, quizzes: list[dict], page: int, uid: int) -> N
         lines.append(
             f"**{i}. {q.get('quiz_name', 'Unnamed')[:100]}**\n"
             f"    ID: `{qid}`\n"
-            f"    {'Paid' if q.get('quiz_type') == 'paid' else 'Free'}\n"
+            "    🆓 Free\n"
             f"    Plays: {q.get('total_participants', 0)}\n"
             f"    Edit: `/edit {qid}`\n"
             f"────────────────"
@@ -75,9 +76,6 @@ async def myquizzes_cmd(c: Client, m: Message) -> None:
     if await subscribe_gate(c, m):
         return
     uid = m.from_user.id
-    if not await is_premium_user(uid):
-        await m.reply("🔒 Purchase premium: /pay")
-        return
     args = m.text.split(maxsplit=1)
     search_term = args[1].strip() if len(args) > 1 else None
 
@@ -124,9 +122,6 @@ async def del_quiz_cmd(c: Client, m: Message) -> None:
         await m.reply("⚠️ Usage: `/del <quiz_id>`")
         return
     qid, uid = args[1], m.from_user.id
-    if not await is_premium_user(uid):
-        await m.reply("🔒 Purchase premium: /pay")
-        return
     repo = QuizRepository(get_db())
     quiz = await repo.get(qid)
     if not quiz:
@@ -205,7 +200,7 @@ async def _send_search_page(c: Client, target, uid: int, term: str, offset: int)
             await target.reply(text)
         return
 
-    me = await c.get_me()
+    runner_username = await get_runner_bot_username()
     lines, buttons = [], []
     for i, q in enumerate(chunk, start=offset + 1):
         name = q.get("quiz_name", "Unnamed")[:55]
@@ -213,7 +208,7 @@ async def _send_search_page(c: Client, target, uid: int, term: str, offset: int)
         plays = q.get("total_participants", 0)
         quiz_type = q.get("quiz_type", "free")
         lines.append(f"**{i}.** {name}\n    ID: `{qid}` | {plays} plays | {quiz_type}")
-        url = f"https://t.me/{me.username}?start={qid}"
+        url = f"https://t.me/{runner_username}?start={qid}"
         buttons.append([InlineKeyboardButton(f"{i}. {q.get('quiz_name', '?')[:28]}", url=url)])
 
     nav = []
@@ -273,9 +268,6 @@ async def setpromo_cmd(c: Client, m: Message) -> None:
     """/setpromo <text> -- set (or clear with 'none') a promo message on
     every quiz this creator owns."""
     uid = m.from_user.id
-    if not await is_premium_user(uid):
-        await m.reply("🔒 Premium required: /pay")
-        return
     args = m.text.split(maxsplit=1)
     if len(args) < 2:
         await m.reply(
@@ -338,7 +330,7 @@ async def listquiz_cmd(c: Client, m: Message) -> None:
     if not quizzes:
         await m.reply("📋 No quizzes.")
         return
-    me = await c.get_me()
+    runner_username = await get_runner_bot_username()
     for i, q in enumerate(quizzes):
         qid = q.get("qid")
         text = (
@@ -349,7 +341,7 @@ async def listquiz_cmd(c: Client, m: Message) -> None:
             f"ID: `{qid}`\n"
             f"Type: `{q.get('quiz_type', 'free')}`"
         )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Start", url=f"https://t.me/{me.username}?start={qid}")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Start", url=f"https://t.me/{runner_username}?start={qid}")]])
         await m.reply(text, reply_markup=kb)
         await asyncio.sleep(4)
 

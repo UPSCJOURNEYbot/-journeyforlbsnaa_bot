@@ -19,6 +19,7 @@ from pyrogram.types import (
 )
 
 from quizbot.database import QuizRepository, get_db
+from quizbot.shared.bot_links import get_runner_bot_username, runner_group_url, runner_start_url
 from quizbot.shared.mini_app_link import mini_app_startapp_button_pyrogram
 
 logger = logging.getLogger(__name__)
@@ -64,10 +65,10 @@ async def inline_query_handler(c: Client, iq: InlineQuery) -> None:
             qr = s.get("question_range", ["?", "?"])
             text += f"\n\n\U0001F539 Section {i}: {s['name']}\n  Questions: {qr[0]} to {qr[1]}\n  Timer: {s.get('timer', 'N/A')}s"
 
-    me = await c.get_me()
+    runner_username = await get_runner_bot_username()
     kb_rows = [
-        [InlineKeyboardButton("\U0001F680 Start", url=f"https://t.me/{me.username}?start={query}")],
-        [InlineKeyboardButton("\U0001F465 Add to Group", url=f"https://t.me/{me.username}?startgroup={query}")],
+        [InlineKeyboardButton("\U0001F680 Start", url=f"https://t.me/{runner_username}?start={query}")],
+        [InlineKeyboardButton("\U0001F465 Add to Group", url=f"https://t.me/{runner_username}?startgroup={query}")],
         [InlineKeyboardButton("\U0001F517 Share", switch_inline_query=query)],
     ]
 

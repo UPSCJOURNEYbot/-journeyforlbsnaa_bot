@@ -455,10 +455,18 @@ async def _handle_anon_verify(query, ctx: ContextTypes.DEFAULT_TYPE, parts: list
     pending_quiz_settings[anon_chat_id] = {
         "quiz": quiz, "update": query, "skip": 0,
         "protect": anon_chat_id != quiz.get("creator_id"), "chat_type": "group",
-        "correct_mark": 1.0, "neg_mark": 0.0,
-        "shuffle_q": False, "shuffle_o": False, "show_explanation": False,
-        "timer_override": None, "initiator_id": real_user_id,
+        "correct_mark": float(quiz.get("correct_marks", 1)),
+        "neg_mark": float(quiz.get("negative_marks", 0)),
+        "shuffle_q": bool(quiz.get("shuffle_questions", False)),
+        "shuffle_o": bool(quiz.get("shuffle_options", False)),
+        "show_explanation": bool(quiz.get("show_explanation", False)),
+        "timer_override": int(quiz.get("timer", 30)),
+        "initiator_id": real_user_id,
     }
+    if quiz.get("fixed_settings"):
+        await _launch_quiz_from_settings(anon_chat_id, ctx, pending_quiz_settings[anon_chat_id])
+        pending_quiz_settings.pop(anon_chat_id, None)
+        return
     await show_correct_mark_prompt(ctx, anon_chat_id)
 
 

@@ -17,6 +17,7 @@ from telegram.ext import Application
 from quizbot.shared import config
 
 from . import handlers
+from .creator_bridge import register_creator_bridge
 from .handlers.admin import watchdog_loop
 from .handlers.scheduling import init_schedule_manager
 from .state import tasks
@@ -29,8 +30,9 @@ scheduler = AsyncIOScheduler()
 async def post_init(application: Application) -> None:
     """Runs once after Application.initialize() -- starts the scheduler and
     the background watchdog task."""
-    init_schedule_manager(scheduler)
+    manager = init_schedule_manager(scheduler, application.bot)
     scheduler.start()
+    await manager.restore()
     tasks.spawn(watchdog_loop(), name="watchdog")
     logger.info("Runner Bot post_init complete (scheduler + watchdog started).")
 
@@ -56,16 +58,17 @@ def build_application() -> Application:
         .build()
     )
     handlers.register(application)
+    # Single-bot architecture: Creator handlers are adapted onto the same PTB poller.
+    register_creator_bridge(application)
     return application
 
 
 async def run_runner_bot() -> None:
-    """Run the Runner Bot non-blocking, as one of two concurrent asyncio
-    tasks sharing a single event loop with the Creator Bot.
+    """Run the single Telegram bot containing both Creator and Runner roles.
 
-    Uses the manual PTB lifecycle (initialize/start/start_polling) instead
-    of `run_polling()`, which owns its own event loop and would block the
-    other bot from running alongside it in the same process.
+    There is exactly one PTB polling client for the bot token. Creator
+    commands/workflows are bridged into this same application, preventing the
+    Telegram long-polling conflict that occurs when two clients share a token.
     """
     application = build_application()
 

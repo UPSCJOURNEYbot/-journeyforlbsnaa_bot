@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -25,8 +24,9 @@ from quizbot.shared.rich_quiz import send_rich_or_fallback
 from quizbot.shared.utils.http import request_json
 
 from .. import state
-from ..premium_grant import grant_and_notify
 from ..ratelimit import ratelimit
+
+PAYMENT_SESSION_SECONDS = 24 * 60 * 60
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ FEATURES_TEXT = (
     "- Full quiz editor (rename, timer, type, questions, permissions)\n"
     "- Quiz analytics and leaderboards\n"
     "- Inline query support for sharing quizzes\n"
-    "- Free and paid quizzes with batch bundling\n"
+    "- Free quizzes with batch bundling\n"
     "- HTML exam-style and analysis reports\n"
     "- Sectional quizzes with per-section timers\n"
 )
@@ -54,14 +54,13 @@ HELP_TEXT = (
     "`/cancel` -- cancel the quiz you're currently creating\n"
     "`/edit <id>` -- edit one of your existing quizzes\n"
     "`/del <id>` -- delete one of your quizzes\n"
-    "`/remall` -- clear your paid-quiz chat authorizations\n"
+    "`/remall` -- clear chat authorizations\n"
     "`/info <id>` -- show details about a quiz\n\n"
     "**Finding & sharing**\n"
     "`/myquizzes [term]` -- list (or search) your quizzes\n"
     "`/search word` (or `/quiz`) -- search all public quizzes\n"
     "`/leaders <id>` (or `/aspirants`) -- full leaderboard\n\n"
-    "**Paid quiz access**\n"
-    "`/add <chat_id>` -- authorize a chat for your paid quizzes\n"
+    "`/add <chat_id>` -- authorize a chat\n"
     "`/rem <chat_id>` -- remove a chat's access\n"
     "`/setpromo text` -- set a promo message on all your quizzes\n\n"
     "**Reports**\n"
@@ -74,7 +73,6 @@ HELP_TEXT = (
     "**Batches**\n"
     "`/batch`, `/createbatch`, `/searchbatch term`\n\n"
     "**Account**\n"
-    "`/pay` -- buy or renew premium\n"
     "`/settings` -- creator settings\n"
     "`/features` -- feature overview\n"
 )
@@ -82,77 +80,13 @@ HELP_TEXT = (
 
 @ratelimit("default")
 async def start_cmd(c: Client, m: Message) -> None:
-    """/start -- silent unless it's a Razorpay payment deep-link
-    (`?start=pay_<token>`).
+    """Creator-side /start handler.
 
-    Both bots share one Telegram token in this deployment, and the Runner
-    Bot owns the user-facing /start welcome message -- so this handler must
-    stay registered (Telegram always delivers a deep-link payload as
-    `/start`, there's no way to route it to another command name) but does
-    nothing visible for a bare /start with no payload, to avoid a second,
-    conflicting welcome message. See `runner_bot/handlers/admin.py` for the
-    shared /start and /help text.
+    The Runner Bot owns the user-facing welcome/deep-link flow. Payment
+    deep-links are intentionally not handled in the Free edition.
     """
     uid = m.from_user.id
     await UserRepository(get_db()).get_or_create(uid)
-
-    args = m.text.split(maxsplit=1)
-    param = args[1].strip() if len(args) > 1 else ""
-
-    if param.startswith("pay_"):
-        token = param[4:]
-        entry = state.pending_payments.get(token)
-        if not entry:
-            await m.reply(
-                "Payment session expired or not found.\n"
-                "If you completed payment, contact support with /help."
-            )
-            return
-        if entry["uid"] != uid:
-            await m.reply("This payment link belongs to a different account.")
-            return
-        if time.time() > entry["expires_at"]:
-            state.pending_payments.pop(token, None)
-            await m.reply("Session expired (15 min limit). Use /pay to start again.")
-            return
-
-        state.pending_payments.pop(token, None)
-        days = entry["days"]
-        try:
-            fmt = await grant_and_notify(uid, days)
-        except Exception:
-            # Grant failed (e.g. a transient DB error) -- re-queue the
-            # pending payment so a retry of the /start deep-link can pick
-            # it back up, and tell the user honestly instead of claiming
-            # success. Matches the original bot's failure-path behavior.
-            logger.error("grant_and_notify failed for uid=%s token=%s", uid, token, exc_info=True)
-            state.pending_payments[token] = entry
-            await m.reply(
-                "⚠️ Payment received but activation failed.\n"
-                f"Contact support with this token: `{token}`"
-            )
-            return
-
-        try:
-            if config.OWNER_ID:
-                await c.send_message(
-                    config.OWNER_ID,
-                    f"Payment received!\nUser: `{uid}` | Plan: {entry['plan_label']} | "
-                    f"{days}d | Rs.{entry['price']} | Link: `{entry['link_id']}`",
-                )
-        except Exception:
-            logger.debug("Failed to notify owner of payment", exc_info=True)
-
-        await m.reply(
-            f"**Premium activated!**\n\n"
-            f"Plan: **{entry['plan_label']}**\n"
-            f"Valid until: `{fmt} IST`\n\n"
-            f"Enjoy your premium features."
-        )
-        return
-
-    # Bare /start, no payment payload -- intentionally silent. The Runner
-    # Bot's /start owns the welcome message for this deployment.
     return
 
 

@@ -36,7 +36,7 @@ _UNIT_TO_DAYS = {
 @ratelimit("default")
 async def add_auth_cmd(c: Client, m: Message) -> None:
     """/add <chat_id> -- authorize a chat/user to access this creator's
-    paid quizzes."""
+    quizzes."""
     if await subscribe_gate(c, m):
         return
     uid = m.from_user.id
