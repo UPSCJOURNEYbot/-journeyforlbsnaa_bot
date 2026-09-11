@@ -479,8 +479,17 @@ def register_creator_bridge(application):
         "mywords": settings.mywords_cmd,
         "clearlist": settings.clearlist_cmd,
     }
+    # Legacy Pyrogram registration marks /testseries (+aliases) private-only
+    # (see creator_bot/handlers/reports.py::register). Enforce the same here
+    # so group chats can never trigger (or receive) someone's test-series PDF.
+    _private_only = frozenset({"testseries", "tsr", "mocktest"})
     for cmd, fn in command_map.items():
-        application.add_handler(CommandHandler(cmd, _call(fn, _wrap_message, application)), group=0)
+        if cmd in _private_only:
+            application.add_handler(CommandHandler(
+                cmd, _call(fn, _wrap_message, application),
+                filters=filters.ChatType.PRIVATE), group=0)
+        else:
+            application.add_handler(CommandHandler(cmd, _call(fn, _wrap_message, application)), group=0)
 
     # Creator callbacks must have priority over all Runner callback handlers.
     # In PTB only the first matching handler in a group runs, so keep these in

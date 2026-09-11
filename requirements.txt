@@ -39,3 +39,7 @@ uvicorn[standard]==0.32.1
 cryptography==43.0.3
 pydantic>=2.10,<3
 google-genai>=1.30.0
+
+# ---- Self-hosted Test Series PDF microservice (pip-only, no system libs) ----
+fpdf2==2.8.8
+uharfbuzz==0.56.1

@@ -95,9 +95,13 @@ def _parse_testseries_args(raw: str) -> tuple[str, str, list[str]]:
     return mode, title, quiz_ids
 
 
-async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll_timeout: int = 180) -> bytes:
-    """Delegate PDF rendering to the external microservice at
-    `config.PDF_API_BASE`. Raises RuntimeError on any failure."""
+def _build_testseries_payload(quizzes: list[dict], mode: str, title: str) -> dict:
+    """Build the /api/generate JSON payload from validated quiz dicts.
+
+    Pure helper (no network): skips questions without options, passes the
+    correct answer id(s) through verbatim, and maps the bot's mode onto the
+    service's `solution_display` contract ("inline" | "end").
+    """
     questions_payload = []
     for quiz in quizzes:
         for q in quiz.get("questions", []):
@@ -115,7 +119,7 @@ async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll
     if not questions_payload:
         raise RuntimeError("No usable questions (with options) found in the given quiz(es).")
 
-    payload = {
+    return {
         "questions_json": questions_payload,
         "institute_name": "Quiz Creator",
         "tagline": "Test Series",
@@ -124,6 +128,12 @@ async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll
         "quiz_names": [str(q.get("quiz_name") or q.get("qid") or "") for q in quizzes],
         "async": True,
     }
+
+
+async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll_timeout: int = 180) -> bytes:
+    """Delegate PDF rendering to the external microservice at
+    `config.PDF_API_BASE`. Raises RuntimeError on any failure."""
+    payload = _build_testseries_payload(quizzes, mode, title)
 
     base = config.PDF_API_BASE.rstrip("/")
     status, job = await request_json("POST", f"{base}/api/generate", json_body=payload)
@@ -138,8 +148,12 @@ async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll
     deadline = time.time() + poll_timeout
     while time.time() < deadline:
         pstatus, pjob = await request_json("GET", progress_url)
-        if not isinstance(pjob, dict):
-            raise RuntimeError("PDF API returned an unexpected progress response.")
+        if pstatus != 200 or not isinstance(pjob, dict):
+            # Fail fast (e.g. the service restarted and the job id is gone)
+            # instead of polling a dead job until the timeout. The caller
+            # turns this into a clean user-facing message; the bot stays up.
+            raise RuntimeError(
+                f"PDF job lost (progress HTTP {pstatus}). Please retry /testseries.")
         job_status = pjob.get("status")
         if job_status == "error":
             raise RuntimeError(f"PDF generation failed: {pjob.get('error', 'unknown error')}")
