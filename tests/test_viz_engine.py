@@ -187,9 +187,16 @@ class ApiCases(unittest.TestCase):
                      "load_subjects", "load_places", "load_base_maps"):
             self.assertTrue(callable(getattr(viz, name)), name)
 
-    def test_not_wired_into_live_flow_yet(self):
-        """Milestone 1: modules + data only; no PDF-flow wiring."""
-        for rel in ("pdf_service/render.py", "pdf_service/app.py",
+    def test_wired_only_into_pdf_renderer(self):
+        """Milestone 2: wired into render.py solution sections ONLY.
+
+        The API layer, the bots and the launcher stay viz-free so the
+        PDF API contract and the single-bot architecture are untouched.
+        """
+        wired = (ROOT / "pdf_service" / "render.py").read_text()
+        self.assertIn("pdf_service.viz", wired)
+        self.assertIn("_maybe_solution_visual", wired)
+        for rel in ("pdf_service/app.py",
                     "quizbot/creator_bot/handlers/reports.py",
                     "quizbot/runner_bot/handlers/reports.py",
                     "pdf_service/__init__.py", "run.py"):

@@ -199,6 +199,45 @@ class _Doc:
                        fill=True)
 
 
+def _maybe_solution_visual(doc: _Doc, question: dict) -> None:
+    """Draw an optional Phase-3 solution visual below the explanation.
+
+    The visual engine decides whether a visual is educationally useful
+    and reliable; without a decision the solution stays text-only.
+    This function never raises: visuals are strictly optional and can
+    never break PDF generation.
+    """
+    try:
+        from pdf_service.viz import engine as viz_engine
+        from pdf_service.viz import mapdraw, templates
+
+        spec = viz_engine.safe_decide_visual(
+            question.get("question", ""),
+            tuple(question.get("options", []) or []),
+            question.get("explanation", ""))
+        if spec is None:
+            return
+        pdf = doc.pdf
+        usable = pdf.w - pdf.l_margin - pdf.r_margin
+        is_map = spec.visual_type in ("location_map", "regional_map")
+        if is_map:
+            height = mapdraw.suggest_height(spec.payload["base"], usable)
+        else:
+            height = templates.estimate_height_for_spec(spec, usable)
+        doc.ensure_space(height + 4)
+        top = pdf.get_y()
+        rect = (pdf.l_margin, top, usable, height)
+        if is_map:
+            mapdraw.draw_map(pdf, base_id=spec.payload["base"],
+                             places=spec.payload["places"], rect=rect,
+                             title=spec.title)
+        else:
+            templates.draw_diagram(pdf, spec, rect)
+        pdf.set_xy(pdf.l_margin, top + height + 3)
+    except Exception:
+        logger.exception("Solution visual skipped after failure")
+
+
 def _cover(doc: _Doc, *, exam_title: str, tagline: str, quiz_names: list[str],
            total: int) -> None:
     pdf = doc.pdf
@@ -297,6 +336,7 @@ def _question_block(doc: _Doc, number: int, question: dict,
         pdf.set_text_color(0, 0, 0)
         if explanation:
             doc.filled_block(f"Explanation: {explanation}")
+        _maybe_solution_visual(doc, question)
         pdf.ln(1)
     pdf.ln(2.5)
 
@@ -347,6 +387,7 @@ def _detailed_solutions(doc: _Doc, questions: list[dict]) -> None:
             pdf.multi_cell(0, 5.2, "No explanation provided.",
                            new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
             pdf.set_text_color(0, 0, 0)
+        _maybe_solution_visual(doc, q)
         pdf.ln(2)
 
 
