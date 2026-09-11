@@ -7,6 +7,7 @@ The codebase has been reviewed and verified with the assistance of Claude AI.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -21,6 +22,7 @@ from pyrogram.types import (
 
 from quizbot.database import CreatorSettingsRepository, QuizRepository, UserRepository, get_db
 from quizbot.shared import config
+from quizbot.shared.bot_links import get_runner_bot_username, runner_group_url, runner_start_url
 from quizbot.shared.mini_app_link import mini_app_web_app_button
 from quizbot.shared.utils import is_premium_user
 
@@ -28,7 +30,7 @@ from .. import state
 from ..parsing import filter_words, parse_question_block, strip_source_noise
 from ..ratelimit import ratelimit
 from ..subscribe_gate import subscribe_gate
-from .file_import import process_uploaded_file
+from .file_import import process_public_url, process_uploaded_file
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +57,7 @@ def _poll_text(value) -> Optional[str]:
 _RESERVED_COMMANDS = [
     "start", "create", "myquizzes", "edit", "info", "ban", "done", "add", "rem",
     "remall", "del", "remove", "clearlist", "mywords", "help", "cancel", "quiz",
-    "search", "auth", "pay", "setpromo", "setkey", "mykeys", "delkey", "settings",
+    "search", "auth", "setpromo", "setkey", "mykeys", "delkey", "settings",
     "batch", "createbatch", "searchbatch", "stopedit", "whtml", "testseries",
     "tsr", "mocktest", "features", "gcast", "stopcast", "statses", "testapi",
     "leaders", "aspirants", "limit", "listquiz", "removeuser",
@@ -80,9 +82,6 @@ async def create_cmd(c: Client, m: Message) -> None:
     if await subscribe_gate(c, m):
         return
     uid = m.from_user.id
-    if not await is_premium_user(uid):
-        await m.reply("🔒 Purchase premium: /pay")
-        return
     if uid in state.quiz_creation:
         await m.reply("⚠️ Already creating a quiz. Use /done or /cancel.")
         return
@@ -106,70 +105,146 @@ async def cancel_cmd(c: Client, m: Message) -> None:
         await m.reply("⚠️ Nothing to cancel.")
 
 
+def _settings_kb(uid: int, step: str, choices: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=f"cws_{step}_{uid}_{value}")]
+         for label, value in choices]
+    )
+
+
+async def _ask_negative_mark(c: Client, target, uid: int) -> None:
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1/4 (0.25)", callback_data=f"cws_nm_{uid}_25"),
+            InlineKeyboardButton("1/3 (0.333)", callback_data=f"cws_nm_{uid}_333"),
+        ],
+        [InlineKeyboardButton("❌ No Negative", callback_data=f"cws_nm_{uid}_0")],
+    ])
+    text = "➖ **Negative marking?**\n\nChoose the penalty for a wrong answer."
+    if hasattr(target, "message") and hasattr(target, "data"):
+        await target.message.edit_text(text, reply_markup=kb)
+    else:
+        await target.reply(text, reply_markup=kb)
+
+
+async def _ask_timer(c: Client, target, uid: int) -> None:
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("10s", callback_data=f"cws_tm_{uid}_10"),
+            InlineKeyboardButton("20s", callback_data=f"cws_tm_{uid}_20"),
+            InlineKeyboardButton("30s", callback_data=f"cws_tm_{uid}_30"),
+        ],
+        [
+            InlineKeyboardButton("60s", callback_data=f"cws_tm_{uid}_60"),
+            InlineKeyboardButton("⚙️ Custom", callback_data=f"cws_tm_{uid}_custom"),
+        ],
+    ])
+    text = "⏱️ **Time per question?**\n\nChoose a preset or tap **Custom** and enter seconds."
+    if hasattr(target, "message") and hasattr(target, "data"):
+        await target.message.edit_text(text, reply_markup=kb)
+    else:
+        await target.reply(text, reply_markup=kb)
+
+
+async def _ask_explanation(c: Client, target, uid: int) -> None:
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes", callback_data=f"cws_ex_{uid}_yes"),
+        InlineKeyboardButton("❌ No", callback_data=f"cws_ex_{uid}_no"),
+    ]])
+    text = "💡 **Show explanation after each question?**"
+    if hasattr(target, "message") and hasattr(target, "data"):
+        await target.message.edit_text(text, reply_markup=kb)
+    else:
+        await target.reply(text, reply_markup=kb)
+
+
+async def _ask_section(c: Client, target, uid: int) -> None:
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes", callback_data=f"cws_sec_{uid}_yes"),
+        InlineKeyboardButton("❌ No", callback_data=f"cws_sec_{uid}_no"),
+    ]])
+    text = "📚 **Section?**\n\nDo you want to divide this quiz into sections?"
+    if hasattr(target, "message") and hasattr(target, "data"):
+        await target.message.edit_text(text, reply_markup=kb)
+    else:
+        await target.reply(text, reply_markup=kb)
+
+
+async def _ask_shuffle_q(c: Client, target, uid: int) -> None:
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes", callback_data=f"cws_sq_{uid}_yes"),
+        InlineKeyboardButton("❌ No", callback_data=f"cws_sq_{uid}_no"),
+    ]])
+    text = "🔀 **Shuffle Questions?**"
+    if hasattr(target, "message") and hasattr(target, "data"):
+        await target.message.edit_text(text, reply_markup=kb)
+    else:
+        await target.reply(text, reply_markup=kb)
+
+
+async def _ask_shuffle_o(c: Client, target, uid: int) -> None:
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes", callback_data=f"cws_so_{uid}_yes"),
+        InlineKeyboardButton("❌ No", callback_data=f"cws_so_{uid}_no"),
+    ]])
+    text = "🔀 **Shuffle Options?**"
+    if hasattr(target, "message") and hasattr(target, "data"):
+        await target.message.edit_text(text, reply_markup=kb)
+    else:
+        await target.reply(text, reply_markup=kb)
+
+
+async def _ask_report(c: Client, target, uid: int, kind: str) -> None:
+    label = "HTML" if kind == "html" else "PDF"
+    default = "Yes"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes", callback_data=f"cws_{kind}_{uid}_yes"),
+        InlineKeyboardButton("❌ No", callback_data=f"cws_{kind}_{uid}_no"),
+    ]])
+    text = f"📄 **{label} Report?**\n\nDefault: **{default}**"
+    if hasattr(target, "message") and hasattr(target, "data"):
+        await target.message.edit_text(text, reply_markup=kb)
+    else:
+        await target.reply(text, reply_markup=kb)
+
+
 @ratelimit("create")
 async def done_cmd(c: Client, m: Message) -> None:
-    """/done -- finish and save the quiz being created (needs >= 10
-    questions). Offers a Quick Save shortcut when the creator has saved
-    defaults (see /settings)."""
+    """/done -- finish question import and start the step-by-step quiz settings wizard."""
     uid = m.from_user.id
-    if not await is_premium_user(uid):
-        await m.reply("🔒 Purchase premium: /pay")
-        return
     if uid not in state.quiz_creation:
         await m.reply("⚠️ Use /create first.")
         return
+
     total = len(state.quiz_creation[uid]["questions"])
     if total < MIN_QUESTIONS:
         await m.reply(f"⚠️ Need at least {MIN_QUESTIONS} questions. You have {total}.")
         return
+
     max_allowed = MAX_QUESTIONS_OWNER if uid == config.OWNER_ID else MAX_QUESTIONS
     if total > max_allowed:
         await m.reply(f"⚠️ Max {max_allowed} questions. You have {total}.")
         return
 
-    settings_repo = CreatorSettingsRepository(get_db())
-    settings = await settings_repo.get(uid)
-    quiz_defaults = settings.get("quiz_defaults") or {}
-    has_defaults = bool(quiz_defaults.get("type"))
-
-    if has_defaults:
-        typ = quiz_defaults.get("type", "free")
-        promo = quiz_defaults.get("promo") or None
-        section = quiz_defaults.get("section", "no")
-        promo_preview = (promo[:30] + "...") if promo and len(promo) > 30 else (promo or "none")
-        kb = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("⚡ Use saved config", callback_data=f"qd_use_{uid}")],
-                [InlineKeyboardButton("📝 Manual setup", callback_data=f"qd_manual_{uid}")],
-            ]
-        )
-        state.quiz_creation[uid]["_qd"] = quiz_defaults
-        await m.reply(
-            f"⚡ **Quick Save available!**\n\nType: `{typ}`\nPromo: `{promo_preview}`\nSections: `{section}`\n\n"
-            f"Use the saved config, or set up manually?",
-            reply_markup=kb,
-        )
-        return
-
-    await m.reply("📚 Section quiz? yes/no")
-    state.quiz_creation[uid]["awaiting_section_choice"] = True
+    ud = state.quiz_creation[uid]
+    ud.update({
+        "negative_marks": 0.0,
+        "timer": None,
+        "show_explanation": False,
+        "section_wise": False,
+        "sections": [],
+        "shuffle_questions": False,
+        "shuffle_options": False,
+        "html_report": True,
+        "pdf_report": True,
+        "wizard_step": "negative",
+    })
+    await _ask_negative_mark(c, m, uid)
 
 
-async def _finalize_quiz(
-    c: Client,
-    reply_target,
-    uid: int,
-    quiz_type: str,
-    promo: Optional[str],
-    sections: list[dict],
-    timer: int,
-    from_user_name: str,
-) -> None:
-    """Save the in-progress quiz to the database and report the result.
-    `reply_target` is either a Message (creation flow) or a CallbackQuery
-    (Quick Save flow) -- we normalize both to a coroutine that sends text.
-    """
-    is_message = isinstance(reply_target, Message)
+async def _finalize_quiz(c: Client, reply_target, uid: int, from_user_name: str) -> None:
+    """Create the quiz using the explicit settings collected by the wizard."""
+    is_message = hasattr(reply_target, "reply") and not hasattr(reply_target, "data")
 
     async def send_result(text: str, kb: Optional[InlineKeyboardMarkup] = None):
         if is_message:
@@ -179,13 +254,18 @@ async def _finalize_quiz(
         except Exception:
             return await reply_target.message.reply(text, reply_markup=kb)
 
-    quiz_name = state.quiz_creation[uid]["quiz_name"]
-    questions = state.quiz_creation[uid]["questions"]
-
+    ud = state.quiz_creation[uid]
+    quiz_name = ud["quiz_name"]
+    questions = ud["questions"]
+    timer = int(ud.get("timer") or 30)
+    sections = ud.get("sections", [])
     settings_repo = CreatorSettingsRepository(get_db())
-    settings = await settings_repo.get(uid)
-    default_text = settings.get("default_text")
-    default_text_field = settings.get("default_text_field", "both")
+    saved = await settings_repo.get(uid)
+
+    # Keep the creator's existing /settings default-text feature, but do not
+    # introduce another question into this step-by-step wizard.
+    default_text = saved.get("default_text")
+    default_text_field = saved.get("default_text_field", "both")
     if default_text:
         for q in questions:
             if default_text_field in ("question", "both") and q.get("question"):
@@ -193,8 +273,7 @@ async def _finalize_quiz(
             if default_text_field in ("explanation", "both"):
                 q["explanation"] = (
                     (q.get("explanation") or "").rstrip() + "\n" + default_text
-                    if q.get("explanation")
-                    else default_text
+                    if q.get("explanation") else default_text
                 )
 
     qid = _gen_qid()
@@ -206,9 +285,15 @@ async def _finalize_quiz(
         qid=qid,
         sections=sections,
         timer=timer,
-        quiz_type=quiz_type,
-        negative_marks=0,
-        promo_message=promo,
+        quiz_type="free",
+        negative_marks=float(ud.get("negative_marks", 0.0)),
+        promo_message=None,
+        show_explanation=bool(ud.get("show_explanation", False)),
+        shuffle_questions=bool(ud.get("shuffle_questions", False)),
+        shuffle_options=bool(ud.get("shuffle_options", False)),
+        html_report=bool(ud.get("html_report", True)),
+        pdf_report=bool(ud.get("pdf_report", True)),
+        fixed_settings=True,
     )
     state.quiz_creation.pop(uid, None)
 
@@ -216,16 +301,22 @@ async def _finalize_quiz(
         await send_result("⚠️ Quiz created but could not be re-fetched. Try /myquizzes.")
         return
 
-    promo_flag = "Set" if promo else "None"
+    neg = quiz.get("negative_marks", 0)
+    neg_label = "No" if not neg else ("1/4" if abs(float(neg) - .25) < .001 else "1/3")
     text = (
-        f"> 🎉 **Quiz Created!**\n\n"
-        f"\U0001F4DD **Name:** {quiz_name}\n"
+        "🎉 **Quiz Created!**\n\n"
+        f"📝 **Name:** {quiz_name}\n"
         f"❓ **Questions:** {len(quiz['questions'])}\n"
-        f"⏱️ **Timer:** {timer}s\n"
+        f"➖ **Negative marking:** {neg_label}\n"
+        f"⏱️ **Time/question:** {timer}s\n"
+        f"💡 **Explanation:** {'Yes' if quiz.get('show_explanation') else 'No'}\n"
+        f"📚 **Sections:** {'Yes' if sections else 'No'}\n"
+        f"🔀 **Shuffle questions:** {'Yes' if quiz.get('shuffle_questions') else 'No'}\n"
+        f"🔀 **Shuffle options:** {'Yes' if quiz.get('shuffle_options') else 'No'}\n"
+        f"📄 **HTML report:** {'Yes' if quiz.get('html_report') else 'No'}\n"
+        f"📄 **PDF report:** {'Yes' if quiz.get('pdf_report') else 'No'}\n"
         f"🆔 **Quiz ID:** `{qid}`\n"
-        f"\U0001F3F7 **Type:** `{quiz_type}`\n"
-        f"🪭 **Promo:** {promo_flag}\n"
-        f"👨‍💼 **Creator:** `{from_user_name}`"
+        f"🏷️ **Type:** `free`"
     )
     if sections:
         text += "\n\n**Sections:**"
@@ -233,27 +324,20 @@ async def _finalize_quiz(
             text += (
                 f"\n\nSection {i}: {sec['name']}\n"
                 f"  Questions: {sec['question_range'][0]} to {sec['question_range'][1]}\n"
-                f"  Timer: {sec.get('timer', 'N/A')}s"
+                f"  Timer: {sec.get('timer', timer)}s"
             )
 
-    me = await c.get_me()
+    runner_username = await get_runner_bot_username()
     kb_buttons = [
-        [InlineKeyboardButton("🚀 Start", url=f"https://t.me/{me.username}?start={qid}")],
-        [InlineKeyboardButton("👥 Add to Group", url=f"https://t.me/{me.username}?startgroup={qid}")],
+        [InlineKeyboardButton("🚀 Start", url=f"https://t.me/{runner_username}?start={qid}")],
+        [InlineKeyboardButton("👥 Add to Group", url=f"https://t.me/{runner_username}?startgroup={qid}")],
         [InlineKeyboardButton("🔗 Share", switch_inline_query=qid)],
     ]
-    # "Play" opens the visual Mini App player right here in this private
-    # chat -- a native web_app button, which Telegram only allows on
-    # messages sent directly to the user (exactly this context). Skipped
-    # entirely when MINI_APP_DOMAIN isn't configured.
-    play_practice = mini_app_web_app_button(me.username, qid, "practice", "Play (Practice)")
-    play_exam = mini_app_web_app_button(me.username, qid, "exam", "Play (Exam)")
+    play_practice = mini_app_web_app_button(runner_username, qid, "practice", "Play (Practice)")
+    play_exam = mini_app_web_app_button(runner_username, qid, "exam", "Play (Exam)")
     if play_practice and play_exam:
         kb_buttons.append([play_practice, play_exam])
-    if quiz_type == "paid":
-        kb_buttons.append([InlineKeyboardButton("📦 Attach to Batch", callback_data=f"bat_attachqz_{qid}_{uid}")])
-    kb = InlineKeyboardMarkup(kb_buttons)
-    await send_result(text, kb)
+    await send_result(text, InlineKeyboardMarkup(kb_buttons))
 
     if config.BOT_GROUP:
         try:
@@ -263,66 +347,17 @@ async def _finalize_quiz(
             logger.debug("Failed to announce new quiz in BOT_GROUP", exc_info=True)
 
 
-async def quicksave_cb(c: Client, cb: CallbackQuery) -> None:
-    """`qd_use_<uid>` / `qd_manual_<uid>` -- Quick Save decision after
-    /done when the creator has saved quiz defaults."""
-    uid = cb.from_user.id
-    action = cb.data.split("_")[1]
-    target = int(cb.data.split("_")[2])
-    if uid != target:
-        await cb.answer("❌ Not yours", show_alert=True)
-        return
-    if uid not in state.quiz_creation:
-        await cb.answer("⚠️ Session expired", show_alert=True)
-        return
-
-    if action == "manual":
-        try:
-            await cb.message.edit_text("📚 Section quiz? yes/no")
-        except Exception:
-            await cb.message.reply("📚 Section quiz? yes/no")
-        state.quiz_creation[uid]["awaiting_section_choice"] = True
-        await cb.answer()
-        return
-
-    quiz_defaults = state.quiz_creation[uid].get("_qd", {})
-    quiz_type = quiz_defaults.get("type", "free")
-    promo = quiz_defaults.get("promo") or None
-    section_choice = quiz_defaults.get("section", "no")
-    timer = state.quiz_creation[uid].get("timer") or 20
-
-    await cb.answer("⚡ Saving...")
-    try:
-        await cb.message.edit_text("🚀 Creating quiz...")
-    except Exception:
-        pass
-
-    if section_choice == "yes":
-        state.quiz_creation[uid]["section_wise"] = True
-        state.quiz_creation[uid]["promo_message"] = promo
-        state.quiz_creation[uid]["type_preset"] = quiz_type
-        state.quiz_creation[uid]["awaiting_section_count"] = True
-        try:
-            await cb.message.edit_text("📚 How many sections? (>= 2)")
-        except Exception:
-            await cb.message.reply("📚 How many sections? (>= 2)")
-        return
-
-    name = cb.from_user.first_name if cb.from_user else str(uid)
-    await _finalize_quiz(c, cb, uid, quiz_type, promo, [], timer, name)
-
-
 async def handle_document(c: Client, m: Message) -> None:
     """Handle a .txt/.json file sent while a quiz-creation session is
     active -- imports questions in bulk (see handlers/file_import.py)."""
     uid = m.from_user.id
-    if not await is_premium_user(uid):
-        return
     if uid not in state.quiz_creation:
         return
-    allowed_types = ("text/plain", "application/json")
-    if m.document.mime_type not in allowed_types:
-        await m.reply("⚠️ Only .txt or .json files are supported for quiz questions.")
+    filename = (m.document.file_name or "").lower()
+    supported_ext = (".txt", ".md", ".markdown", ".json", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+    mime = (m.document.mime_type or "").lower()
+    if not filename.endswith(supported_ext) and not any(x in mime for x in ("text/plain", "text/markdown", "json", "pdf", "image/")):
+        await m.reply("⚠️ Supported: TXT, MD, JSON, PDF, PNG/JPG/WEBP/BMP/TIFF.")
         return
 
     status = await m.reply("⏳ Processing...")
@@ -333,71 +368,135 @@ async def handle_document(c: Client, m: Message) -> None:
     user = await UserRepository(get_db()).get_or_create(uid)
     remove_words = user.get("remove_words", [])
 
-    count, error = process_uploaded_file(
+    # Parsing (especially large/scanned PDFs) is CPU-bound: run it off the
+    # event loop so the single PTB poller never appears frozen while a file
+    # is being processed.
+    count, error = await asyncio.to_thread(
+        process_uploaded_file,
         content, m.document.file_name or "upload.txt", state.quiz_creation[uid]["questions"], remove_words
     )
     if error:
         await status.edit_text(f"❌ Error: {error}")
+    elif count == 0:
+        await status.edit_text(
+            "⚠️ No questions could be read from this file.\n"
+            "Send .txt/.json, a text-based PDF with marked answers, or an image of the questions. /done"
+        )
     else:
         total = len(state.quiz_creation[uid]["questions"])
-        await status.edit_text(f"✅ {count} questions processed! Total: {total}\nSend more or /done")
+        await status.edit_text(f"✅ {count} questions processed! Total: {total}\nSend more, paste text, send an image, PDF/MD/TXT, or public AI link. /done")
+
+
+async def handle_photo(c: Client, m: Message) -> None:
+    """OCR a question image while creating a quiz."""
+    uid = m.from_user.id
+    if uid not in state.quiz_creation:
+        return
+    status = await m.reply("⏳ Reading image...")
+    try:
+        file_bytes = await c.download_media(m.photo.file_id, in_memory=True)
+        file_bytes.seek(0)
+        content = file_bytes.read()
+        user = await UserRepository(get_db()).get_or_create(uid)
+        remove_words = user.get("remove_words", [])
+        count, error = process_uploaded_file(
+            content, "question.jpg", state.quiz_creation[uid]["questions"], remove_words
+        )
+        if error:
+            await status.edit_text(f"❌ {error}")
+        else:
+            total = len(state.quiz_creation[uid]["questions"])
+            await status.edit_text(f"✅ {count} questions extracted from image. Total: {total}\nSend more or /done")
+    except Exception as exc:
+        logger.exception("Image import failed")
+        await status.edit_text(f"❌ Image could not be processed: {exc}")
 
 
 async def handle_creation_message(c: Client, m: Message) -> None:
-    """Drives every text/poll step of the quiz-creation wizard: quiz name,
-    section setup, promo message, type selection, and free-text question
-    parsing (paste format or forwarded quiz polls)."""
-    uid, cid = m.from_user.id, m.chat.id
+    """Handle quiz name, imported questions and the text-entry steps of the
+    creation wizard. Settings are handled by inline callbacks below."""
+    uid = m.from_user.id
     if uid not in state.quiz_creation:
         return
     ud = state.quiz_creation[uid]
 
-    if m.poll:
-        poll = m.poll
-        if poll.type != PollType.QUIZ:
-            await m.reply("⚠️ Only quiz-type polls are supported.")
+    # Step-by-step settings that require typed input.
+    if ud.get("awaiting_timer"):
+        try:
+            timer = int(m.text.strip())
+            if timer <= 0 or timer > 3600:
+                raise ValueError
+        except ValueError:
+            await m.reply("⚠️ Enter seconds between 1 and 3600.")
             return
-        user = await UserRepository(get_db()).get_or_create(uid)
-        remove_words = user.get("remove_words", [])
-        question = strip_source_noise(filter_words(_poll_text(poll.question), remove_words))
-        options = [filter_words(_poll_text(o.text), remove_words) for o in poll.options]
-        # Confirmed via live log against this Kurigram build: a closed quiz
-        # poll (the normal state of a poll someone forwards to the bot)
-        # exposes the correct answer as `correct_option_id` -- SINGULAR,
-        # a plain int -- not `correct_option_ids` (plural/list). The plural
-        # attribute simply doesn't exist on this object at all, so the
-        # previous getattr(poll, "correct_option_ids", ...) silently and
-        # always fell through to 0, which is why every imported poll ended
-        # up marking option 1 (index 0) as correct regardless of the
-        # poll's real checkmark.
-        correct_id = getattr(poll, "correct_option_id", None)
-        if correct_id is None:
-            # Defensive fallback for any future/older Kurigram build that
-            # instead reports the plural, list-shaped attribute.
-            correct_ids = getattr(poll, "correct_option_ids", None) or []
-            correct_id = correct_ids[0] if correct_ids else 0
-        explanation = None
-        if getattr(poll, "explanation", None):
-            explanation = strip_source_noise(filter_words(_poll_text(poll.explanation), remove_words))
-        reply_msg = m.reply_to_message
-        reply_text = reply_msg.text if reply_msg and reply_msg.text else None
-        file_id = None
-        if reply_msg and reply_msg.photo and config.BOT_GROUP:
-            try:
-                copied = await c.copy_message(config.BOT_GROUP, reply_msg.chat.id, reply_msg.id)
-                file_id = copied.photo.file_id
-            except Exception:
-                logger.debug("Failed to copy poll's reply photo", exc_info=True)
-        ud["questions"].append(
-            {
-                "question": question, "options": options, "correct_option_id": correct_id,
-                "explanation": explanation, "file_id": file_id, "reply_text": reply_text,
-            }
-        )
-        await m.reply(f"✅ {len(ud['questions'])} saved! Send more or /done")
+        ud["timer"] = timer
+        ud.pop("awaiting_timer", None)
+        await _ask_explanation(c, m, uid)
         return
 
-    if not m.text:
+    if ud.get("awaiting_section_count"):
+        try:
+            n = int(m.text.strip())
+            if n < 2 or n > len(ud["questions"]):
+                raise ValueError
+        except ValueError:
+            await m.reply(f"⚠️ Enter a section count from 2 to {len(ud['questions'])}.")
+            return
+        ud["section_count"] = n
+        ud["sections"] = []
+        ud["current_section"] = 1
+        ud["last_range_end"] = 0
+        ud.pop("awaiting_section_count", None)
+        ud["awaiting_section_name"] = True
+        await m.reply("📚 Section 1 name:")
+        return
+
+    if ud.get("awaiting_section_name"):
+        name = m.text.strip()
+        if not name:
+            await m.reply("⚠️ Invalid section name.")
+            return
+        ud["sections"].append({"name": name})
+        ud.pop("awaiting_section_name", None)
+        ud["awaiting_question_range"] = True
+        await m.reply(f"📚 Range for **{name}** (e.g. 1-5). Max: {len(ud['questions'])}")
+        return
+
+    if ud.get("awaiting_question_range"):
+        try:
+            start_q, end_q = map(int, m.text.strip().split("-"))
+            total = len(ud["questions"])
+            if not (1 <= start_q <= end_q <= total):
+                raise ValueError
+            if ud.get("last_range_end") and start_q != ud["last_range_end"] + 1:
+                raise ValueError
+        except ValueError:
+            await m.reply("⚠️ Invalid range. Use e.g. `1-10` and keep sections continuous.")
+            return
+        ud["sections"][-1]["question_range"] = (start_q, end_q)
+        ud.pop("awaiting_question_range", None)
+        ud["last_range_end"] = end_q
+        ud["awaiting_section_timer"] = True
+        await m.reply("⏱️ Section timer in seconds (1-3600):")
+        return
+
+    if ud.get("awaiting_section_timer"):
+        try:
+            timer = int(m.text.strip())
+            if timer <= 0 or timer > 3600:
+                raise ValueError
+        except ValueError:
+            await m.reply("⚠️ Enter seconds between 1 and 3600.")
+            return
+        ud["sections"][-1]["timer"] = timer
+        ud.pop("awaiting_section_timer", None)
+        if len(ud["sections"]) < ud["section_count"]:
+            ud["current_section"] += 1
+            ud["awaiting_section_name"] = True
+            await m.reply(f"📚 Section {ud['current_section']} name:")
+            return
+        # All sections are configured.
+        await _ask_shuffle_q(c, m, uid)
         return
 
     if ud.get("awaiting_name"):
@@ -407,137 +506,40 @@ async def handle_creation_message(c: Client, m: Message) -> None:
             return
         ud["quiz_name"] = name
         ud["awaiting_name"] = False
-        await m.reply(f"📝 Name: **{name}**\nSend questions, forward quiz polls, or a .txt file. /cancel to abort.")
+        await m.reply(
+            f"📝 **Name:** {name}\n\n"
+            "Now send questions as text, TXT/MD/JSON/PDF, image, forwarded quiz polls, "
+            "or public ChatGPT/DeepSeek/Gemini links.\n\n"
+            "When finished, use /done."
+        )
         return
 
-    if ud.get("awaiting_section_choice"):
-        choice = m.text.strip().lower()
-        if choice not in ("yes", "no"):
-            await m.reply("⚠️ Reply yes or no.")
-            return
-        ud["section_wise"] = choice == "yes"
-        del ud["awaiting_section_choice"]
-        if ud["section_wise"]:
-            ud["awaiting_section_count"] = True
-            await m.reply("📚 How many sections? (>1)")
+    # Public AI/share links.
+    import re
+    urls = re.findall(r"https?://\S+", m.text or "")
+    if urls and not any(ud.get(k) for k in (
+        "awaiting_name", "awaiting_timer", "awaiting_section_count",
+        "awaiting_section_name", "awaiting_question_range", "awaiting_section_timer"
+    )):
+        user = await UserRepository(get_db()).get_or_create(uid)
+        remove_words = user.get("remove_words", [])
+        status = await m.reply("⏳ Reading public link and extracting questions...")
+        imported, errors = 0, []
+        for url in urls[:3]:
+            count, error = await process_public_url(url.rstrip(")]>"), ud["questions"], remove_words)
+            imported += count or 0
+            if error:
+                errors.append(error)
+        total = len(ud["questions"])
+        if imported:
+            await status.edit_text(f"✅ {imported} questions imported. Total: {total}\nSend more or /done")
         else:
-            ud["timer"] = 20
-            ud["awaiting_promo"] = True
-            await m.reply("📢 Send your promo message (shown periodically). Send 'skip' or 'no' to leave empty.")
+            await status.edit_text(errors[0] if errors else "❌ No valid questions found.")
         return
 
-    if ud.get("awaiting_section_count"):
-        try:
-            section_count = int(m.text.strip())
-            if section_count < 2:
-                raise ValueError
-        except ValueError:
-            await m.reply("⚠️ Enter a number >= 2.")
-            return
-        ud["section_count"] = section_count
-        ud["sections"] = []
-        ud["current_section"] = 1
-        ud["last_range_end"] = 0
-        del ud["awaiting_section_count"]
-        ud["awaiting_section_name"] = True
-        await m.reply("📚 Section 1 name:")
+    # Free-text question paste.
+    if not m.text:
         return
-
-    if ud.get("awaiting_section_name"):
-        name = m.text.strip()
-        if not name:
-            await m.reply("⚠️ Invalid name.")
-            return
-        ud["sections"].append({"name": name})
-        del ud["awaiting_section_name"]
-        ud["awaiting_question_range"] = True
-        await m.reply(f"📚 Range for '{name}' (e.g. 1-5). Max: {len(ud['questions'])}")
-        return
-
-    if ud.get("awaiting_question_range"):
-        try:
-            start, end = map(int, m.text.strip().split("-"))
-            total = len(ud["questions"])
-            if not (start >= 1 and end <= total and start <= end):
-                raise ValueError
-            if ud["last_range_end"] and start != ud["last_range_end"] + 1:
-                raise ValueError
-        except ValueError:
-            await m.reply("⚠️ Invalid range.")
-            return
-        ud["sections"][-1]["question_range"] = (start, end)
-        del ud["awaiting_question_range"]
-        ud["last_range_end"] = end
-        ud["awaiting_section_timer"] = True
-        await m.reply("⏱️ Section timer in seconds (>10):")
-        return
-
-    if ud.get("awaiting_section_timer"):
-        try:
-            timer = int(m.text.strip())
-            if timer <= 10:
-                raise ValueError
-        except ValueError:
-            await m.reply("⚠️ Enter a number > 10.")
-            return
-        ud["sections"][-1]["timer"] = timer
-        del ud["awaiting_section_timer"]
-        if len(ud["sections"]) < ud["section_count"]:
-            ud["current_section"] += 1
-            ud["awaiting_section_name"] = True
-            await m.reply(f"📚 Section {ud['current_section']} name:")
-        else:
-            ud["awaiting_promo"] = True
-            await m.reply("📢 Send your promo message (shown periodically). Send 'skip' or 'no' to leave empty.")
-        return
-
-    if ud.get("awaiting_promo"):
-        promo_text = m.text.strip()
-        ud["promo_message"] = None if promo_text.lower() in ("skip", "no", "none", "/skip") else promo_text
-        del ud["awaiting_promo"]
-
-        settings_repo = CreatorSettingsRepository(get_db())
-        settings = await settings_repo.get(uid)
-        default_text = settings.get("default_text")
-        default_text_field = settings.get("default_text_field", "both")
-        if default_text:
-            field_labels = {"question": "questions", "explanation": "explanations", "both": "questions & explanations"}
-            ud["awaiting_default_text_confirm"] = True
-            ud["_dt"] = default_text
-            ud["_dtf"] = default_text_field
-            kb = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton("✅ Yes, add it", callback_data=f"dtc_yes_{uid}"),
-                        InlineKeyboardButton("⏭️ Skip", callback_data=f"dtc_no_{uid}"),
-                    ]
-                ]
-            )
-            await m.reply(
-                f"💡 **Add default text to {field_labels.get(default_text_field, 'fields')}?**\n\n`{default_text[:100]}`",
-                reply_markup=kb,
-            )
-            return
-        ud["awaiting_type"] = True
-        await m.reply("📊 Type (free/paid)")
-        return
-
-    if ud.get("awaiting_default_text_confirm"):
-        return  # handled via the dtc_yes/dtc_no callback
-
-    if ud.get("awaiting_type"):
-        quiz_type = m.text.strip().lower()
-        if quiz_type not in ("free", "paid"):
-            await m.reply("⚠️ Reply free or paid.")
-            return
-        timer = ud.get("timer") or 20
-        sections = ud.get("sections", [])
-        promo = ud.get("promo_message")
-        name = m.from_user.first_name if m.from_user else str(uid)
-        await _finalize_quiz(c, m, uid, quiz_type, promo, sections, timer, name)
-        return
-
-    # ── Free-text question paste ──────────────────────────────────────
     blocks = m.text.split("\n\n")
     reply_msg = m.reply_to_message
     reply_text = reply_msg.text if reply_msg and reply_msg.text else None
@@ -547,7 +549,7 @@ async def handle_creation_message(c: Client, m: Message) -> None:
             copied = await c.copy_message(config.BOT_GROUP, reply_msg.chat.id, reply_msg.id)
             file_id = copied.photo.file_id
         except Exception:
-            logger.debug("Failed to copy pasted question's reply photo", exc_info=True)
+            logger.debug("Failed to copy pasted question photo", exc_info=True)
 
     parsed_any = False
     for block in blocks:
@@ -556,9 +558,8 @@ async def handle_creation_message(c: Client, m: Message) -> None:
         parsed = parse_question_block(block)
         if not parsed:
             await m.reply(
-                "⚠️ Invalid format.\n\nMark the correct option with a check-mark emoji. "
-                "For multi-line questions, put a lone emoji on its own line before the options, "
-                "or start each option with A) B) C) D)."
+                "⚠️ Invalid format.\n\nMark the correct option with a check-mark emoji, "
+                "or use A) B) C) D) labels."
             )
             return
         parsed["file_id"] = file_id
@@ -570,25 +571,122 @@ async def handle_creation_message(c: Client, m: Message) -> None:
         await m.reply("⚠️ No valid question found.")
         return
     total = len(ud["questions"])
-    suffix = " Consider stopping soon." if total > 200 else " Send more or /done"
-    await m.reply(f"✅ {total} saved!{suffix}")
+    await m.reply(f"✅ {total} questions saved! Send more or /done")
 
 
-async def default_text_confirm_cb(c: Client, cb: CallbackQuery) -> None:
-    """`dtc_yes_<uid>` / `dtc_no_<uid>` -- confirm whether to apply the
-    creator's saved default text before proceeding to type selection."""
-    uid = cb.from_user.id
-    action = cb.data.split("_")[1]
-    if uid not in state.quiz_creation:
-        await cb.answer("⚠️ Session expired", show_alert=True)
+async def creation_wizard_cb(c: Client, cb: CallbackQuery) -> None:
+    """Inline callbacks for the /create settings wizard."""
+    parts = cb.data.split("_")
+    # cws_<step>_<uid>_<value>
+    if len(parts) < 4:
+        await cb.answer("Invalid step.", show_alert=True)
         return
-    ud = state.quiz_creation[uid]
-    ud.pop("awaiting_default_text_confirm", None)
-    if action == "no":
-        ud.pop("_dt", None)
-        ud.pop("_dtf", None)
-    ud["awaiting_type"] = True
-    await cb.message.reply("📊 Type (free/paid)")
+    step, uid_s, value = parts[1], parts[2], "_".join(parts[3:])
+    try:
+        uid = int(uid_s)
+    except ValueError:
+        await cb.answer("Invalid session.", show_alert=True)
+        return
+    if cb.from_user.id != uid:
+        await cb.answer("❌ This setup belongs to another user.", show_alert=True)
+        return
+    ud = state.quiz_creation.get(uid)
+    if not ud:
+        await cb.answer("⚠️ Session expired. Start again with /create.", show_alert=True)
+        return
+
+    if step == "nm":
+        ud["negative_marks"] = {"25": .25, "333": 1/3, "0": 0.0}.get(value, 0.0)
+        ud["wizard_step"] = "timer"
+        await _ask_timer(c, cb, uid)
+
+    elif step == "tm":
+        if value == "custom":
+            ud["awaiting_timer"] = True
+            ud["wizard_step"] = "timer_custom"
+            await cb.message.edit_text("⏱️ **Enter time per question in seconds.**\n\nAllowed: 1–3600")
+        else:
+            ud["timer"] = int(value)
+            ud["wizard_step"] = "explanation"
+            await _ask_explanation(c, cb, uid)
+
+    elif step == "ex":
+        ud["show_explanation"] = value == "yes"
+        ud["wizard_step"] = "section"
+        await _ask_section(c, cb, uid)
+
+    elif step == "sec":
+        if value == "yes":
+            ud["section_wise"] = True
+            ud["wizard_step"] = "section_count"
+            ud["awaiting_section_count"] = True
+            await cb.message.edit_text(
+                f"📚 **How many sections?**\n\nEnter 2–{len(ud['questions'])}."
+            )
+        else:
+            ud["section_wise"] = False
+            ud["sections"] = []
+            ud["wizard_step"] = "shuffle_questions"
+            await _ask_shuffle_q(c, cb, uid)
+
+    elif step == "sq":
+        ud["shuffle_questions"] = value == "yes"
+        ud["wizard_step"] = "shuffle_options"
+        await _ask_shuffle_o(c, cb, uid)
+
+    elif step == "so":
+        ud["shuffle_options"] = value == "yes"
+        ud["wizard_step"] = "html"
+        await _ask_report(c, cb, uid, "html")
+
+    elif step == "html":
+        ud["html_report"] = value != "no"
+        ud["wizard_step"] = "pdf"
+        await _ask_report(c, cb, uid, "pdf")
+
+    elif step == "pdf":
+        ud["pdf_report"] = value != "no"
+        ud["wizard_step"] = "summary"
+        neg = ud.get("negative_marks", 0)
+        neg_label = "No" if not neg else ("1/4" if abs(neg-.25) < .001 else "1/3")
+        summary = (
+            "⚙️ **Quiz Settings Summary**\n\n"
+            f"➖ Negative marking: **{neg_label}**\n"
+            f"⏱️ Time/question: **{ud.get('timer')}s**\n"
+            f"💡 Show explanation: **{'Yes' if ud.get('show_explanation') else 'No'}**\n"
+            f"📚 Sections: **{'Yes' if ud.get('sections') else 'No'}**\n"
+            f"🔀 Shuffle questions: **{'Yes' if ud.get('shuffle_questions') else 'No'}**\n"
+            f"🔀 Shuffle options: **{'Yes' if ud.get('shuffle_options') else 'No'}**\n"
+            f"📄 HTML report: **{'Yes' if ud.get('html_report') else 'No'}**\n"
+            f"📄 PDF report: **{'Yes' if ud.get('pdf_report') else 'No'}**\n\n"
+            "Everything looks good?"
+        )
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Create Quiz", callback_data=f"cws_create_{uid}_yes"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cws_cancel_{uid}_yes"),
+        ]])
+        await cb.message.edit_text(summary, reply_markup=kb)
+
+    elif step == "create":
+        if value != "yes":
+            await cb.answer()
+            return
+        await cb.answer("⏳ Creating quiz...")
+        try:
+            await cb.message.edit_text("🚀 Creating quiz...")
+        except Exception:
+            pass
+        name = cb.from_user.first_name if cb.from_user else str(uid)
+        await _finalize_quiz(c, cb, uid, name)
+
+    elif step == "cancel":
+        state.quiz_creation.pop(uid, None)
+        await cb.message.edit_text("❌ Quiz creation cancelled.")
+
+    else:
+        await cb.answer("Unknown step.", show_alert=True)
+        return
+
     await cb.answer()
 
 
@@ -603,9 +701,9 @@ def register(app: Client) -> None:
     app.on_message(filters.command("create") & filters.private)(create_cmd)
     app.on_message(filters.command("done") & filters.private)(done_cmd)
     app.on_message(filters.command("cancel") & filters.private)(cancel_cmd)
-    app.on_callback_query(filters.regex(r"^qd_(use|manual)_\d+$"))(quicksave_cb)
-    app.on_callback_query(filters.regex(r"^dtc_(yes|no)_\d+$"))(default_text_confirm_cb)
+    app.on_callback_query(filters.regex(r"^cws_(nm|tm|ex|sec|sq|so|html|pdf|create|cancel)_\d+_.+$"))(creation_wizard_cb)
     app.on_message(filters.document & filters.private & in_quiz_creation_filter())(handle_document)
+    app.on_message(filters.photo & filters.private & in_quiz_creation_filter())(handle_photo)
     app.on_message(
         (filters.text | filters.poll)
         & filters.private

@@ -16,7 +16,6 @@ from . import (
     batches,
     file_import,  # noqa: F401 -- imported for side-effect-free reuse by quiz_creation
     inline,
-    payments,
     quiz_creation,
     quiz_editing,
     quiz_management,
@@ -31,7 +30,6 @@ def register(app: Client) -> None:
     """Register every handler module's commands/callbacks on `app`."""
     admin.register(app)
     auth.register(app)
-    payments.register(app)
     ai_keys.register(app)
     settings.register(app)
     quiz_management.register(app)

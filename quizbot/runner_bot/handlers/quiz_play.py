@@ -474,7 +474,7 @@ async def end_private_quiz(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None
             ctx, chat_id, quiz_data, [{
                 "user_id": chat_id, "name": "You", "correct": correct, "wrong": wrong,
                 "score": score, "total_time": total_time, "answers": udata.get("answers", {}),
-            }], chat_title="Direct Message", protect_type=False, thread_id=None,
+            }], chat_title="Direct Message", protect_type=False, thread_id=None, session_polls=s.get("polls", {}),
         )
     except Exception as e:
         logger.error("end_private_quiz error: %s", e, exc_info=True)
@@ -983,6 +983,7 @@ async def end_quiz(update: Any, ctx: ContextTypes.DEFAULT_TYPE, quiz_id: str, pr
         end_tid = pre_sess.get("message_thread_id") if pre_sess else None
 
         session = await session_mgr.delete(chat_id)
+        session_polls = (session or {}).get("polls", {})
         msg_kwargs = {"message_thread_id": end_tid} if end_tid else {}
         placeholder = await safe_send_message(ctx, chat_id, "Generating Result...", **msg_kwargs)
 
@@ -1071,7 +1072,7 @@ async def end_quiz(update: Any, ctx: ContextTypes.DEFAULT_TYPE, quiz_id: str, pr
 
         await _record_attempt_and_report(
             ctx, chat_id, quiz_data, leaderboard, chat_title=chat_title,
-            protect_type=protect_type, thread_id=end_tid,
+            protect_type=protect_type, thread_id=end_tid, session_polls=session_polls,
         )
     except Exception as e:
         logger.error("end_quiz error: %s", e, exc_info=True)
@@ -1081,7 +1082,7 @@ async def end_quiz(update: Any, ctx: ContextTypes.DEFAULT_TYPE, quiz_id: str, pr
 
 async def _record_attempt_and_report(
     ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz_data: dict, leaderboard: list[dict],
-    *, chat_title: str, protect_type: bool, thread_id: Optional[int],
+    *, chat_title: str, protect_type: bool, thread_id: Optional[int], session_polls: Optional[dict] = None,
 ) -> None:
     """Persist attempts/leaderboard rows to the DB and send HTML/PDF reports
     if enabled for this chat. Replaces the old local quiz_results/*.json
@@ -1109,8 +1110,15 @@ async def _record_attempt_and_report(
             if not isinstance(user_id, int):
                 continue
             attempt = await attempt_repo.start(user_id, qid, quiz_data.get("quiz_name", ""), total)
-            await attempt_repo.update(attempt["attempt_id"], answers=entry.get("answers", {}), score=int(entry["score"]))
-            await attempt_repo.complete(attempt["attempt_id"], int(entry["score"]), str(entry["name"]))
+            await attempt_repo.update(
+                attempt["attempt_id"],
+                answers=entry.get("answers", {}),
+                score=float(entry["score"]),
+                correct=int(entry.get("correct", 0)),
+                wrong=int(entry.get("wrong", 0)),
+                total_time=float(entry.get("total_time", 0.0)),
+            )
+            await attempt_repo.complete(attempt["attempt_id"], float(entry["score"]), str(entry["name"]))
 
             mistakes = []
             for q_key, ans in entry.get("answers", {}).items():
@@ -1130,12 +1138,13 @@ async def _record_attempt_and_report(
             await stats_repo.bulk_update_wrong_stats(
                 qid, [{"index": i, "wrong": wrong_by_q.get(i, 0), "total": n} for i, n in total_by_q.items()]
             )
-        await quiz_repo.increment_participants(qid)
+        for _ in leaderboard:
+            await quiz_repo.increment_participants(qid)
 
     chat_settings_repo = ChatSettingsRepository(db)
     chat_settings = await chat_settings_repo.get(chat_id)
 
-    if chat_settings["html_enabled"]:
+    if quiz_data.get("html_report", False) or chat_settings["html_enabled"]:
         try:
             report_quiz = {**quiz_data, "qid": qid}
             html_bytes, filename = await render_quiz_html(report_quiz, mode="exam")
@@ -1147,8 +1156,8 @@ async def _record_attempt_and_report(
         except Exception as e:
             logger.error("HTML report generation error: %s", e)
 
-    if chat_settings["pdf_enabled"]:
-        await _send_pdf_report(ctx, chat_id, quiz_data, chat_title, leaderboard, session_polls=None, thread_id=thread_id)
+    if quiz_data.get("pdf_report", False) or chat_settings["pdf_enabled"]:
+        await _send_pdf_report(ctx, chat_id, quiz_data, chat_title, leaderboard, session_polls=session_polls, thread_id=thread_id)
 
 
 async def _send_pdf_report(
@@ -1212,6 +1221,49 @@ async def _send_pdf_report(
         logger.error("PDF report error: %s", e, exc_info=True)
 
 
+async def result_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the caller's most recently completed quiz result."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+    try:
+        attempt = await AttemptRepository(get_db()).latest_completed_for_user(user.id)
+        if not attempt:
+            await safe_send_message(ctx, chat.id, "📊 <b>No completed quiz result found yet.</b>\n\nPlay a quiz first with <code>/start QUIZ_ID</code>.", parse_mode=ParseMode.HTML)
+            return
+
+        total = int(attempt.get("total_questions", 0))
+        correct = int(attempt.get("correct", 0))
+        wrong = int(attempt.get("wrong", 0))
+        score = float(attempt.get("score", 0))
+        total_time = float(attempt.get("total_time", 0))
+        answered = correct + wrong
+        pct = (correct / total * 100) if total else 0.0
+        accuracy = (correct / answered * 100) if answered else 0.0
+        mins, secs = divmod(int(total_time), 60)
+        quiz_name = attempt.get("quiz_name") or "Quiz"
+        ended = attempt.get("time_ended") or ""
+        text = (
+            "📊 <b>Latest Quiz Result</b>\n\n"
+            f"📝 <b>{quiz_name}</b>\n"
+            f"🆔 <code>{attempt.get('qid', 'N/A')}</code>\n\n"
+            f"📚 Questions: <b>{total}</b>\n"
+            f"✅ Correct: <b>{correct}</b>\n"
+            f"❌ Wrong: <b>{wrong}</b>\n"
+            f"🎯 Score: <b>{score:g}</b>\n"
+            f"📈 Percentage: <b>{pct:.1f}%</b>\n"
+            f"🎯 Accuracy: <b>{accuracy:.1f}%</b>\n"
+            f"⏱ Time: <b>{mins}m {secs}s</b>"
+        )
+        if ended:
+            text += f"\n\n🕒 Completed: <code>{ended} UTC</code>"
+        await safe_send_message(ctx, chat.id, text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error("result_command error: %s", e, exc_info=True)
+        await safe_send_message(ctx, chat.id, "❌ Could not load your result right now.")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # COMMAND HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1241,9 +1293,6 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         user_id = update.message.from_user.id
 
-        if not await is_premium_user(user_id):
-            await safe_send_message(ctx, chat_id, "Please help us to make this project more valuable by purchasing premium! Thanks")
-            return
         if not await rate_limiter.check(user_id):
             await safe_send_message(ctx, chat_id, "⏱️ Too many requests. Wait a moment.")
             return
@@ -1333,6 +1382,26 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         quiz["correct_mark"] = quiz.get("correct_marks", 1)
         quiz["shuffle_options"] = bool(quiz.get("shuffle_options", False))
         quiz["shuffle"] = bool(quiz.get("shuffle_questions", False))
+
+        # Quizzes created by the new Creator /create wizard have fixed,
+        # creator-selected settings. Do not ask the player a second settings
+        # wizard; launch directly with the saved quiz configuration.
+        if quiz.get("fixed_settings"):
+            pending_quiz_settings[chat_id] = {
+                "quiz": quiz, "update": update, "skip": skip,
+                "protect": protect, "chat_type": chat_type,
+                "correct_mark": float(quiz.get("correct_marks", 1)),
+                "neg_mark": float(quiz.get("negative_marks", 0)),
+                "shuffle_q": bool(quiz.get("shuffle_questions", False)),
+                "shuffle_o": bool(quiz.get("shuffle_options", False)),
+                "show_explanation": bool(quiz.get("show_explanation", False)),
+                "timer_override": int(quiz.get("timer", 30)),
+                "initiator_id": user_id, "message_thread_id": getattr(update.message, "message_thread_id", None),
+            }
+            from .setup_wizard import _launch_quiz_from_settings
+            await _launch_quiz_from_settings(chat_id, ctx, pending_quiz_settings[chat_id])
+            pending_quiz_settings.pop(chat_id, None)
+            return
 
         cmd_thread_id = getattr(update.message, "message_thread_id", None)
         pending_quiz_settings[chat_id] = {
@@ -1625,9 +1694,8 @@ async def _check_anti_cheat(
     ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, session: dict, poll_id: str,
     user_id: int, user_name: str, option_ids: list, correct: Any, now: float,
 ) -> None:
-    """Speed+accuracy pattern check: users who repeatedly answer faster than
-    config.CHEAT_SPEED_THRESHOLD *and* get it wrong are flagged as likely
-    running a duplicate/bot account and auto-kicked past a suspicion ratio."""
+    """Speed+accuracy pattern check. Suspicious activity is logged only;
+    the bot never auto-bans a participant based on heuristics."""
     pinfo = session["polls"][poll_id]
     sent_time = pinfo.get("sent_time", now)
     answer_time = now - sent_time
@@ -1646,21 +1714,15 @@ async def _check_anti_cheat(
     sus_ratio = ct["suspicious"] / ct["total"]
     if sus_ratio < CHEAT_WRONG_RATIO:
         return
-    try:
-        await ctx.bot.ban_chat_member(chat_id, user_id)
-        await safe_send_message(
-            ctx, chat_id,
-            f"\U0001F6AB <b>{user_name}</b> was removed from the group!\n\n"
-            f"<i>Suspicious rapid-wrong-answer pattern detected (possible duplicate account).</i>",
-            parse_mode=ParseMode.HTML,
-        )
-        logger.warning("Cheater kicked: uid=%s name=%s cid=%s suspicious=%.0f%%", user_id, user_name, chat_id, sus_ratio * 100)
-    except Exception as e:
-        logger.error("Failed to kick cheater uid=%s: %s", user_id, e)
+    logger.warning(
+        "Suspicious quiz activity flagged: uid=%s name=%s cid=%s suspicious=%.0f%%",
+        user_id, user_name, chat_id, sus_ratio * 100,
+    )
 
 
 def register(application: Application) -> None:
     """Register all quiz-play command/poll handlers on the given Application."""
+    application.add_handler(CommandHandler("result", result_command))
     application.add_handler(CommandHandler("start", start_quiz))
     application.add_handler(CommandHandler("pause", pause_quiz))
     application.add_handler(CommandHandler("resume", resume_quiz))

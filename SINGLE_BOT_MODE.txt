@@ -1,0 +1,5 @@
+Journey for लबासना — SINGLE BOT MODE
+
+This build runs Creator + Runner through ONE python-telegram-bot polling client.
+Do not run quizbot/creator_bot/bot.py separately.
+Keep the existing .env and data/ directory.

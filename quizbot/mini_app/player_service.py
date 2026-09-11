@@ -236,8 +236,15 @@ async def complete_session(attempt_id: str) -> Optional[dict]:
     wrong_count = len(answers) - correct_count
 
     attempt_repo = AttemptRepository(get_db())
-    await attempt_repo.update(attempt_id, current_question=len(session["order"]), score=round(total_score))
-    await attempt_repo.complete(attempt_id, score=round(total_score), username=session["username"])
+    await attempt_repo.update(
+        attempt_id,
+        current_question=len(session["order"]),
+        score=float(total_score),
+        correct=int(correct_count),
+        wrong=int(wrong_count),
+        total_time=float(total_time),
+    )
+    await attempt_repo.complete(attempt_id, score=float(total_score), username=session["username"])
 
     qid = session["qid"]
     stats_repo = QuestionStatsRepository(get_db())

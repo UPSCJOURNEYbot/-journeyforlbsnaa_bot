@@ -63,7 +63,9 @@ class Database:
         await db.auth_chats.create_index("creator_id", unique=True)
 
         await db.payments.create_index("user_id")
-        await db.payments.create_index("transaction_id")
+        await db.payments.create_index("transaction_id", sparse=True)
+        await db.payments.create_index("token", unique=True, sparse=True)
+        await db.payments.create_index([("user_id", 1), ("status", 1), ("created_at", -1)])
 
         await db.ai_keys.create_index([("user_id", 1), ("provider", 1)])
 
@@ -89,6 +91,8 @@ class Database:
         await db.batches.create_index("creator_id")
         await db.batch_access.create_index([("batch_id", 1), ("chat_id", 1)], unique=True)
         await db.batch_quizzes.create_index([("batch_id", 1), ("qid", 1)], unique=True)
+        await db.scheduled_quizzes.create_index("job_id", unique=True)
+        await db.scheduled_quizzes.create_index([("chat_id", 1), ("scheduled_time", 1)])
 
     async def close(self) -> None:
         if self._client is not None:

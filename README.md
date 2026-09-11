@@ -101,6 +101,20 @@ Everything runs from **one process** (`run.py`) by default, sharing a single asy
 
 ---
 
+
+## ⚠️ Telegram Bot Token Requirement
+
+This deployment uses two Telegram bots and they **must use different bot tokens**:
+
+- `CREATOR_BOT_TOKEN` → backward-compatible alias for the single bot token
+- `RUNNER_BOT_TOKEN` → backward-compatible alias for the same single bot token
+
+All quiz **Start**, **Add to Group**, search, inline-share, and Mini App links are generated for the same single bot automatically from `RUNNER_BOT_TOKEN`. There is exactly one Telegram polling client; Creator and Runner are logical roles inside that one bot.
+
+Telegram does not allow the same bot token to be polled by both the Pyrogram Creator Bot and the python-telegram-bot Runner Bot. If both variables contain the same token, startup stops with a clear configuration error.
+
+Do **not** create a second bot. Put your existing bot token in `BOT_TOKEN` (or keep the existing `CREATOR_BOT_TOKEN` and `RUNNER_BOT_TOKEN` values identical for backward compatibility). Never paste tokens into chat or commit them to GitHub.
+
 ## 🔧 Prerequisites
 
 | Requirement | Minimum Version | Notes |
@@ -135,8 +149,9 @@ All values live in `.env` (copy from [`.env.example`](.env.example)). Note: you 
 | Variable | Required | Description |
 |---|---|---|
 | `API_ID` / `API_HASH` | ✅ | Telegram API credentials from [my.telegram.org](https://my.telegram.org) |
-| `CREATOR_BOT_TOKEN` | ✅ | Token for the Pyrogram bot (creation, editing, payments) |
-| `RUNNER_BOT_TOKEN` | ✅ | Token for the PTB bot (playing, scheduling, AI generation) |
+| `BOT_TOKEN` | ✅ | The single Telegram bot token used for all bot roles |
+| `CREATOR_BOT_TOKEN` | Optional | Backward-compatible alias; falls back to `BOT_TOKEN` |
+| `RUNNER_BOT_TOKEN` | Optional | Backward-compatible alias; falls back to `CREATOR_BOT_TOKEN` / `BOT_TOKEN` |
 | `MONGODB_URI` | ✅ | MongoDB Atlas connection string |
 | `MONGODB_DB_NAME` | ✅ | Database name (default: `quizbot`) |
 | `OWNER_ID` | ✅ | Your Telegram user ID |
@@ -263,3 +278,6 @@ Data lives in MongoDB Atlas — a free M0 cluster is enough to get started (see 
 *Built for educators, exam aspirants, and quiz creators.*
 
 </div>
+
+## Journey for लबासना Podcast — Gemini
+The podcast handler uses Gemini for script generation and Gemini 2.5 Flash TTS for two-speaker audio. Add `GEMINI_API_KEY` to `.env`. The final Codespace launcher is `./install_and_run_final.sh`; it preserves `.env`, chooses a supported Python 3.11–3.13 environment, installs dependencies, ensures ffmpeg is available, and starts the bot.

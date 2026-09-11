@@ -34,10 +34,34 @@ class ScheduledQuizManager:
     """Tracks pending scheduled-quiz jobs and drives their launch via the
     shared AsyncIOScheduler instance."""
 
-    def __init__(self, scheduler: AsyncIOScheduler) -> None:
+    def __init__(self, scheduler: AsyncIOScheduler, bot: Any = None) -> None:
         self.scheduler = scheduler
+        self.bot = bot
         self.jobs: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
+        self.col = get_db().collection("scheduled_quizzes")
+
+    async def restore(self) -> None:
+        """Reload future schedules from MongoDB after a process restart."""
+        now = datetime.now(IST)
+        async for row in self.col.find({"scheduled_time": {"$gt": now.isoformat()}}):
+            try:
+                scheduled_time = IST.localize(datetime.fromisoformat(row["scheduled_time"]).replace(tzinfo=None))
+                job_id = row["job_id"]
+                if self.bot is not None:
+                    self.scheduler.add_job(
+                        self._run, trigger=DateTrigger(run_date=scheduled_time),
+                        args=[row["chat_id"], row["quiz_id"], _BotContext(self.bot)],
+                        id=job_id, replace_existing=True,
+                    )
+                    self.jobs[job_id] = {
+                        "chat_id": row["chat_id"], "quiz_id": row["quiz_id"],
+                        "scheduled_time": scheduled_time, "created_by": row["created_by"],
+                        "created_at": row.get("created_at", now),
+                    }
+            except Exception:
+                logger.exception("Failed to restore scheduled quiz %s", row.get("job_id"))
+
 
     async def add(self, chat_id: int, qid: str, scheduled_time: datetime, created_by: int, ctx: ContextTypes.DEFAULT_TYPE) -> str:
         async with self._lock:
@@ -46,10 +70,19 @@ class ScheduledQuizManager:
                 self._run, trigger=DateTrigger(run_date=scheduled_time),
                 args=[chat_id, qid, ctx], id=job_id, replace_existing=True,
             )
+            created_at = datetime.now(IST)
             self.jobs[job_id] = {
                 "chat_id": chat_id, "quiz_id": qid, "scheduled_time": scheduled_time,
-                "created_by": created_by, "created_at": datetime.now(IST),
+                "created_by": created_by, "created_at": created_at,
             }
+            await self.col.update_one(
+                {"job_id": job_id},
+                {"$set": {
+                    "job_id": job_id, "chat_id": chat_id, "quiz_id": qid,
+                    "scheduled_time": scheduled_time.isoformat(), "created_by": created_by,
+                    "created_at": created_at.isoformat(),
+                }}, upsert=True,
+            )
             return job_id
 
     async def remove(self, job_id: str) -> bool:
@@ -61,6 +94,7 @@ class ScheduledQuizManager:
             except Exception:
                 pass
             del self.jobs[job_id]
+            await self.col.delete_one({"job_id": job_id})
             return True
 
     async def get_for_chat(self, chat_id: int) -> list[dict[str, Any]]:
@@ -77,6 +111,7 @@ class ScheduledQuizManager:
                     if info["chat_id"] == chat_id and info["quiz_id"] == qid:
                         admin_id = info["created_by"]
                         self.jobs.pop(jid, None)
+                        await self.col.delete_one({"job_id": jid})
                         break
             admin_id = admin_id or chat_id
 
@@ -139,13 +174,19 @@ class ScheduledQuizManager:
                 pass
 
 
+class _BotContext:
+    """Minimal context used by restored APScheduler jobs."""
+    def __init__(self, bot: Any) -> None:
+        self.bot = bot
+
+
 schedule_mgr: "ScheduledQuizManager | None" = None
 
 
-def init_schedule_manager(scheduler: AsyncIOScheduler) -> ScheduledQuizManager:
+def init_schedule_manager(scheduler: AsyncIOScheduler, bot: Any = None) -> ScheduledQuizManager:
     """Called once from bot.py after the shared scheduler is created."""
     global schedule_mgr
-    schedule_mgr = ScheduledQuizManager(scheduler)
+    schedule_mgr = ScheduledQuizManager(scheduler, bot)
     return schedule_mgr
 
 
@@ -199,6 +240,9 @@ async def schedule_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             await safe_send_message(ctx, chat_id, f"❌ Quiz {qid} not found.")
             return
 
+        if schedule_mgr is None:
+            await safe_send_message(ctx, chat_id, "❌ Scheduler is not ready. Please try again.")
+            return
         await schedule_mgr.add(chat_id, qid, sched_time, user_id, ctx)
 
         diff = sched_time - now
@@ -222,6 +266,9 @@ async def viewschedule_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             await safe_send_message(ctx, chat_id, "❌ Groups only.")
             return
 
+        if schedule_mgr is None:
+            await safe_send_message(ctx, chat_id, "❌ Scheduler is not ready.")
+            return
         schedules = await schedule_mgr.get_for_chat(chat_id)
         if not schedules:
             await safe_send_message(ctx, chat_id, "\U0001F4C5 No scheduled quizzes.")
@@ -266,6 +313,9 @@ async def cancelschedule_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             return
 
         qid = ctx.args[0]
+        if schedule_mgr is None:
+            await safe_send_message(ctx, chat_id, "❌ Scheduler is not ready.")
+            return
         schedules = await schedule_mgr.get_for_chat(chat_id)
         for s in schedules:
             if s["quiz_id"] == qid and await schedule_mgr.remove(s["job_id"]):

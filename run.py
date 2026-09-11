@@ -29,17 +29,10 @@ for noisy in ("httpx", "httpcore", "apscheduler", "pymongo"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-async def _run_creator_bot() -> None:
-    from quizbot.creator_bot.bot import run_creator_bot
-
-    logger.info("Starting Creator Bot (Pyrogram)...")
-    await run_creator_bot()
-
-
 async def _run_runner_bot() -> None:
     from quizbot.runner_bot.bot import run_runner_bot
 
-    logger.info("Starting Runner Bot (python-telegram-bot)...")
+    logger.info("Starting SINGLE Telegram Bot (Creator + Runner)...")
     await run_runner_bot()
 
 
@@ -63,10 +56,10 @@ async def main(only: str | None) -> None:
     logger.info("Database ready.")
 
     tasks: list[asyncio.Task] = []
-    if only in (None, "creator"):
-        tasks.append(asyncio.create_task(_run_creator_bot(), name="creator_bot"))
-    if only in (None, "runner"):
-        tasks.append(asyncio.create_task(_run_runner_bot(), name="runner_bot"))
+    # ONE Telegram bot / ONE polling client. Creator + Runner handlers are
+    # both registered inside the Runner PTB application.
+    if only in (None, "runner", "creator"):
+        tasks.append(asyncio.create_task(_run_runner_bot(), name="bot"))
     if only == "miniapp":
         tasks.append(asyncio.create_task(_run_mini_app(), name="mini_app"))
     elif only is None and config.MINI_APP_DOMAIN:
@@ -108,8 +101,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Advance Quiz Bot platform.")
     parser.add_argument(
         "--only", choices=["creator", "runner", "miniapp"], default=None,
-        help="Run only one component (default: run both bots, plus the "
-             "Mini App server too if MINI_APP_DOMAIN is configured).",
+        help="Run the single Telegram bot (creator/runner are logical roles); "
+             "or run only the Mini App server.",
     )
     args = parser.parse_args()
 
