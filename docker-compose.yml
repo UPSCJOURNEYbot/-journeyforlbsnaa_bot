@@ -1,32 +1,27 @@
 version: "3.9"
 
-# Two bot services plus an optional Mini App service. Data lives in MongoDB
-# Atlas (a hosted database reached via the MONGODB_URI env var), NOT in a
-# local volume -- so there is nothing to persist on this host between
-# container recreations. Run with:
+# SINGLE-BOT build: Creator + Runner are logical roles inside ONE
+# python-telegram-bot polling client. Telegram allows exactly one
+# long-polling consumer per bot token, so there is exactly ONE bot
+# service here (running the old two-service layout with one shared token
+# would cause a getUpdates conflict).
+#
+# Data lives in MongoDB (MONGODB_URI) -- nothing is persisted on this host
+# between container recreations. Run with:
 #   docker compose up -d --build
 #
 # The mini-app service is only useful if MINI_APP_DOMAIN is set in .env
 # (pointing at a reverse proxy / tunnel in front of the exposed port below).
-# If you don't want the Mini App feature at all, just leave MINI_APP_DOMAIN
-# blank and run `docker compose up -d creator-bot runner-bot` instead.
+# If you don't want the Mini App feature at all, leave MINI_APP_DOMAIN
+# blank and run `docker compose up -d --build quizbot` instead.
 
 services:
-  creator-bot:
+  quizbot:
     build: .
-    container_name: quizbot-creator
-    command: ["python", "run.py", "--only", "creator"]
+    container_name: quizbot
+    command: ["python", "run.py"]
     env_file: .env
     restart: unless-stopped
-
-  runner-bot:
-    build: .
-    container_name: quizbot-runner
-    command: ["python", "run.py", "--only", "runner"]
-    env_file: .env
-    restart: unless-stopped
-    depends_on:
-      - creator-bot
 
   mini-app:
     build: .
@@ -37,4 +32,4 @@ services:
       - "${MINI_APP_PORT:-8080}:${MINI_APP_PORT:-8080}"
     restart: unless-stopped
     depends_on:
-      - creator-bot
+      - quizbot
