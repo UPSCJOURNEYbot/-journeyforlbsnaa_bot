@@ -389,6 +389,7 @@ class _CreatorStateFilter(BaseFilter):
             uid in state.quiz_creation
             or uid in state.batch_sessions
             or uid in state.edit_sessions
+            or uid in state.testseries_upload
         )
 
 
@@ -411,6 +412,19 @@ async def _creator_message_router(update, context):
         from quizbot.creator_bot.handlers.quiz_editing import handle_edit_text_input
         await handle_edit_text_input(client, bridge)
         return
+
+    # Direct test-series file flow: one document, then one config line.
+    if uid in state.testseries_upload and msg.chat.type == "private":
+        from quizbot.creator_bot.handlers import testseries_file as tsf
+        if msg.document:
+            await tsf.handle_testseries_document(client, bridge)
+            return
+        if msg.text and not msg.text.startswith("/"):
+            if (state.testseries_upload.get(uid) or {}).get("step") == "awaiting_config":
+                await tsf.handle_testseries_config(client, bridge)
+                return
+            await tsf.handle_testseries_text(client, bridge)
+            return
 
     # Creation wizard accepts documents, photos, polls and free text.
     if uid in state.quiz_creation and msg.chat.type == "private":

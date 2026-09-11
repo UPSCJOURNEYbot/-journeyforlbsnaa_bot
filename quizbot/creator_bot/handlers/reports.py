@@ -130,10 +130,17 @@ def _build_testseries_payload(quizzes: list[dict], mode: str, title: str) -> dic
     }
 
 
-async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll_timeout: int = 180) -> bytes:
+async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll_timeout: int = 180,
+                                tagline: str | None = None) -> bytes:
     """Delegate PDF rendering to the external microservice at
-    `config.PDF_API_BASE`. Raises RuntimeError on any failure."""
+    `config.PDF_API_BASE`. Raises RuntimeError on any failure.
+
+    `tagline` (used only by the direct-file flow) overrides the cover
+    tagline; None keeps the default "Test Series".
+    """
     payload = _build_testseries_payload(quizzes, mode, title)
+    if tagline is not None:
+        payload["tagline"] = tagline
 
     base = config.PDF_API_BASE.rstrip("/")
     status, job = await request_json("POST", f"{base}/api/generate", json_body=payload)
@@ -200,13 +207,11 @@ async def testseries_cmd(c: Client, m: Message) -> None:
 
     raw = m.text.split(maxsplit=1)[1].strip() if len(m.text.split(maxsplit=1)) > 1 else ""
     if not raw:
-        await m.reply(
-            "**Mock Test PDF Generator**\n\n"
-            "Usage: `/testseries QID1 [QID2 QID3...] [mode=inline|keyonly] [title=Your_Title]`\n\n"
-            "`mode=inline` -- answer & explanation after every question\n"
-            "`mode=keyonly` -- questions only, answer key at the end (default)\n\n"
-            "Example: `/testseries GGN123 GGN456 mode=keyonly title=SSC_Mock_2026`"
-        )
+        # Bare /testseries -- direct MCQ-file flow (additive; the QID flow
+        # below is unchanged). Local import: testseries_file imports this
+        # module's PDF helpers, so a top-level import would be circular.
+        from .testseries_file import start_upload_flow
+        await start_upload_flow(c, m)
         return
 
     mode, title, quiz_ids = _parse_testseries_args(raw)
