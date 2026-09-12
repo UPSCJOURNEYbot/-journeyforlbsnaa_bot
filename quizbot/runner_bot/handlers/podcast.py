@@ -302,6 +302,32 @@ GEMINI_CALL_TIMEOUT = 180.0
 # asyncio wait_for() later abandons.
 GEMINI_HTTP_TIMEOUT_MS = 150_000
 
+# --- Total generation budget -------------------------------------------------
+# GEMINI_CALL_TIMEOUT bounds a *single* Gemini call. The pipeline is a serial
+# loop over N questions (plus TTS chunks and ffmpeg work), so the sum of those
+# bounded calls needs a cap of its own: without it a slow-but-not-stuck run can
+# occupy a worker and the user's quota for hours.
+# The floor covers TTS + ffmpeg merge/split; the per-question term scales the
+# script stage (10-question PDF vs 300-question Test Series range).
+PODCAST_BASE_TIMEOUT = 1200.0
+PODCAST_PER_QUESTION_TIMEOUT = 45.0
+# Hard bound on every ffmpeg/ffprobe wait -- both are on the critical path.
+FFMPEG_CMD_TIMEOUT = 300.0
+
+# Per-user generation locks. One running job per user, so a slow or stuck
+# episode cannot pile more Gemini/ffmpeg work onto the shared thread pool that
+# the rest of the bot also uses.
+_PODCAST_LOCKS: dict[int, asyncio.Lock] = {}
+
+_DEADLINE_MSG = (
+    "❌ Podcast banane me bahut time lag gaya. "
+    "Chhoti range (kam questions) select karke dobara try karein."
+)
+_BUSY_USER_MSG = (
+    "⏳ Aapka pichhla podcast abhi ban raha hai. "
+    "Wah complete hone ke baad naya podcast bhejein."
+)
+
 
 def _genai_types():
     """Lazily import ``google.genai.types``; None when the SDK is absent.
@@ -453,8 +479,9 @@ def _new_genai_client(api_key: str):
 
     Passes an explicit HTTP timeout so the SDK's own blocking request is
     bounded too (the asyncio wait_for() bounds the bot side; this bounds the
-    worker thread). If the SDK/type import fails, a plain client is built so
-    legacy test doubles keep working.
+    worker thread). If the SDK/type import fails the timeout is still applied
+    via a plain dict, because an unbounded client leaves orphaned worker
+    threads behind whenever asyncio wait_for() gives up on them.
     """
     from google import genai
     http_options = None
@@ -463,9 +490,17 @@ def _new_genai_client(api_key: str):
         http_options = _types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS)
     except Exception:
         http_options = None
-    if http_options is None:
+    if http_options is not None:
+        return genai.Client(api_key=api_key, http_options=http_options)
+    # Degraded path: no typed helper available. Still bound the socket, and
+    # only fall back to an unbounded client if this SDK rejects a dict.
+    try:
+        return genai.Client(api_key=api_key,
+                            http_options={"timeout": GEMINI_HTTP_TIMEOUT_MS})
+    except TypeError:
+        logger.warning("google-genai rejected dict http_options; "
+                       "falling back to an unbounded client")
         return genai.Client(api_key=api_key)
-    return genai.Client(api_key=api_key, http_options=http_options)
 
 
 def _generate_once(prompt: str, api_key: str, max_tokens: int) -> str:
@@ -622,13 +657,31 @@ def _chunk_lines_for_tts(lines: list[tuple[str, str]],
     return chunks
 
 
-async def _run_cmd(*args: str, capture_stdout: bool = False) -> tuple[int, str]:
-    """Run ffmpeg/ffprobe without blocking the bot. Seam for tests."""
+async def _run_cmd(*args: str, capture_stdout: bool = False,
+                   timeout: float = FFMPEG_CMD_TIMEOUT) -> tuple[int, str]:
+    """Run ffmpeg/ffprobe without blocking the bot. Seam for tests.
+
+    The wait is bounded: a wedged ffmpeg must not hold the pipeline forever.
+    On expiry the child is killed so no orphan process is left behind, and a
+    GNU-timeout style status (124) is returned so callers keep their existing
+    failure handling.
+    """
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
-    out, err = await proc.communicate()
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, TimeoutError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        return 124, f"command timed out after {timeout:.0f}s"
     tail = (out if capture_stdout else err).decode(errors="ignore")
     return proc.returncode or 0, tail[-2000:]
 
@@ -922,72 +975,103 @@ async def _send_main_menu(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
     )
 
 
+def _podcast_lock(uid: int) -> asyncio.Lock:
+    """Per-user lock so a user can only run one podcast at a time."""
+    lock = _PODCAST_LOCKS.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PODCAST_LOCKS[uid] = lock
+    return lock
+
+
 async def _generate_podcast(uid: int, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE,
                             api_key: str, source: str, mode: str, label: str) -> None:
     status = await safe_send_message(ctx, chat_id, "🎙️ Podcast script तैयार किया जा रहा है...")
     out = str(config.TEMP_DIR / f"podcast_{uid}_{os.getpid()}_{abs(hash(label)) % 10**8}.mp3")
     parts: list[str] = []
+    lock = _podcast_lock(uid)
+    if lock.locked():
+        await _edit_status(status, _BUSY_USER_MSG)
+        return
     try:
-        async def on_script(i: int, n: int) -> None:
-            if n <= 10 or i == 1 or i == n or i % 10 == 0:
-                await _edit_status(status, f"🎙️ Podcast script तैयार किया जा रहा है...\nQuestion {i}/{n}")
+        async with lock:
+            # Total budget for generation (script + TTS + merge/split). The
+            # Telegram delivery below is deliberately outside this budget:
+            # cancelling a half-finished upload would only waste the work done.
+            total_budget = PODCAST_BASE_TIMEOUT
+            if mode == "question":
+                total_budget += PODCAST_PER_QUESTION_TIMEOUT * max(
+                    1, len(_extract_tagged_questions(source))
+                )
+            try:
+                async with asyncio.timeout(total_budget):
+                    async def on_script(i: int, n: int) -> None:
+                        if n <= 10 or i == 1 or i == n or i % 10 == 0:
+                            await _edit_status(status, f"🎙️ Podcast script तैयार किया जा रहा है...\nQuestion {i}/{n}")
 
-        if mode == "question":
-            raw_questions = _extract_tagged_questions(source)
-            questions = raw_questions
-            if not questions:
-                raise RuntimeError("No questions found in the selected source.")
-            lines = await _generate_question_script(uid, questions, api_key, progress_cb=on_script)
-        else:
-            prompt = _script_prompt(source, mode, label)
-            raw = await _gemini_generate(prompt, api_key, max_tokens=min(12000, max(5000, len(source) // 2)))
-            lines = _parse_dialogue(raw)
-            if not lines:
-                raise RuntimeError("AI did not return a valid two-host dialogue.")
-        # Brand promo is spoken first, then the educational script, then the outro.
-        lines = _assemble_episode(uid, lines)
+                    if mode == "question":
+                        raw_questions = _extract_tagged_questions(source)
+                        questions = raw_questions
+                        if not questions:
+                            raise RuntimeError("No questions found in the selected source.")
+                        lines = await _generate_question_script(uid, questions, api_key, progress_cb=on_script)
+                    else:
+                        prompt = _script_prompt(source, mode, label)
+                        raw = await _gemini_generate(prompt, api_key, max_tokens=min(12000, max(5000, len(source) // 2)))
+                        lines = _parse_dialogue(raw)
+                        if not lines:
+                            raise RuntimeError("AI did not return a valid two-host dialogue.")
+                    # Brand promo is spoken first, then the educational script, then the outro.
+                    lines = _assemble_episode(uid, lines)
 
-        # -- 2) Voice/audio generation (Gemini TTS + ffmpeg merge/split). --
-        await _edit_status(status, "🎧 Voices generate की जा रही हैं...")
+                    # -- 2) Voice/audio generation (Gemini TTS + ffmpeg merge/split). --
+                    await _edit_status(status, "🎧 Voices generate की जा रही हैं...")
 
-        async def on_audio(stage: str) -> None:
-            if stage == "audio":
-                await _edit_status(status, "🔊 Audio तैयार किया जा रहा है...")
+                    async def on_audio(stage: str) -> None:
+                        if stage == "audio":
+                            await _edit_status(status, "🔊 Audio तैयार किया जा रहा है...")
 
-        try:
-            await _gemini_tts_and_merge(lines, out, api_key, progress_cb=on_audio)
-            parts = await _split_audio_if_needed(out)
-        except GeminiRequestError:
-            # Gemini classified errors (quota/invalid-key/busy) keep their
-            # own messages via the outer handler; never re-labeled as audio.
-            raise
-        except Exception as exc:
-            # TTS/audio-stage failures are reported separately from Gemini
-            # errors (req: TTS errors must not masquerade as script/API errors).
-            logger.error("Podcast audio stage failed: %s",
-                         redact_secrets(str(exc), [api_key]))
-            await _edit_status(status, _TTS_ERR_MSG)
-            return
+                    try:
+                        await _gemini_tts_and_merge(lines, out, api_key, progress_cb=on_audio)
+                        parts = await _split_audio_if_needed(out)
+                    except GeminiRequestError:
+                        # Gemini classified errors (quota/invalid-key/busy) keep their
+                        # own messages via the outer handler; never re-labeled as audio.
+                        raise
+                    except Exception as exc:
+                        # TTS/audio-stage failures are reported separately from Gemini
+                        # errors (req: TTS errors must not masquerade as script/API errors).
+                        logger.error("Podcast audio stage failed: %s",
+                                     redact_secrets(str(exc), [api_key]))
+                        await _edit_status(status, _TTS_ERR_MSG)
+                        return
+            except TimeoutError:
+                logger.warning(
+                    "podcast generation exceeded total budget uid=%s budget=%.0fs",
+                    uid, total_budget,
+                )
+                await _edit_status(status, _DEADLINE_MSG)
+                return
 
-        # -- 3) Delivery to Telegram (reported separately from generation). --
-        await _edit_status(status, "✅ Podcast तैयार है.")
-        total = len(parts)
-        try:
-            for i, part in enumerate(parts, 1):
-                caption = f"🎧 Part {i}/{total} — {label}"[:200] if total > 1 else None
-                with open(part, "rb") as fh:
-                    await ctx.bot.send_audio(
-                        chat_id=chat_id, audio=fh,
-                        title="Journey for लबासना — Podcast",
-                        performer="Journey for लबासना",
-                        caption=caption,
-                    )
-        except Exception as exc:
-            # Telegram/file delivery errors are reported separately (req).
-            logger.error("Podcast delivery failed: %s",
-                         redact_secrets(str(exc), [api_key]))
-            await _edit_status(status, _DELIVERY_ERR_MSG)
-            return
+            # -- 3) Delivery to Telegram (reported separately from generation). --
+            await _edit_status(status, "✅ Podcast तैयार है.")
+            total = len(parts)
+            try:
+                for i, part in enumerate(parts, 1):
+                    caption = f"🎧 Part {i}/{total} — {label}"[:200] if total > 1 else None
+                    with open(part, "rb") as fh:
+                        await ctx.bot.send_audio(
+                            chat_id=chat_id, audio=fh,
+                            title="Journey for लबासना — Podcast",
+                            performer="Journey for लबासना",
+                            caption=caption,
+                        )
+            except Exception as exc:
+                # Telegram/file delivery errors are reported separately (req).
+                logger.error("Podcast delivery failed: %s",
+                             redact_secrets(str(exc), [api_key]))
+                await _edit_status(status, _DELIVERY_ERR_MSG)
+                return
     except GeminiRequestError as exc:
         logger.warning("podcast gemini failure kind=%s", exc.kind)
         if exc.kind == "invalid_key":
