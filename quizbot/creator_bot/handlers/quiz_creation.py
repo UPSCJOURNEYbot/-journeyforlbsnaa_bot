@@ -42,13 +42,144 @@ def _poll_text(value) -> Optional[str]:
     (with a `.text` attribute + entities) instead of a bare `str`, so any
     downstream `re.sub`/string handling breaks with a TypeError unless we
     normalize here first. Handles both the old (str) and new (FormattedText)
-    shapes, plus a plain None."""
+    shapes, plus a plain None.
+
+    A `FormattedText` wrapper whose own `.text` is None (an absent poll
+    explanation, say) must normalize to None -- falling through to `str(value)`
+    would leak the object's repr into the question text."""
     if value is None:
         return None
-    text = getattr(value, "text", None)
-    if text is not None:
-        return str(text)
-    return str(value)
+    missing = object()
+    text = getattr(value, "text", missing)
+    if text is missing:
+        return str(value)
+    if text is None:
+        return None
+    return str(text)
+
+
+def _poll_correct_ids(poll) -> Optional[list[int]]:
+    """Return the marked-correct option indexes of a poll, or None.
+
+    Handles both API shapes seen in the wild: newer Pyrogram forks
+    (Kurigram) expose ``correct_option_ids`` as a list, while older builds
+    expose a single ``correct_option_id`` int.
+    """
+    ids = getattr(poll, "correct_option_ids", None)
+    if ids is None:
+        single = getattr(poll, "correct_option_id", None)
+        ids = [single] if single is not None else None
+    if not ids:
+        return None
+    try:
+        return [int(i) for i in ids]
+    except (TypeError, ValueError):
+        return None
+
+
+def _poll_to_question(
+    poll, remove_words: Optional[list[str]] = None
+) -> tuple[Optional[dict], Optional[str]]:
+    """Convert a forwarded Telegram quiz poll into an internal question dict.
+
+    Returns ``(question, None)`` on success, or ``(None, error_message)`` when
+    the poll cannot be imported -- so the caller can tell the user *why*
+    instead of silently dropping the message.
+    """
+    remove_words = remove_words or []
+    if poll is None:
+        return None, "⚠️ That message has no poll attached."
+
+    poll_type = getattr(poll, "type", None)
+    if poll_type is not None and poll_type != PollType.QUIZ:
+        return None, (
+            "⚠️ That is a regular poll, not a quiz poll -- it has no marked "
+            "correct answer."
+        )
+
+    question = _poll_text(getattr(poll, "question", None))
+    if not question or not question.strip():
+        return None, "⚠️ That poll has no question text."
+
+    raw_options = getattr(poll, "options", None) or []
+    # Keep every option in place: the correct-answer indexes point at these
+    # positions, so dropping blanks here would silently shift the answer.
+    options = [_poll_text(getattr(o, "text", None)) for o in raw_options]
+    if len(options) < 2:
+        return None, "⚠️ A quiz poll needs at least two options."
+    if any(not o or not o.strip() for o in options):
+        return None, "⚠️ That poll has an empty option and cannot be imported."
+
+    correct_ids = _poll_correct_ids(poll)
+    if not correct_ids:
+        return None, (
+            "⚠️ That poll has no marked correct answer. Re-send it as a quiz poll."
+        )
+    if any(i < 0 or i >= len(options) for i in correct_ids):
+        return None, "⚠️ That poll's correct answer points outside its options."
+    if len(correct_ids) > 1:
+        return None, (
+            "⚠️ Multiple-answer polls are not supported yet -- every imported "
+            "question needs exactly one correct option."
+        )
+
+    if remove_words:
+        question = filter_words(question, remove_words)
+        options = [filter_words(o, remove_words) for o in options]
+
+    explanation = _poll_text(getattr(poll, "explanation", None))
+    if explanation and remove_words:
+        explanation = filter_words(explanation, remove_words)
+
+    question = strip_source_noise(question)
+    options = [strip_source_noise(o) for o in options]
+    if explanation:
+        explanation = strip_source_noise(explanation)
+
+    if not question or len(options) < 2:
+        return None, "⚠️ Nothing usable was left in that poll after cleanup."
+
+    return {
+        "question": question,
+        "options": options,
+        "correct_option_id": correct_ids[0],
+        "explanation": explanation or None,
+    }, None
+
+
+async def _import_poll(m: Message, uid: int, ud: dict) -> None:
+    """Import a forwarded quiz poll into the in-progress /create session."""
+    remove_words: list[str] = []
+    try:
+        user = await UserRepository(get_db()).get_or_create(uid)
+        remove_words = user.get("remove_words", [])
+    except Exception:
+        # remove-words is cosmetic cleanup; never block the import on it.
+        logger.debug("Could not load remove_words for poll import", exc_info=True)
+
+    parsed, error = _poll_to_question(m.poll, remove_words)
+    if error:
+        await m.reply(error)
+        return
+    parsed["file_id"] = None
+    parsed["reply_text"] = None
+    ud["questions"].append(parsed)
+    total = len(ud["questions"])
+    await m.reply(f"✅ {total} questions saved! Send more or /done")
+
+
+# Wizard steps that expect a typed answer. A poll message carries no ``m.text``
+# at all, so these must reject it explicitly instead of reaching the
+# ``m.text.strip()`` calls below (which raised AttributeError, was swallowed by
+# Pyrogram, and left the wizard silently stuck).
+_TYPED_INPUT_STEPS = (
+    "awaiting_name",
+    "awaiting_timer",
+    "awaiting_section_count",
+    "awaiting_section_name",
+    "awaiting_question_range",
+    "awaiting_section_timer",
+)
 
 
 # Commands that must always be reachable even while a quiz-creation wizard
@@ -425,6 +556,17 @@ async def handle_creation_message(c: Client, m: Message) -> None:
     if uid not in state.quiz_creation:
         return
     ud = state.quiz_creation[uid]
+
+    # Forwarded quiz polls. A poll has no ``m.text``, so it must be dispatched
+    # before any step that touches ``m.text``.
+    if getattr(m, "poll", None) is not None:
+        if any(ud.get(k) for k in _TYPED_INPUT_STEPS):
+            await m.reply(
+                "⚠️ Reply with text for this step -- a poll cannot be used here."
+            )
+            return
+        await _import_poll(m, uid, ud)
+        return
 
     # Step-by-step settings that require typed input.
     if ud.get("awaiting_timer"):
