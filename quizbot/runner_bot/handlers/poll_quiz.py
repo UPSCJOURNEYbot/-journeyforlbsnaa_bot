@@ -16,6 +16,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from quizbot.database import AuthChatRepository, QuizRepository, get_db
+from quizbot.shared.bold_words import apply_bold_to_poll_fields, format_bold_html
 from quizbot.shared.rich_quiz import RichDispatchResult, enrich_question_dispatch
 from quizbot.shared.utils import is_premium_user
 
@@ -79,6 +80,16 @@ async def _pollquiz_send_one(
             poll_desc = None
             overflow = None
 
+        # -- Important-word bolding (presentation-only; see
+        #    quizbot/shared/bold_words.py). Options/answer key untouched. --
+        if overflow and "Options:" not in overflow:
+            overflow = format_bold_html(overflow)[0]
+        poll_q, poll_expl, bold_modes = apply_bold_to_poll_fields(
+            poll_q, poll_expl,
+            skip_question=bool(rich_res.poll_question_override)
+            or "Choose the correct option" in poll_q,
+        )
+
         if overflow:
             await safe_send_message(ctx, chat_id, overflow, parse_mode=ParseMode.HTML)
             await asyncio.sleep(0.5)
@@ -91,6 +102,7 @@ async def _pollquiz_send_one(
             poll_kwargs["correct_option_id"] = correct_ids[0]
         if poll_desc:
             poll_kwargs["description"] = poll_desc
+        poll_kwargs.update(bold_modes)
 
         sent = await safe_send_poll(
             ctx, chat_id, question=poll_q, options=poll_opts, type=Poll.QUIZ,
