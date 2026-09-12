@@ -406,12 +406,14 @@ async def _creator_message_router(update, context):
     bridge = BridgeMessage(context.bot, msg)
     client = BridgeClient(context.bot)
 
-    # Batch/edit sessions must receive their next text input.
-    if uid in state.batch_sessions and msg.text and not msg.text.startswith("/"):
+    # Batch/edit sessions must receive their next text input (private only,
+    # matching the legacy Pyrogram filters -- otherwise group chatter from
+    # the same user would hijack an open private wizard).
+    if uid in state.batch_sessions and msg.text and not msg.text.startswith("/") and msg.chat.type == "private":
         from quizbot.creator_bot.handlers.batches import batch_input
         await batch_input(client, bridge)
         return
-    if uid in state.edit_sessions and msg.text and not msg.text.startswith("/"):
+    if uid in state.edit_sessions and msg.text and not msg.text.startswith("/") and msg.chat.type == "private":
         from quizbot.creator_bot.handlers.quiz_editing import handle_edit_text_input
         await handle_edit_text_input(client, bridge)
         return
@@ -511,11 +513,13 @@ def register_creator_bridge(application):
         "mywords": settings.mywords_cmd,
         "clearlist": settings.clearlist_cmd,
     }
-    # Legacy Pyrogram registration marks /testseries (+aliases) private-only
-    # (see creator_bot/handlers/reports.py::register). Enforce the same here
-    # so group chats can never trigger (or receive) someone's test-series PDF.
-    # /newseries inherits the same restriction (it also yields a PDF).
-    _private_only = frozenset({"testseries", "tsr", "mocktest", "newseries"})
+    # Legacy Pyrogram registration marks every Creator command private-only
+    # except /help, /features and /listquiz (see each handler module's
+    # register()). Enforce the same here so group chats can never trigger
+    # (or receive) someone's private data. /testseries (+aliases) and
+    # /newseries yield PDFs and are included in the same private set.
+    _public_cmds = frozenset({"help", "features", "listquiz"})
+    _private_only = frozenset(cmd for cmd in command_map if cmd not in _public_cmds)
     for cmd, fn in command_map.items():
         if cmd in _private_only:
             application.add_handler(CommandHandler(

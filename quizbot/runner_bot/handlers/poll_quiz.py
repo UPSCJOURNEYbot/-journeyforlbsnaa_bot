@@ -12,7 +12,7 @@ import logging
 from typing import Any, Optional
 
 from telegram import Poll, Update
-from telegram.constants import ParseMode
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from quizbot.database import AuthChatRepository, QuizRepository, get_db
@@ -194,6 +194,11 @@ async def pollquiz_channel_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
             await safe_send_message(ctx, chat_id, "❌ Invalid QuestionSetID.")
             return
 
+        paid_err = await check_channel_paid_access(quiz, chat_id)
+        if paid_err:
+            await safe_send_message(ctx, chat_id, paid_err)
+            return
+
         questions = quiz.get("questions", [])
         if not questions:
             await safe_send_message(ctx, chat_id, "❌ Quiz has no questions.")
@@ -204,24 +209,39 @@ async def pollquiz_channel_command(update: Update, ctx: ContextTypes.DEFAULT_TYP
         channel_poll_tasks[chat_id] = task
     except Exception as e:
         logger.error("pollquiz_channel_command error: %s", e, exc_info=True)
+        await safe_send_message(ctx, chat_id, "❌ Could not start the poll quiz.")
 
 
 async def pollstop_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """`/pollstop` -- cancels a running `/pollquiz` in this chat."""
     chat_id = update.message.chat_id
     try:
+        chat_type = update.message.chat.type
         try:
             await ctx.bot.delete_message(chat_id, update.message.message_id)
         except Exception:
             pass
 
         task = channel_poll_tasks.get(chat_id)
-        if task and not task.done():
-            task.cancel()
-        else:
+        if not task or task.done():
             await safe_send_message(ctx, chat_id, "⚠️ No poll quiz is running.")
+            return
+
+        if chat_type != ChatType.PRIVATE:
+            from .quiz_play import _require_admin
+            msg = update.message
+            is_anon = msg.sender_chat is not None or (
+                msg.from_user is not None and msg.from_user.id == _ANON_ADMIN_ID
+            )
+            user_id = None if is_anon else (msg.from_user.id if msg.from_user else None)
+            if not await _require_admin(ctx, chat_id, user_id, is_anon):
+                await safe_send_message(ctx, chat_id, "\U0001F6AB Admin only.")
+                return
+
+        task.cancel()
     except Exception as e:
         logger.error("pollstop_command error: %s", e, exc_info=True)
+        await safe_send_message(ctx, chat_id, "❌ Could not stop the poll quiz.")
 
 
 async def check_channel_paid_access(quiz: dict, chat_id: int) -> Optional[str]:

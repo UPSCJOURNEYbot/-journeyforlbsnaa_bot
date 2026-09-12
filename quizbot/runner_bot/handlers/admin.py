@@ -12,7 +12,7 @@ import logging
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from quizbot.database import AuthChatRepository, QuizRepository, get_db
 from quizbot.shared import config
@@ -21,30 +21,6 @@ from ..state import channel_poll_tasks, rate_limiter, session_mgr
 from ..telegram_utils import safe_send_message
 
 logger = logging.getLogger(__name__)
-
-HELP_TEXT = (
-    "\U0001F4D6 <b>Runner Bot — Command Reference</b>\n\n"
-    "<b>Playing quizzes</b>\n"
-    "/start &lt;quiz_id&gt; [skip] — launch a quiz\n"
-    "/pause, /resume, /stop — control the running quiz\n"
-    "/slow, /fast, /normal — adjust the per-question timer\n"
-    "/leaderboard — show a live leaderboard mid-quiz\n\n"
-    "<b>Other quiz modes</b>\n"
-    "/pollquiz &lt;quiz_id&gt;, /pollstop — non-expiring poll mode\n"
-    "/mix &lt;count&gt; &lt;id1&gt; &lt;id2&gt; ... — combine quizzes\n"
-    "/aiquiz &lt;topic&gt; — AI-generated quiz\n"
-    "/pdfquiz — reply to a PDF to generate a quiz from it\n\n"
-    "<b>Reports &amp; settings</b>\n"
-    "/html, /pdf — toggle report generation for this chat\n"
-    "/trans &lt;lang&gt; — live question translation\n"
-    "/schedule, /viewschedule, /cancelschedule — schedule a quiz\n"
-)
-
-
-async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/help` -- command reference."""
-    await safe_send_message(ctx, update.effective_chat.id, HELP_TEXT, parse_mode=ParseMode.HTML)
-
 
 async def handle_channel_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle `/pollquiz` and `/pollstop` sent as channel posts (these
@@ -129,5 +105,7 @@ async def watchdog_loop() -> None:
 
 
 def register(application: Application) -> None:
-    application.add_handler(CommandHandler("help", help_command))
+    # NOTE: no runner /help here. The creator bridge owns /help (a merged
+    # creator+player reference); registering a second handler would make
+    # every /help reply twice (same group, no filters).
     application.add_handler(MessageHandler(filters.COMMAND & filters.ChatType.CHANNEL, handle_channel_command))

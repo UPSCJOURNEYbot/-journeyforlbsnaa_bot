@@ -41,6 +41,7 @@ async def trans_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     await safe_send_message(ctx, chat_id, "\U0001F6AB Admin only.")
                     return
             except Exception:
+                await safe_send_message(ctx, chat_id, "❌ Could not verify admin status. Try again.")
                 return
 
         if not ctx.args:
@@ -65,6 +66,7 @@ async def trans_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_send_message(ctx, chat_id, f"\U0001F310 Translation ON → {SUPPORTED_LANGS[lang]}")
     except Exception as e:
         logger.error("trans_command error: %s", e)
+        await safe_send_message(ctx, chat_id, "❌ Could not update the translation setting. Try again.")
 
 
 def register(application: Application) -> None:

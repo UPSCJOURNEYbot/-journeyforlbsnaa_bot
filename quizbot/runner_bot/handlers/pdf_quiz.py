@@ -24,7 +24,7 @@ from quizbot.shared.utils.async_files import remove_file, write_temp_file
 
 from ..ai_providers import gemini_page_questions, get_provider_key_single
 from ..state import PDF_QUIZ_SESSIONS
-from ..telegram_utils import safe_send_message
+from ..telegram_utils import esc, safe_send_message
 from .ai_quiz import _launch_ai_quiz  # reuse the same quiz-launch path as /aiquiz
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,7 @@ async def pdfquiz_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             except ValueError:
                 await sm.edit_text("❌ Invalid page range. Use <code>1-10</code> or <code>all</code>", parse_mode=ParseMode.HTML)
                 PDF_QUIZ_SESSIONS.pop(user_id, None)
+                await remove_file(pdf_path)
                 return
             sess = PDF_QUIZ_SESSIONS[user_id]
             sess["page_start"], sess["page_end"], sess["step"] = start_p, end_p, "count"
@@ -127,8 +128,13 @@ def _parse_range(text: str, total_pages: int) -> tuple[int, int]:
     if text == "all":
         return 1, (min(20, total_pages) if total_pages else 20)
     rparts = text.split("-")
-    start_p = int(rparts[0].strip())
-    end_p = int(rparts[1].strip())
+    if len(rparts) != 2:
+        raise ValueError("bad range")
+    try:
+        start_p = int(rparts[0].strip())
+        end_p = int(rparts[1].strip())
+    except (ValueError, IndexError) as exc:
+        raise ValueError("bad range") from exc
     if start_p < 1 or end_p < start_p:
         raise ValueError("bad range")
     return start_p, min(end_p, start_p + 19)  # max 20 pages
@@ -168,8 +174,17 @@ async def pdfquiz_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         sess = PDF_QUIZ_SESSIONS.get(user_id)
         if not sess or sess.get("step") != "pages":
             return False
+        # Only the chat the wizard started in may answer the page-range
+        # prompt; otherwise this user's text in any other chat is hijacked.
+        if sess.get("chat_id") is not None and chat_id != sess.get("chat_id"):
+            return False
 
-        text = update.message.text.strip().lower()
+        text = (update.message.text or "").strip().lower()
+        if text in ("cancel", "stop"):
+            PDF_QUIZ_SESSIONS.pop(user_id, None)
+            await remove_file(sess.get("pdf_path", ""))
+            await safe_send_message(ctx, chat_id, "❌ PDF quiz cancelled.")
+            return True
         try:
             start_p, end_p = _parse_range(text, sess.get("total_pages", 0))
         except ValueError:
@@ -362,6 +377,7 @@ async def _pdfquiz_generate_flow(uid: int, ctx: ContextTypes.DEFAULT_TYPE, msg: 
     except ImportError:
         await msg.edit_text("❌ PyMuPDF not installed.\nAsk admin: <code>pip install PyMuPDF</code>", parse_mode=ParseMode.HTML)
         PDF_QUIZ_SESSIONS.pop(uid, None)
+        await remove_file(sess.get("pdf_path", ""))
         return
 
     loop = asyncio.get_running_loop()
@@ -415,16 +431,17 @@ async def _pdfquiz_generate_flow(uid: int, ctx: ContextTypes.DEFAULT_TYPE, msg: 
         if not all_questions:
             await msg.edit_text("❌ No questions generated. The PDF may be empty or unreadable.\nTry a different page range.", parse_mode=ParseMode.HTML)
             PDF_QUIZ_SESSIONS.pop(uid, None)
+            await remove_file(pdf_path)
             return
 
         all_questions = all_questions[:total_q]
         preview = f"✅ <b>{len(all_questions)} questions from PDF!</b>\n\n\U0001F4C4 Pages {start_p}–{end_p} | {total_pages_in_range} page(s) scanned\n\n<b>Preview:</b>\n"
         for i, q in enumerate(all_questions[:2], 1):
             cids = q["correct_option_id"] if isinstance(q["correct_option_id"], list) else [q["correct_option_id"]]
-            preview += f"\n<b>Q{i}.</b> {q['question'][:80]}{'...' if len(q['question']) > 80 else ''}\n"
+            preview += f"\n<b>Q{i}.</b> {esc(q['question'][:80])}{'...' if len(q['question']) > 80 else ''}\n"
             for j, opt in enumerate(q["options"]):
                 mark = "✅" if j in cids else "▪️"
-                preview += f"  {mark} {opt[:45]}\n"
+                preview += f"  {mark} {esc(opt[:45])}\n"
         preview += "\n⏱ <b>Timer per question?</b>"
 
         sess["questions"] = all_questions

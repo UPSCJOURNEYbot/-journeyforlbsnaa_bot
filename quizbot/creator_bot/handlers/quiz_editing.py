@@ -419,14 +419,30 @@ async def edit_tree_cb(c: Client, cb: CallbackQuery) -> None:
     (`bat_`), and quiz-list pagination (`prev:`/`next:`/`refresh:`) --
     those are routed to their own handler modules."""
     uid = cb.from_user.id
-    data = cb.data
+    data = cb.data or ""
     if data == "page_info":
         await cb.answer()
         return
     if uid not in state.edit_sessions:
         await cb.answer()
         return
-    qid = state.edit_sessions[uid]["qid"]
+    session = state.edit_sessions[uid]
+    qid = session.get("qid")
+    if not qid:
+        # Settings-only session (stg_field without an open /edit quiz).
+        await cb.answer("⚠️ No quiz open -- use /edit <quiz_id> first.", show_alert=True)
+        return
+    # Stale-button guard: callbacks that embed a qid must match the session.
+    for prefix in ("main_", "set_", "qmgr_", "view_", "next_", "prev_", "ename_",
+                   "etimer_", "etype_", "eneg_", "add_", "exp_", "shuf_", "perms_",
+                   "addperm_", "remperm_", "epromo_", "close_", "tshufq_", "tshufo_"):
+        if data.startswith(prefix):
+            rest = data[len(prefix):]
+            cb_qid = rest.split("_")[0] if rest else ""
+            if cb_qid and cb_qid != qid:
+                await cb.answer("⚠️ Stale button -- reopen with /edit.", show_alert=True)
+                return
+            break
     quiz = await QuizRepository(get_db()).get(qid)
     if not quiz:
         await cb.answer("⚠️ Not found", show_alert=True)

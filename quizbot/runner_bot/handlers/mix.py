@@ -17,7 +17,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from quizbot.database import QuizRepository, get_db
 from quizbot.shared.utils import is_premium_user
 
-from ..state import pending_quiz_settings, rate_limiter, session_mgr
+from ..quiz_utils import resolve_quiz_access
+from ..state import pending_quiz_settings, pending_setup_live, rate_limiter, session_mgr
 from ..telegram_utils import safe_send_message
 from .setup_wizard import show_correct_mark_prompt
 
@@ -72,21 +73,43 @@ async def mix_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await safe_send_message(ctx, chat_id, "⚠️ A quiz is already running. /stop it first.")
             return
 
+        if pending_setup_live(chat_id):
+            await safe_send_message(ctx, chat_id, "⚠️ Quiz setup already in progress. Finish it, cancel it, or wait for it to expire.")
+            return
+
         status = await safe_send_message(ctx, chat_id, f"⏳ Fetching {len(qids)} quizzes...")
 
         quiz_repo = QuizRepository(get_db())
-        quizzes, failed = [], []
+        quizzes, failed, denied = [], [], []
         for qid in qids:
             q = await quiz_repo.get(qid.strip())
-            if q and q.get("questions"):
-                quizzes.append(q)
-            else:
+            if not q or not q.get("questions"):
                 failed.append(qid)
+                continue
+            # Same access gate as /start: a mix must not launder paid
+            # quizzes the mixer is not authorised for.
+            allowed, _batch = await resolve_quiz_access(
+                qid.strip(), q, chat_id, chat_type, user_id, ctx=ctx
+            )
+            if not allowed:
+                denied.append(qid)
+                continue
+            quizzes.append(q)
 
         if failed:
             await safe_send_message(ctx, chat_id, f"⚠️ Skipped (not found): {', '.join(failed)}")
+        if denied:
+            await safe_send_message(ctx, chat_id, f"🔒 Skipped (no access): {', '.join(denied)}")
         if not quizzes:
-            await safe_send_message(ctx, chat_id, "❌ None of the provided quiz IDs are valid.")
+            if status:
+                try:
+                    await status.delete()
+                except Exception:
+                    pass
+            if denied:
+                await safe_send_message(ctx, chat_id, "❌ None of the provided quiz IDs are accessible to you.")
+            else:
+                await safe_send_message(ctx, chat_id, "❌ None of the provided quiz IDs are valid.")
             return
 
         per_q = max(1, n // len(quizzes))
@@ -120,6 +143,7 @@ async def mix_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         cmd_thread_id = getattr(update.message, "message_thread_id", None)
         pending_quiz_settings[chat_id] = {
+            "created_at": time.time(),
             "quiz": mix_quiz, "update": update, "skip": 0,
             "protect": False, "chat_type": chat_type,
             "correct_mark": 1.0, "neg_mark": 0.0,

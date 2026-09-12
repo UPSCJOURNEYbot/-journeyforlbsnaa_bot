@@ -45,6 +45,7 @@ async def html_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_send_message(ctx, chat_id, text, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error("html_command error: %s", e)
+        await safe_send_message(ctx, chat_id, "❌ Could not toggle HTML reports right now.")
 
 
 async def pdf_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -63,6 +64,7 @@ async def pdf_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_send_message(ctx, chat_id, text, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error("pdf_command error: %s", e)
+        await safe_send_message(ctx, chat_id, "❌ Could not toggle PDF reports right now.")
 
 
 async def compare_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -71,12 +73,28 @@ async def compare_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         query = update.callback_query
         user_id = query.from_user.id
-        parts = query.data.split("_")
+        parts = (query.data or "").split("_")
+        if len(parts) < 2 or not parts[1]:
+            await query.answer(text="❌ Bad data", show_alert=True)
+            return
         qid = parts[1]
 
-        chat_settings_repo = ChatSettingsRepository(get_db())
-        settings = await chat_settings_repo.get(int(parts[2])) if len(parts) > 2 else None
-        if settings is not None and not settings["html_enabled"]:
+        settings = None
+        if len(parts) > 2:
+            try:
+                chat_id_arg = int(parts[2])
+            except (TypeError, ValueError):
+                await query.answer(text="❌ Bad data", show_alert=True)
+                return
+            try:
+                settings = await ChatSettingsRepository(get_db()).get(chat_id_arg)
+            except Exception:
+                logger.exception("compare_results settings lookup failed")
+                await query.answer(text="❌ Could not load chat settings.", show_alert=True)
+                return
+        # Missing key (docs predating the toggle) means "never explicitly
+        # disabled": let the comparison proceed, as before toggles existed.
+        if settings is not None and not settings.get("html_enabled", True):
             await query.answer(text="❌ HTML reports disabled. Use /html", show_alert=True)
             return
 
@@ -100,6 +118,10 @@ async def compare_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         )
     except Exception as e:
         logger.error("compare_results error: %s", e, exc_info=True)
+        try:
+            await update.callback_query.answer(text="❌ Could not generate the analysis.")
+        except Exception:
+            pass
 
 
 def register(application: Application) -> None:

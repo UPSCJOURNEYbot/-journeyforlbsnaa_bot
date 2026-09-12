@@ -1186,7 +1186,7 @@ async def _record_attempt_and_report(
     chat_settings_repo = ChatSettingsRepository(db)
     chat_settings = await chat_settings_repo.get(chat_id)
 
-    if quiz_data.get("html_report", False) or chat_settings["html_enabled"]:
+    if quiz_data.get("html_report", False) or chat_settings.get("html_enabled", False):
         try:
             report_quiz = {**quiz_data, "qid": qid}
             html_bytes, filename = await render_quiz_html(report_quiz, mode="exam")
@@ -1198,7 +1198,7 @@ async def _record_attempt_and_report(
         except Exception as e:
             logger.error("HTML report generation error: %s", e)
 
-    if quiz_data.get("pdf_report", False) or chat_settings["pdf_enabled"]:
+    if quiz_data.get("pdf_report", False) or chat_settings.get("pdf_enabled", False):
         await _send_pdf_report(ctx, chat_id, quiz_data, chat_title, leaderboard, session_polls=session_polls, thread_id=thread_id)
 
 
@@ -1314,7 +1314,7 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/start [quiz_id] [skip] -- launches the quiz-setup wizard, or shows a
     welcome message if no quiz id was given."""
     from .setup_wizard import show_correct_mark_prompt
-    from ..state import pending_quiz_settings
+    from ..state import pending_quiz_settings, pending_setup_live
 
     chat_id = update.message.chat_id
     try:
@@ -1344,7 +1344,14 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         qid = ctx.args[0]
-        skip = int(ctx.args[1]) if len(ctx.args) > 1 and ctx.args[1].isdigit() else 0
+        if len(ctx.args) > 1 and not ctx.args[1].isdigit():
+            await safe_send_message(
+                ctx, chat_id,
+                "⚠️ Invalid skip value. Usage: <code>/start QUIZ_ID [skip]</code> (skip must be a positive number).",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        skip = int(ctx.args[1]) if len(ctx.args) > 1 else 0
 
         # The inline-share "Play Quiz" button opens `?startapp=play_<qid>_
         # <mode>` (see mini_app_link.py's _startapp_payload) so it can work
@@ -1371,6 +1378,10 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await safe_send_message(ctx, chat_id, "⚠️ A quiz is already running. /stop it first.")
             return
 
+        if pending_setup_live(chat_id):
+            await safe_send_message(ctx, chat_id, "⚠️ Quiz setup already in progress. Finish it, cancel it, or wait for it to expire.")
+            return
+
         quiz_repo = QuizRepository(get_db())
         quiz = await quiz_repo.get(qid)
         if not quiz:
@@ -1381,6 +1392,11 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             else:
                 await safe_send_message(ctx, chat_id, "❌ Invalid QuestionSetID.")
+            return
+
+        total_qs = len(quiz.get("questions", []))
+        if skip >= total_qs:
+            await safe_send_message(ctx, chat_id, f"⚠️ Skip {skip} exceeds this quiz's {total_qs} questions.")
             return
 
         if mini_app_mode and chat_type == ChatType.PRIVATE:
@@ -1425,6 +1441,7 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # wizard; launch directly with the saved quiz configuration.
         if quiz.get("fixed_settings"):
             pending_quiz_settings[chat_id] = {
+                "created_at": time.time(),
                 "quiz": quiz, "update": update, "skip": skip,
                 "protect": protect, "chat_type": chat_type,
                 "correct_mark": float(quiz.get("correct_marks", 1)),
@@ -1442,6 +1459,7 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         cmd_thread_id = getattr(update.message, "message_thread_id", None)
         pending_quiz_settings[chat_id] = {
+            "created_at": time.time(),
             "quiz": quiz, "update": update, "skip": skip,
             "protect": protect, "chat_type": chat_type,
             "correct_mark": 1.0, "neg_mark": 0.0,
@@ -1528,6 +1546,7 @@ async def stop_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await safe_send_message(ctx, chat_id, "\U0001F6AB Quiz stopped by admin.")
     except Exception as e:
         logger.error("stop_quiz error: %s", e, exc_info=True)
+        await safe_send_message(ctx, chat_id, "❌ Could not stop the quiz. Please try again.")
 
 
 async def pause_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1552,6 +1571,7 @@ async def pause_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_send_message(ctx, chat_id, f"⏸ Paused{who}. /resume to continue.")
     except Exception as e:
         logger.error("pause_quiz error: %s", e)
+        await safe_send_message(ctx, chat_id, "❌ Could not pause the quiz. Please try again.")
 
 
 async def resume_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1574,13 +1594,13 @@ async def resume_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await session_mgr.update(chat_id, {"paused": False})
         who = "" if chat_type == ChatType.PRIVATE else " by admin"
         await safe_send_message(ctx, chat_id, f"▶️ Resumed{who}!")
-
-        if chat_type == ChatType.PRIVATE and session.get("is_private") and session.get("waiting_for_answer"):
-            cur = session.get("current_index", 0)
-            if cur < len(session.get("questions", [])):
-                await send_private_question(chat_id, ctx, cur)
+        # NOTE: no re-send of the current question here. The live poll (if
+        # any) is still open with its own timeout task; re-sending would
+        # orphan it and double-spawn timeouts. The pending timeout/answer
+        # path advances the quiz on its own after resume.
     except Exception as e:
         logger.error("resume_quiz error: %s", e)
+        await safe_send_message(ctx, chat_id, "❌ Could not resume the quiz. Please try again.")
 
 
 async def _adjust_timer(update: Update, ctx: ContextTypes.DEFAULT_TYPE, delta: int) -> None:
@@ -1687,13 +1707,19 @@ async def leaderboard_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                     await safe_send_message(ctx, chat_id, "\U0001F6AB Admin only.")
                     return
             except Exception:
+                await safe_send_message(ctx, chat_id, "❌ Could not verify admin status. Try again.")
                 return
+
+        if not session.get("participants"):
+            await safe_send_message(ctx, chat_id, "📊 No answers recorded yet.")
+            return
 
         total = len(session.get("quiz_data", {}).get("questions", []))
         done = session.get("current_index", 0)
         await _send_mid_quiz_leaderboard(chat_id, ctx, done, total)
     except Exception as e:
         logger.error("leaderboard_command error: %s", e)
+        await safe_send_message(ctx, chat_id, "❌ Could not load the leaderboard right now.")
 
 
 async def handle_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

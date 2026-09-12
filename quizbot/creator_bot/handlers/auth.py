@@ -107,6 +107,12 @@ async def auth_cmd(c: Client, m: Message) -> None:
         target_uid = int(parts[1])
         duration_value = int(parts[2])
         unit = parts[3].lower()
+        if target_uid <= 0:
+            await m.reply("Invalid user_id: must be a positive Telegram user id.")
+            return
+        if duration_value <= 0:
+            await m.reply("Invalid duration: must be a positive number.")
+            return
         if unit not in _UNIT_TO_DAYS:
             await m.reply("Invalid unit. Use: min/hours/days/weeks/month/year/decades")
             return
@@ -138,7 +144,15 @@ async def removeuser_cmd(c: Client, m: Message) -> None:
     except ValueError:
         await m.reply("Invalid user_id.")
         return
-    await revoke_premium(target_uid)
+    if target_uid <= 0:
+        await m.reply("Invalid user_id: must be a positive Telegram user id.")
+        return
+    try:
+        await revoke_premium(target_uid)
+    except Exception:
+        logger.exception("removeuser_cmd: revoke failed for %s", target_uid)
+        await m.reply("❌ Could not revoke premium right now. Try again.")
+        return
     try:
         await c.send_message(target_uid, "Your premium has been revoked.")
     except Exception:
