@@ -80,23 +80,70 @@ def encrypt_api_key(plaintext: str) -> str:
     return _fernet().encrypt(plaintext.strip().encode("utf-8")).decode("ascii")
 
 
+def _is_plain_gemini_key(token: str) -> bool:
+    """Heuristic for legacy plaintext Gemini keys (e.g. ``AIza...``).
+
+    Stored before Phase 6 encryption or migrated from AIKeyRepository, these
+    were saved as raw ``AIza`` strings. Fernet tokens always start with
+    ``gAAAA`` and are base64url, so a plaintext Gemini key is easy to
+    distinguish. This helper is intentionally narrow: only ``AIza`` prefixed
+    strings of plausible length are treated as legacy plaintext.
+    """
+    t = (token or "").strip()
+    if not t or len(t) < 30 or len(t) > 200:
+        return False
+    if not t.startswith("AIza"):
+        return False
+    # Gemini keys are base64url-like alphanum plus - and _
+    allowed = set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_")
+    return all(c in allowed for c in t)
+
+
 def decrypt_api_key(token: str) -> str:
     """Decrypt a stored key back to plaintext for server-side API use.
 
     Raises ValueError when the blob is missing/corrupt or was encrypted
     with a different master secret (operator must ask the user to re-set
     the key). The exception message never contains key material.
+
+    Compatibility: if *token* looks like a legacy plaintext Gemini key
+    (``AIza...``) rather than a Fernet token, it is returned as-is
+    (stripped). This lets deployments upgraded from pre-Phase-6 or from
+    the generic AI-key store continue to work without forcing every user
+    to re-set their key. Random/invalid blobs still raise ValueError.
     """
     if not token:
         raise ValueError("No stored API key to decrypt.")
+    raw = token.strip()
+    if not raw:
+        raise ValueError("No stored API key to decrypt.")
+    # Fast-path for legacy plaintext: Fernet tokens always start with gAAAA
+    # and are much longer; plaintext Gemini keys start with AIza.
+    if _is_plain_gemini_key(raw):
+        # Double-check: if it *is* a Fernet token that coincidentally looks
+        # like AIza (extremely unlikely), try Fernet first. Fernet tokens
+        # are base64url and start with gAAAA, so they never match AIza.
+        # For safety, still attempt Fernet decrypt and fall back to plain.
+        try:
+            return _fernet().decrypt(raw.encode("ascii")).decode("utf-8")
+        except InvalidToken:
+            return raw
+        except Exception:
+            # Not a valid Fernet blob but matches plain-key shape => plain.
+            return raw
     try:
-        return _fernet().decrypt(token.encode("ascii")).decode("utf-8")
+        return _fernet().decrypt(raw.encode("ascii")).decode("utf-8")
     except InvalidToken as exc:
+        # If it looks like plaintext but we missed it (e.g. different prefix
+        # but still plausible), treat as invalid blob rather than leaking.
+        # Only AIza-shaped tokens get the legacy fallback.
         raise ValueError(
             "Stored API key cannot be decrypted with the current master "
             "secret (it may have been rotated)."
         ) from exc
     except Exception as exc:
+        # Legacy plaintext that didn't match the AIza heuristic but is still
+        # short and non-Fernet should be rejected as invalid, not leaked.
         raise ValueError("Stored API key blob is invalid.") from exc
 
 
