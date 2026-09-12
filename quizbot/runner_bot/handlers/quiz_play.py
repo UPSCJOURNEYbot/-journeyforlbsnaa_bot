@@ -28,6 +28,7 @@ from quizbot.database import (
     get_db,
 )
 from quizbot.shared import config
+from quizbot.shared.bold_words import apply_bold_to_poll_fields, format_bold_html
 from quizbot.shared.html.quiz_report import render_quiz_html
 from quizbot.shared.mini_app_link import mini_app_web_app_button_ptb
 from quizbot.shared.rich_quiz import (
@@ -59,6 +60,24 @@ from ..telegram_utils import (
 logger = logging.getLogger(__name__)
 
 _ANON_ADMIN_ID = 1087968824  # Telegram's fake @GroupAnonymousBot user id.
+
+# Bare-/start welcome message (HTML parse mode).  Only the text changed --
+# buttons, menus and every other /start behaviour are untouched.
+_START_WELCOME_TEXT = (
+    "🎯 Welcome to Journey for LBSNAA\n\n"
+    "🇮🇳 Dreaming of the Civil Services? Start your journey with the right preparation.\n\n"
+    "📚 Practice UPSC-focused MCQs\n"
+    "🧠 Strengthen your Concepts &amp; Understanding\n"
+    "📝 Attempt Test Series &amp; Practice Tests\n"
+    "📊 Learn from Detailed Explanations\n"
+    "🎙️ Turn your study material into Smart Learning\n\n"
+    "⚡ Practice. Analyse. Improve. Repeat.\n\n"
+    "Every question is an opportunity to learn.\n"
+    "Every test takes you one step closer to your goal.\n\n"
+    "🚀 Journey for LBSNAA\n"
+    "Your preparation. Your journey. Your destination.\n\n"
+    "👇 Choose an option below and begin your preparation."
+)
 
 # How often (every N questions) to auto-post a mid-quiz leaderboard. 0 disables it.
 MID_QUIZ_LB_INTERVAL = 10
@@ -734,6 +753,19 @@ async def _send_group_question(chat_id, ctx, questions, idx, total, base_timer, 
             poll_desc = None
             overflow = None
 
+        # -- Important-word bolding (presentation-only).  Wording, options,
+        #    option order and the answer key are never altered; text that is
+        #    already marked up passes through untouched.  Skipped for the
+        #    rich pre-pass and for the "Choose the correct option"
+        #    placeholder stems.  See quizbot/shared/bold_words.py ----------
+        if overflow and "Options:" not in overflow:
+            overflow = format_bold_html(overflow)[0]
+        poll_q, poll_expl, bold_modes = apply_bold_to_poll_fields(
+            poll_q, poll_expl,
+            skip_question=bool(rich_res.poll_question_override)
+            or "Choose the correct option" in poll_q,
+        )
+
         if overflow:
             await safe_send_message(ctx, chat_id, overflow, parse_mode=ParseMode.HTML)
             await asyncio.sleep(0.3)
@@ -752,6 +784,7 @@ async def _send_group_question(chat_id, ctx, questions, idx, total, base_timer, 
             poll_kwargs["reply_to_message_id"] = photo_msg_id
         if poll_desc:
             poll_kwargs["description"] = poll_desc
+        poll_kwargs.update(bold_modes)
 
         poll_msg = await safe_send_poll(
             ctx, chat_id, question=poll_q, options=poll_opts, type=Poll.QUIZ,
@@ -869,8 +902,11 @@ async def _send_explanation_after_poll(ctx: ContextTypes.DEFAULT_TYPE, chat_id: 
             )
             return
 
+        # Important-word bolding for plain explanations (rich explanations
+        # were already handled above); pass-through text is untouched.
+        body, _fmt_ok = format_bold_html(expl[:4000])
         await ctx.bot.send_message(
-            chat_id=chat_id, text=f"\U0001F4A1 <b>Explanation:</b>\n\n{expl[:4000]}", parse_mode=ParseMode.HTML, **kw,
+            chat_id=chat_id, text=f"\U0001F4A1 <b>Explanation:</b>\n\n{body}", parse_mode=ParseMode.HTML, **kw,
         )
     except Exception as e:
         logger.debug("_send_explanation_after_poll: %s", e)
@@ -1298,12 +1334,7 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if not ctx.args:
-            welcome = (
-                "\U0001F44B Welcome to <b>Advance Quiz Bot</b>!\n\n"
-                "Create quizzes with MCQs, sections, timers, and more.\n\n"
-                "Use /help to learn usage!"
-            )
-            await safe_send_message(ctx, chat_id, welcome, parse_mode=ParseMode.HTML)
+            await safe_send_message(ctx, chat_id, _START_WELCOME_TEXT, parse_mode=ParseMode.HTML)
             return
 
         qid = ctx.args[0]
