@@ -296,6 +296,11 @@ _RETRY_BACKOFF = (1.0, 3.0)
 # Bounded per-call timeout (seconds): a stuck Gemini request must never hang
 # podcast generation indefinitely. Applies to validation, script and TTS calls.
 GEMINI_CALL_TIMEOUT = 180.0
+# HTTP-level timeout handed to the google-genai SDK (milliseconds). Slightly
+# shorter than GEMINI_CALL_TIMEOUT so the SDK's own request raises a clean
+# timeout/API error first, rather than leaking a worker thread that only the
+# asyncio wait_for() later abandons.
+GEMINI_HTTP_TIMEOUT_MS = 150_000
 
 
 def _genai_types():
@@ -334,37 +339,85 @@ _QUOTA_MSG = (
 )
 _BUSY_MSG = "Gemini API abhi busy hai. Kuch der baad dobara try karein."
 _NET_MSG = "Network issue lag raha hai. Thodi der baad dobara try karein."
+_TIMEOUT_MSG = (
+    "Gemini ka jawab time par nahi aaya (timeout). Kuch der baad dobara try karein."
+)
 
 
 def _classify_gemini_error(exc: Exception) -> GeminiRequestError:
-    """Map a raw Gemini exception to a kind + safe user message. Pure."""
-    text = str(exc or "").lower()
+    """Map a raw Gemini exception to a kind + safe user message.
+
+    Classification prefers the structured attributes carried by
+    ``google.genai`` errors (``code``/``status``/``message``) so it is
+    deterministic across SDK versions, then falls back to substring
+    matching of ``str(exc)`` for transport-level exceptions (httpx /
+    asyncio timeouts and connection errors). The returned message is always
+    a fixed Hinglish string and never contains key material or raw API
+    payloads.
+
+    kind: "invalid_key" | "quota" | "transient" | "other".
+    """
+    code = getattr(exc, "code", None)
+    if not isinstance(code, int):
+        code = None
+    status = str(getattr(exc, "status", None) or "")
+    message = str(getattr(exc, "message", None) or "")
+    text = str(exc or "")
+    joined = f"{status} {message} {text}".lower()
+
+    # -- Timeouts (transport or SDK-side) are transient, never "invalid key".
+    #    ``asyncio.TimeoutError`` is an alias of ``TimeoutError`` on 3.11+.
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return GeminiRequestError("transient", _TIMEOUT_MSG)
+    if any(m in joined for m in ("timeout", "timed out", "deadline exceeded",
+                                 "deadline_exceeded")):
+        return GeminiRequestError("transient", _TIMEOUT_MSG)
+
+    # -- Explicit HTTP status codes win over substring guessing. --
+    if code is not None:
+        if code == 429:
+            # Gemini 429 == RESOURCE_EXHAUSTED (quota/billing), never a key
+            # problem and not worth blind retries.
+            return GeminiRequestError("quota", _QUOTA_MSG)
+        if code in (401, 403):
+            return GeminiRequestError("invalid_key", _INVALID_KEY_MSG)
+        if code == 408 or 500 <= code < 600:
+            return GeminiRequestError("transient", _BUSY_MSG)
+
+    # -- Invalid-key markers. --
     invalid_markers = (
         "api_key_invalid", "api key not valid", "invalid api key",
-        "incorrect api key", "key is invalid", "unauthenticated",
-        "leaked", "permission_denied",
+        "incorrect api key", "key is invalid", "api key is invalid",
+        "api key expired", "unauthenticated", "permission_denied", "leaked",
     )
-    if any(m in text for m in invalid_markers):
+    if any(m in joined for m in invalid_markers):
         return GeminiRequestError("invalid_key", _INVALID_KEY_MSG)
+
+    # -- Quota / billing markers (429 family). --
     quota_markers = (
-        # Gemini 429 == RESOURCE_EXHAUSTED (quota/billing), never a key
-        # problem and not worth blind retries.
         "429", "quota", "resource_exhausted", "resource exhausted",
-        "billing", "limit: 0", "free tier",
+        "billing", "limit: 0", "free tier", "rate limit", "too many requests",
     )
-    if any(m in text for m in quota_markers):
+    if any(m in joined for m in quota_markers):
         return GeminiRequestError("quota", _QUOTA_MSG)
-    transient_markers = (
-        "500", "502", "503", "504", "unavailable", "overloaded",
-        "timeout", "timed out", "temporarily", "connection", "network",
-        "econnreset", "broken pipe", "rate limit", "too many requests",
-        "deadline exceeded", "try again",
+
+    # -- Transient network/connection markers. --
+    network_markers = (
+        "connection", "network", "econnreset", "broken pipe",
+        "econnrefused", "connecterror", "getaddrinfo", "name resolution",
+        "connection refused", "connection reset", "temporary failure",
     )
-    if any(m in text for m in transient_markers):
-        kinds = "timeout" if "timeout" in text or "timed out" in text else "busy"
-        return GeminiRequestError(
-            "transient", _NET_MSG if kinds == "timeout" else _BUSY_MSG
-        )
+    if any(m in joined for m in network_markers):
+        return GeminiRequestError("transient", _NET_MSG)
+
+    # -- Transient server-side / busy markers. --
+    busy_markers = (
+        "500", "502", "503", "504", "529", "unavailable", "overloaded",
+        "temporarily", "try again", "internal", "server error",
+    )
+    if any(m in joined for m in busy_markers):
+        return GeminiRequestError("transient", _BUSY_MSG)
+
     return GeminiRequestError(
         "other", "Gemini se jawab nahi mil paya. Dobara try karein."
     )
@@ -385,11 +438,7 @@ async def _with_gemini_retries(sync_fn: Callable[[], Any], retries: int) -> Any:
         except GeminiRequestError as err:
             raise err
         except Exception as exc:
-            err = (
-                GeminiRequestError("transient", _NET_MSG)
-                if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
-                else _classify_gemini_error(exc)
-            )
+            err = _classify_gemini_error(exc)
             last = err
             if err.kind == "transient" and attempt < retries:
                 await _retry_delay(_RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)])
@@ -400,9 +449,23 @@ async def _with_gemini_retries(sync_fn: Callable[[], Any], retries: int) -> Any:
 
 
 def _new_genai_client(api_key: str):
-    """Seam for constructing the google-genai client (patched in tests)."""
+    """Seam for constructing the google-genai client (patched in tests).
+
+    Passes an explicit HTTP timeout so the SDK's own blocking request is
+    bounded too (the asyncio wait_for() bounds the bot side; this bounds the
+    worker thread). If the SDK/type import fails, a plain client is built so
+    legacy test doubles keep working.
+    """
     from google import genai
-    return genai.Client(api_key=api_key)
+    http_options = None
+    try:
+        from google.genai import types as _types
+        http_options = _types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS)
+    except Exception:
+        http_options = None
+    if http_options is None:
+        return genai.Client(api_key=api_key)
+    return genai.Client(api_key=api_key, http_options=http_options)
 
 
 def _generate_once(prompt: str, api_key: str, max_tokens: int) -> str:
@@ -676,6 +739,16 @@ def _user_facing_error(exc: Exception, secrets: Optional[list[str]] = None) -> s
     return "❌ Podcast generation failed. Dobara try karein."
 
 
+# Fixed Hinglish messages for the audio/TTS stage and the Telegram delivery
+# stage, kept distinct from Gemini classification messages (req: TTS and
+# delivery errors must be reported separately from Gemini errors).
+_TTS_ERR_MSG = "❌ Audio taiyaar karne me problem aayi. Thodi der baad dobara try karein."
+_DELIVERY_ERR_MSG = (
+    "❌ Podcast ban gaya, lekin Telegram par bhejne me problem aayi. "
+    "Thodi der baad dobara try karein."
+)
+
+
 async def _generate_question_script(uid: int, questions: list[tuple[int, str]],
                                     api_key: str,
                                     progress_cb: Optional[Callable[[int, int], Awaitable[None]]] = None,
@@ -874,25 +947,47 @@ async def _generate_podcast(uid: int, chat_id: int, ctx: ContextTypes.DEFAULT_TY
         # Brand promo is spoken first, then the educational script, then the outro.
         lines = _assemble_episode(uid, lines)
 
+        # -- 2) Voice/audio generation (Gemini TTS + ffmpeg merge/split). --
         await _edit_status(status, "🎧 Voices generate की जा रही हैं...")
 
         async def on_audio(stage: str) -> None:
             if stage == "audio":
                 await _edit_status(status, "🔊 Audio तैयार किया जा रहा है...")
 
-        await _gemini_tts_and_merge(lines, out, api_key, progress_cb=on_audio)
-        parts = await _split_audio_if_needed(out)
+        try:
+            await _gemini_tts_and_merge(lines, out, api_key, progress_cb=on_audio)
+            parts = await _split_audio_if_needed(out)
+        except GeminiRequestError:
+            # Gemini classified errors (quota/invalid-key/busy) keep their
+            # own messages via the outer handler; never re-labeled as audio.
+            raise
+        except Exception as exc:
+            # TTS/audio-stage failures are reported separately from Gemini
+            # errors (req: TTS errors must not masquerade as script/API errors).
+            logger.error("Podcast audio stage failed: %s",
+                         redact_secrets(str(exc), [api_key]))
+            await _edit_status(status, _TTS_ERR_MSG)
+            return
+
+        # -- 3) Delivery to Telegram (reported separately from generation). --
         await _edit_status(status, "✅ Podcast तैयार है.")
         total = len(parts)
-        for i, part in enumerate(parts, 1):
-            caption = f"🎧 Part {i}/{total} — {label}"[:200] if total > 1 else None
-            with open(part, "rb") as fh:
-                await ctx.bot.send_audio(
-                    chat_id=chat_id, audio=fh,
-                    title="Journey for लबासना — Podcast",
-                    performer="Journey for लबासना",
-                    caption=caption,
-                )
+        try:
+            for i, part in enumerate(parts, 1):
+                caption = f"🎧 Part {i}/{total} — {label}"[:200] if total > 1 else None
+                with open(part, "rb") as fh:
+                    await ctx.bot.send_audio(
+                        chat_id=chat_id, audio=fh,
+                        title="Journey for लबासना — Podcast",
+                        performer="Journey for लबासना",
+                        caption=caption,
+                    )
+        except Exception as exc:
+            # Telegram/file delivery errors are reported separately (req).
+            logger.error("Podcast delivery failed: %s",
+                         redact_secrets(str(exc), [api_key]))
+            await _edit_status(status, _DELIVERY_ERR_MSG)
+            return
     except GeminiRequestError as exc:
         logger.warning("podcast gemini failure kind=%s", exc.kind)
         if exc.kind == "invalid_key":
