@@ -24,6 +24,8 @@ import math
 import os
 import re
 import shutil
+import socket
+import ssl
 import tempfile
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -474,29 +476,154 @@ async def _with_gemini_retries(sync_fn: Callable[[], Any], retries: int) -> Any:
     raise last
 
 
+# --- Gemini transport: IPv4-only name resolution ---------------------------
+# Production evidence on the VPS: ``curl -4 https://generativelanguage
+# .googleapis.com`` answers immediately, ``curl -6`` to the same host times out,
+# and an unfiltered ``getaddrinfo()`` for it stalls -- the box has a broken /
+# blackholed IPv6 path. google-genai hands httpx the *hostname*, and httpcore's
+# ``connect_tcp()`` resolves it with AF_UNSPEC, so a Gemini call can spend the
+# whole 150s HTTP timeout on IPv6 before IPv4 is ever tried. That is what pushes
+# /podcast past its 180s bound and surfaces to the user as kind=transient.
+#
+# The fix is deliberately narrow: only the httpx transport used by the Gemini
+# client resolves and dials over IPv4. Nothing else in the process is touched
+# (Telegram polling, MongoDB, Edge-TTS, plain HTTP APIs and ffmpeg keep the
+# stock resolver), no global monkeypatching is installed, and if the transport
+# cannot be built the client silently keeps the stock SDK behaviour.
+_IPV4_BACKEND_CLASS: Optional[Any] = None
+_IPV4_TRANSPORT_WARNED = False
+
+
+def _ipv4_addresses(host: str, port: int) -> list[str]:
+    """Resolve ``host`` with AF_INET only; [] when it cannot be resolved.
+
+    An AF_INET-filtered ``getaddrinfo()`` asks the resolver for A records only,
+    which is the same thing ``curl -4`` does -- so a blackholed AAAA path can no
+    longer stall the lookup.
+    """
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    except Exception:  # noqa: BLE001 - a DNS failure must fall back, never raise
+        return []
+    addrs: list[str] = []
+    for info in infos:
+        sockaddr = info[4]
+        if sockaddr and sockaddr[0] not in addrs:
+            addrs.append(sockaddr[0])
+    return addrs
+
+
+def _ipv4_network_backend() -> Optional[Any]:
+    """httpcore backend that dials IPv4 literals only (None if unsupported)."""
+    global _IPV4_BACKEND_CLASS
+    try:
+        if _IPV4_BACKEND_CLASS is None:
+            import httpcore
+
+            class _IPv4SyncBackend(httpcore.SyncBackend):
+                """Resolve with AF_INET, then hand httpcore an IP literal.
+
+                TLS is unaffected: httpcore takes ``server_hostname`` (SNI and
+                the certificate hostname check) from the request origin, not from
+                the address dialed here.
+                """
+
+                def connect_tcp(self, host, port, timeout=None, local_address=None,
+                                socket_options=None):
+                    last_exc = None
+                    for addr in _ipv4_addresses(host, port):
+                        try:
+                            return super().connect_tcp(addr, port, timeout,
+                                                       local_address, socket_options)
+                        except Exception as exc:  # noqa: BLE001 - try the next A record
+                            last_exc = exc
+                    if last_exc is not None:
+                        raise last_exc
+                    # No A record at all: keep the stock resolver path so an
+                    # IPv6-only host still works instead of failing here.
+                    return super().connect_tcp(host, port, timeout, local_address,
+                                               socket_options)
+
+            _IPV4_BACKEND_CLASS = _IPv4SyncBackend
+        return _IPV4_BACKEND_CLASS()
+    except Exception:  # noqa: BLE001 - httpcore internals unavailable/changed
+        return None
+
+
+def _gemini_http_transport() -> Optional[Any]:
+    """httpx transport for the Gemini client that never waits on broken IPv6.
+
+    Returns None when the installed httpx/httpcore do not expose the hooks this
+    needs, so the caller keeps the stock SDK transport instead of failing the
+    request. The transport is built per client (as the SDK already does), so its
+    connection pool is closed together with the client that owns it.
+    """
+    global _IPV4_TRANSPORT_WARNED
+    backend = _ipv4_network_backend()
+    if backend is None:
+        return None
+    try:
+        import httpx
+
+        # Mirror google-genai's own SSL context handling (certifi plus the
+        # SSL_CERT_FILE / SSL_CERT_DIR overrides that httpx does not read by
+        # itself), because an explicit transport replaces the SDK-built one and
+        # must verify certificates exactly as strictly as before.
+        try:
+            import certifi
+            cafile = os.environ.get("SSL_CERT_FILE", certifi.where())
+        except Exception:  # noqa: BLE001
+            cafile = os.environ.get("SSL_CERT_FILE")
+        try:
+            verify: Any = ssl.create_default_context(
+                cafile=cafile, capath=os.environ.get("SSL_CERT_DIR"))
+        except Exception:  # noqa: BLE001
+            verify = True
+        transport = httpx.HTTPTransport(verify=verify)
+        pool = getattr(transport, "_pool", None)
+        if pool is None or not hasattr(pool, "_network_backend"):
+            raise RuntimeError("httpx transport internals changed")
+        pool._network_backend = backend
+        return transport
+    except Exception as exc:  # noqa: BLE001 - never break podcast generation
+        if not _IPV4_TRANSPORT_WARNED:
+            _IPV4_TRANSPORT_WARNED = True
+            logger.warning("Gemini IPv4 transport unavailable (%s); falling back "
+                           "to the stock SDK transport", type(exc).__name__)
+        return None
+
+
 def _new_genai_client(api_key: str):
     """Seam for constructing the google-genai client (patched in tests).
 
     Passes an explicit HTTP timeout so the SDK's own blocking request is
     bounded too (the asyncio wait_for() bounds the bot side; this bounds the
-    worker thread). If the SDK/type import fails the timeout is still applied
-    via a plain dict, because an unbounded client leaves orphaned worker
-    threads behind whenever asyncio wait_for() gives up on them.
+    worker thread), and an IPv4-only httpx transport so a broken IPv6 path on
+    the host cannot consume that timeout before Google is ever reached. If the
+    SDK/type import fails the timeout is still applied via a plain dict, because
+    an unbounded client leaves orphaned worker threads behind whenever asyncio
+    wait_for() gives up on them.
     """
     from google import genai
+    transport = _gemini_http_transport()
     http_options = None
     try:
         from google.genai import types as _types
-        http_options = _types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS)
+        kwargs: dict[str, Any] = {"timeout": GEMINI_HTTP_TIMEOUT_MS}
+        if transport is not None:
+            kwargs["client_args"] = {"transport": transport}
+        http_options = _types.HttpOptions(**kwargs)
     except Exception:
         http_options = None
     if http_options is not None:
         return genai.Client(api_key=api_key, http_options=http_options)
     # Degraded path: no typed helper available. Still bound the socket, and
     # only fall back to an unbounded client if this SDK rejects a dict.
+    degraded: dict[str, Any] = {"timeout": GEMINI_HTTP_TIMEOUT_MS}
+    if transport is not None:
+        degraded["client_args"] = {"transport": transport}
     try:
-        return genai.Client(api_key=api_key,
-                            http_options={"timeout": GEMINI_HTTP_TIMEOUT_MS})
+        return genai.Client(api_key=api_key, http_options=degraded)
     except TypeError:
         logger.warning("google-genai rejected dict http_options; "
                        "falling back to an unbounded client")
