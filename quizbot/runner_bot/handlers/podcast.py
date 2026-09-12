@@ -293,6 +293,23 @@ PODCAST_MAX_FILE_BYTES = 45 * 1024 * 1024
 # failures never retry, to avoid burning the user's quota pointlessly).
 GEMINI_MAX_RETRIES = 2
 _RETRY_BACKOFF = (1.0, 3.0)
+# Bounded per-call timeout (seconds): a stuck Gemini request must never hang
+# podcast generation indefinitely. Applies to validation, script and TTS calls.
+GEMINI_CALL_TIMEOUT = 180.0
+
+
+def _genai_types():
+    """Lazily import ``google.genai.types``; None when the SDK is absent.
+
+    The SDK is a production dependency (requirements.txt), but tests replace
+    the client through ``_new_genai_client`` without it. Callers must fall
+    back to a plain ``None`` config for the (possibly patched) client call.
+    """
+    try:
+        from google.genai import types  # type: ignore
+        return types
+    except Exception:
+        return None
 
 
 class GeminiRequestError(RuntimeError):
@@ -330,13 +347,15 @@ def _classify_gemini_error(exc: Exception) -> GeminiRequestError:
     if any(m in text for m in invalid_markers):
         return GeminiRequestError("invalid_key", _INVALID_KEY_MSG)
     quota_markers = (
-        "quota", "resource_exhausted", "resource exhausted", "billing",
-        "limit: 0", "free tier",
+        # Gemini 429 == RESOURCE_EXHAUSTED (quota/billing), never a key
+        # problem and not worth blind retries.
+        "429", "quota", "resource_exhausted", "resource exhausted",
+        "billing", "limit: 0", "free tier",
     )
     if any(m in text for m in quota_markers):
         return GeminiRequestError("quota", _QUOTA_MSG)
     transient_markers = (
-        "429", "500", "502", "503", "504", "unavailable", "overloaded",
+        "500", "502", "503", "504", "unavailable", "overloaded",
         "timeout", "timed out", "temporarily", "connection", "network",
         "econnreset", "broken pipe", "rate limit", "too many requests",
         "deadline exceeded", "try again",
@@ -360,11 +379,17 @@ async def _with_gemini_retries(sync_fn: Callable[[], Any], retries: int) -> Any:
     last: Optional[GeminiRequestError] = None
     for attempt in range(retries + 1):
         try:
-            return await asyncio.to_thread(sync_fn)
+            return await asyncio.wait_for(
+                asyncio.to_thread(sync_fn), timeout=GEMINI_CALL_TIMEOUT
+            )
         except GeminiRequestError as err:
             raise err
         except Exception as exc:
-            err = _classify_gemini_error(exc)
+            err = (
+                GeminiRequestError("transient", _NET_MSG)
+                if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+                else _classify_gemini_error(exc)
+            )
             last = err
             if err.kind == "transient" and attempt < retries:
                 await _retry_delay(_RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)])
@@ -381,7 +406,7 @@ def _new_genai_client(api_key: str):
 
 
 def _generate_once(prompt: str, api_key: str, max_tokens: int) -> str:
-    from google.genai import types
+    types = _genai_types()
     client = _new_genai_client(api_key)
     response = client.models.generate_content(
         model=GEMINI_TEXT_MODEL,
@@ -389,7 +414,7 @@ def _generate_once(prompt: str, api_key: str, max_tokens: int) -> str:
         config=types.GenerateContentConfig(
             max_output_tokens=max_tokens,
             temperature=0.7,
-        ),
+        ) if types is not None else None,
     )
     text = (response.text or "").strip()
     if not text:
@@ -412,7 +437,7 @@ async def _validate_gemini_key(api_key: str) -> tuple[bool, str]:
     """
 
     def call() -> str:
-        from google.genai import types
+        types = _genai_types()
         client = _new_genai_client(api_key)
         response = client.models.generate_content(
             model=GEMINI_TEXT_MODEL,
@@ -420,12 +445,14 @@ async def _validate_gemini_key(api_key: str) -> tuple[bool, str]:
             config=types.GenerateContentConfig(
                 max_output_tokens=8,
                 temperature=0,
-            ),
+            ) if types is not None else None,
         )
         return (response.text or "").strip()
 
     try:
-        text = await asyncio.to_thread(call)
+        text = await asyncio.wait_for(
+            asyncio.to_thread(call), timeout=GEMINI_CALL_TIMEOUT
+        )
     except Exception as exc:
         err = _classify_gemini_error(exc)
         if err.kind == "invalid_key":
@@ -468,12 +495,9 @@ def _tts_once(lines: list[tuple[str, str]], api_key: str) -> bytes:
         "or paraphrase words. Preserve the transcript exactly as written.\n\n"
         + transcript
     )
-    from google.genai import types
-    client = _new_genai_client(api_key)
-    response = client.models.generate_content(
-        model=GEMINI_TTS_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
+    types = _genai_types()
+    config = (
+        types.GenerateContentConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
                 language_code="hi-IN",
@@ -494,7 +518,15 @@ def _tts_once(lines: list[tuple[str, str]], api_key: str) -> bytes:
                     ]
                 ),
             ),
-        ),
+        )
+        if types is not None
+        else None
+    )
+    client = _new_genai_client(api_key)
+    response = client.models.generate_content(
+        model=GEMINI_TTS_MODEL,
+        contents=prompt,
+        config=config,
     )
     return _pcm_from_response(response)
 
