@@ -15,16 +15,82 @@ from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from quizbot.shared import config
 from quizbot.shared.utils import is_premium_user
 
 from ..ai_providers import AIQUIZ_LANG_UI, generate_in_chunks, get_provider_keys
-from ..state import AI_QUIZ_SESSIONS, last_working_ai, session_mgr, tasks
-from ..telegram_utils import safe_send_message
+from ..state import AI_QUIZ_INFLIGHT, AI_QUIZ_SESSIONS, last_working_ai, session_mgr, tasks
+from ..telegram_utils import esc, safe_send_message
 
 logger = logging.getLogger(__name__)
+
+# Safety valve for AI_QUIZ_INFLIGHT: generation is advertised at 30-120s, so
+# 15 minutes is far beyond any legitimate run. Past that the entry is treated
+# as stale and the user is allowed to retry rather than being locked out for
+# the lifetime of the process.
+INFLIGHT_TTL = 900.0
+
+# Single source of truth for the difficulty / exam-style buttons: the labels
+# rendered back to the user and the only callback values accepted for them.
+DIFF_LABELS = {"moderate": "\U0001F7E1 Moderate", "hard": "\U0001F534 Hard", "extreme": "\U0001F480 Extreme"}
+EXAM_LABELS = {"ssc": "\U0001F4CB SSC", "civil": "\U0001F3DB Civil", "oneway": "\U0001F4DD One Day"}
+
+# The exact callback-data values each button row emits (as strings, matching
+# what `_kb()` builds). They double as the allow-list in `aiquiz_callback`, so
+# a forged callback_query can neither store junk in the session nor reach
+# `int()`/`float()` and die silently in the catch-all handler.
+TIMER_CHOICES = ("10", "15", "20", "25", "30", "45")
+NEG_CHOICES = ("0", "0.25", "0.333", "0.5", "1.0")
+CM_CHOICES = ("1", "2", "3", "4")
+SHUFFLE_COUNT_CHOICES = ("2", "4", "all")
+
+_STEP_VALUES = {
+    "lang": frozenset(AIQUIZ_LANG_UI),
+    "lang2": frozenset(AIQUIZ_LANG_UI),
+    "bilingual": frozenset({"yes", "no"}),
+    "diff": frozenset(DIFF_LABELS),
+    "exam": frozenset(EXAM_LABELS),
+    "timer": frozenset(TIMER_CHOICES),
+    "neg": frozenset(NEG_CHOICES),
+    "cm": frozenset(CM_CHOICES),
+    "shuffle": frozenset({"q", "o", "b", "none"}),
+    "shufflecount": frozenset(SHUFFLE_COUNT_CHOICES),
+    "ex": frozenset({"yes", "no"}),
+}
+
+
+def _claim_generation(uid: int) -> bool:
+    """Reserve the per-user generation slot. Returns False when this user
+    already has a generation in flight.
+
+    Contains no `await`, so under a single event loop (and PTB's
+    `concurrent_updates=True`) the check-and-set is atomic -- two callbacks
+    arriving together can never both claim the slot.
+    """
+    started = AI_QUIZ_INFLIGHT.get(uid)
+    if started is not None:
+        age = time.monotonic() - started
+        if age < INFLIGHT_TTL:
+            return False
+        logger.warning("Stale /aiquiz in-flight entry for %s (%.0fs old) -- clearing it", uid, age)
+    AI_QUIZ_INFLIGHT[uid] = time.monotonic()
+    return True
+
+
+def _release_generation(uid: int) -> None:
+    AI_QUIZ_INFLIGHT.pop(uid, None)
+
+
+def _retry_kb(uid: int) -> InlineKeyboardMarkup:
+    """Retry / Cancel keyboard shown after a generation failure, so the user
+    can try again without re-typing the whole wizard."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("\U0001F504 Retry", callback_data=f"aiq_retry_{uid}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"aiq_cancel_{uid}"),
+    ]])
 
 
 def _kb(step: str, uid: int) -> InlineKeyboardMarkup:
@@ -102,8 +168,23 @@ def _kb(step: str, uid: int) -> InlineKeyboardMarkup:
 
 
 async def _edit(msg, text: str, kb: InlineKeyboardMarkup = None) -> None:
+    """Edit the wizard message in place.
+
+    Text reaching here is already escaped with `esc()`, but if Telegram still
+    rejects the HTML the step is re-sent as plain text: a wizard that fails to
+    re-render leaves the user staring at the previous step while the session
+    underneath has already moved on.
+    """
     try:
         await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+    except BadRequest as e:
+        if "parse entities" not in str(e).lower():
+            return
+        logger.warning("aiquiz wizard edit rejected as HTML (%s) -- retrying as plain text", e)
+        try:
+            await msg.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -187,13 +268,22 @@ async def aiquiz_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         chat_type = update.message.chat.type
         AI_QUIZ_SESSIONS[user_id] = {"topic": topic, "step": "count", "chat_id": chat_id, "chat_type": chat_type, "user_id": user_id}
         msg = await safe_send_message(
-            ctx, chat_id, f"\U0001F916 <b>AI Quiz: {topic}</b>\n\nHow many questions?",
+            ctx, chat_id, f"\U0001F916 <b>AI Quiz: {esc(topic)}</b>\n\nHow many questions?",
             parse_mode=ParseMode.HTML, reply_markup=_kb("count", user_id),
         )
         if msg:
             AI_QUIZ_SESSIONS[user_id]["msg_id"] = msg.message_id
+        else:
+            # The prompt never reached the user (kicked from the group, flood
+            # limit, ...) -- don't leave a wizard session behind that can only
+            # be advanced by buttons nobody was ever shown.
+            AI_QUIZ_SESSIONS.pop(user_id, None)
     except Exception as e:
         logger.error("aiquiz_command error: %s", e, exc_info=True)
+        try:
+            await safe_send_message(ctx, chat_id, "❌ Could not start the AI quiz. Please try again.")
+        except Exception:
+            pass
 
 
 async def aiquiz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -213,28 +303,45 @@ async def aiquiz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer("❌ Not your session", show_alert=True)
             return
 
+        # callback_data is forgeable -- any client can post an arbitrary
+        # callback_query for a message it can see -- so every step's value is
+        # checked against the exact set its own buttons emit before it is
+        # stored or echoed back into an HTML message.
+        allowed = _STEP_VALUES.get(step)
+        if allowed is not None and value not in allowed:
+            await query.answer("❌ Invalid choice", show_alert=True)
+            return
+
         sess = AI_QUIZ_SESSIONS.get(uid)
         if not sess:
+            _release_generation(uid)
             await query.message.edit_text("❌ Session expired. /aiquiz again")
             return
 
         msg = query.message
-        topic = sess["topic"]
+        # The topic is free text typed after /aiquiz and is echoed into every
+        # HTML step below; unescaped, a single "<" makes Telegram reject the
+        # whole message and the wizard silently freezes on the previous step.
+        t = esc(sess["topic"])
 
         if step == "count":
-            count_val = int(value)
+            try:
+                count_val = int(value)
+            except (TypeError, ValueError):
+                await query.answer("❌ Invalid question count", show_alert=True)
+                return
             if not (1 <= count_val <= 100):
                 await query.answer("❌ Choose between 1–100 questions", show_alert=True)
                 return
             sess["count"] = count_val
-            await _edit(msg, f"\U0001F916 <b>AI Quiz: {topic}</b>\n\U0001F4CB Questions: {value}\n\nLanguage?", _kb("lang", uid))
+            await _edit(msg, f"\U0001F916 <b>AI Quiz: {t}</b>\n\U0001F4CB Questions: {count_val}\n\nLanguage?", _kb("lang", uid))
 
         elif step == "lang":
             sess["lang"] = value
-            lbl = AIQUIZ_LANG_UI.get(value, value)
+            lbl = esc(AIQUIZ_LANG_UI.get(value, value))
             await _edit(
                 msg,
-                f"\U0001F916 <b>AI Quiz: {topic}</b>\n\U0001F4CB {sess['count']} | \U0001F310 {lbl}\n\n"
+                f"\U0001F916 <b>AI Quiz: {t}</b>\n\U0001F4CB {sess['count']} | \U0001F310 {lbl}\n\n"
                 f"\U0001F310 <b>Bilingual mode?</b>\nShow questions in 2 languages (lang1 / lang2 format)",
                 _kb("bilingual", uid),
             )
@@ -242,58 +349,90 @@ async def aiquiz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         elif step == "bilingual":
             if value == "yes":
                 sess["bilingual"] = True
-                lbl = AIQUIZ_LANG_UI.get(sess.get("lang", "en"), "English")
+                lbl = esc(AIQUIZ_LANG_UI.get(sess.get("lang", "en"), "English"))
                 await _edit(
-                    msg, f"\U0001F916 <b>AI Quiz: {topic}</b>\n\U0001F4CB {sess['count']} | \U0001F310 {lbl} + ?\n\n\U0001F310 <b>Select 2nd language:</b>",
+                    msg, f"\U0001F916 <b>AI Quiz: {t}</b>\n\U0001F4CB {sess['count']} | \U0001F310 {lbl} + ?\n\n\U0001F310 <b>Select 2nd language:</b>",
                     _kb("lang2", uid),
                 )
             else:
                 sess["bilingual"] = False
                 sess["lang2"] = None
-                lbl = AIQUIZ_LANG_UI.get(sess.get("lang", "en"), "English")
-                await _edit(msg, f"\U0001F916 <b>AI Quiz: {topic}</b>\n\U0001F4CB {sess['count']} | \U0001F310 {lbl}\n\nDifficulty?", _kb("diff", uid))
+                lbl = esc(AIQUIZ_LANG_UI.get(sess.get("lang", "en"), "English"))
+                await _edit(msg, f"\U0001F916 <b>AI Quiz: {t}</b>\n\U0001F4CB {sess['count']} | \U0001F310 {lbl}\n\nDifficulty?", _kb("diff", uid))
 
         elif step == "lang2":
             sess["lang2"] = value
-            l1 = AIQUIZ_LANG_UI.get(sess.get("lang", "en"), "Lang1")
-            l2 = AIQUIZ_LANG_UI.get(value, value)
-            await _edit(msg, f"\U0001F916 <b>AI Quiz: {topic}</b>\n\U0001F4CB {sess['count']} | \U0001F310 {l1} / {l2}\n\nDifficulty?", _kb("diff", uid))
+            l1 = esc(AIQUIZ_LANG_UI.get(sess.get("lang", "en"), "Lang1"))
+            l2 = esc(AIQUIZ_LANG_UI.get(value, value))
+            await _edit(msg, f"\U0001F916 <b>AI Quiz: {t}</b>\n\U0001F4CB {sess['count']} | \U0001F310 {l1} / {l2}\n\nDifficulty?", _kb("diff", uid))
 
         elif step == "diff":
             sess["diff"] = value
-            dlbl = {"moderate": "\U0001F7E1 Moderate", "hard": "\U0001F534 Hard", "extreme": "\U0001F480 Extreme"}.get(value, value)
-            await _edit(msg, f"\U0001F916 <b>AI Quiz: {topic}</b>\n\U0001F4CB {sess['count']} | {dlbl}\n\nExam style?", _kb("exam", uid))
+            dlbl = esc(DIFF_LABELS.get(value, value))
+            await _edit(msg, f"\U0001F916 <b>AI Quiz: {t}</b>\n\U0001F4CB {sess['count']} | {dlbl}\n\nExam style?", _kb("exam", uid))
 
-        elif step == "exam":
-            sess["exam"] = value
-            elbl = {"ssc": "\U0001F4CB SSC", "civil": "\U0001F3DB Civil", "oneway": "\U0001F4DD One Day"}.get(value, value)
-            has_gemini = bool(await get_provider_keys(uid, "gemini"))
-            has_groq = bool(await get_provider_keys(uid, "groq"))
-            has_openrouter = bool(await get_provider_keys(uid, "openrouter"))
-            has_default_or = bool(config.OPENROUTER_DEFAULT_KEYS)
-            if has_gemini:
-                ai_label = "Gemini"
-            elif has_groq:
-                ai_label = "Groq"
-            elif has_openrouter:
-                ai_label = "OpenRouter (your key)"
-            elif has_default_or:
-                ai_label = "OpenRouter (shared key)"
-            else:
-                ai_label = "Pollinations (free fallback)"
+        elif step in ("exam", "retry"):
+            # Claim the slot *before* touching the session: a second tap that
+            # loses the race must not be able to overwrite the exam style the
+            # winning generation is about to be told to use.
+            if not _claim_generation(uid):
+                await query.answer("⏳ Questions are still being generated — please wait.", show_alert=True)
+                return
 
-            bilingual_info = ""
-            if sess.get("bilingual") and sess.get("lang2"):
-                l1 = AIQUIZ_LANG_UI.get(sess.get("lang", "en"), "")
-                l2 = AIQUIZ_LANG_UI.get(sess["lang2"], "")
-                bilingual_info = f"\n\U0001F310 <b>Bilingual:</b> {l1} / {l2}"
+            started = False
+            try:
+                # "retry" re-runs generation with the choices already
+                # collected, so a provider hiccup costs one tap instead of the
+                # whole wizard.
+                if step == "exam":
+                    sess["exam"] = value
+                if not sess.get("exam"):
+                    await _edit(msg, f"\U0001F916 <b>AI Quiz: {t}</b>\n\nExam style?", _kb("exam", uid))
+                    return
+                elbl = esc(EXAM_LABELS.get(sess["exam"], sess["exam"]))
 
-            await _edit(
-                msg,
-                f"\U0001F916 <b>AI Quiz: {topic}</b>\n\U0001F4CB {sess['count']} | {elbl} | \U0001F916 {ai_label}"
-                f"{bilingual_info}\n\n⏳ Generating questions in chunks of 25...\nThis may take 30–120 seconds.",
-            )
-            tasks.spawn(_aiquiz_generate_flow(uid, ctx, msg, sess), name=f"aiquiz_gen_{uid}")
+                has_gemini = bool(await get_provider_keys(uid, "gemini"))
+                has_groq = bool(await get_provider_keys(uid, "groq"))
+                has_openrouter = bool(await get_provider_keys(uid, "openrouter"))
+                has_default_or = bool(config.OPENROUTER_DEFAULT_KEYS)
+                if has_gemini:
+                    ai_label = "Gemini"
+                elif has_groq:
+                    ai_label = "Groq"
+                elif has_openrouter:
+                    ai_label = "OpenRouter (your key)"
+                elif has_default_or:
+                    ai_label = "OpenRouter (shared key)"
+                else:
+                    ai_label = "Pollinations (free fallback)"
+
+                bilingual_info = ""
+                if sess.get("bilingual") and sess.get("lang2"):
+                    l1 = esc(AIQUIZ_LANG_UI.get(sess.get("lang", "en"), ""))
+                    l2 = esc(AIQUIZ_LANG_UI.get(sess["lang2"], ""))
+                    bilingual_info = f"\n\U0001F310 <b>Bilingual:</b> {l1} / {l2}"
+
+                # Empty keyboard: the exam/retry buttons would otherwise stay
+                # attached for the whole 30-120s generation and invite a
+                # second (now rejected, but pointless) tap.
+                await _edit(
+                    msg,
+                    f"\U0001F916 <b>AI Quiz: {t}</b>\n\U0001F4CB {sess['count']} | {elbl} | \U0001F916 {ai_label}"
+                    f"{bilingual_info}\n\n⏳ Generating questions in chunks of 25...\nThis may take 30–120 seconds.",
+                    InlineKeyboardMarkup([]),
+                )
+                tasks.spawn(_aiquiz_generate_flow(uid, ctx, msg, sess), name=f"aiquiz_gen_{uid}")
+                started = True
+            finally:
+                if not started:
+                    # Nothing took ownership of the slot -- release it here so
+                    # the user is never locked out of a retry.
+                    _release_generation(uid)
+
+        elif step == "cancel":
+            AI_QUIZ_SESSIONS.pop(uid, None)
+            _release_generation(uid)
+            await _edit(msg, f"❌ <b>AI Quiz cancelled.</b>\n\nRun <code>/aiquiz {t}</code> to start again.", InlineKeyboardMarkup([]))
 
         elif step == "timer":
             sess["timer"] = int(value)
@@ -337,14 +476,14 @@ async def aiquiz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         elif step == "ex":
             sess["show_explanation"] = value == "yes"
             questions = sess.get("questions", [])
-            topic = sess.get("topic", "AI Quiz")
             neg_str = "None" if sess["neg"] == 0 else f"-{sess['neg']}"
             slbl = "Both" if (sess.get("shuffle_q") and sess.get("shuffle_o")) else "Questions" if sess.get("shuffle_q") else "Options" if sess.get("shuffle_o") else "None"
             await _edit(
                 msg,
-                f"\U0001F916 <b>AI Quiz Ready!</b>\n\n\U0001F4CC <b>Topic:</b> {topic}\n\U0001F4CB <b>Questions:</b> {len(questions)}\n"
+                f"\U0001F916 <b>AI Quiz Ready!</b>\n\n\U0001F4CC <b>Topic:</b> {t}\n\U0001F4CB <b>Questions:</b> {len(questions)}\n"
                 f"⏱ <b>Timer:</b> {sess['timer']}s\n✅ <b>Correct:</b> +{sess['cm']}\n➖ <b>Negative:</b> {neg_str}\n"
                 f"\U0001F500 <b>Shuffle:</b> {slbl}\n\U0001F4A1 <b>Explanation:</b> {'✅ Yes' if sess['show_explanation'] else '❌ No'}\n\n▶️ Starting quiz now...",
+                InlineKeyboardMarkup([]),
             )
             chat_id = sess.get("chat_id", uid)
             chat_type = sess.get("chat_type", "private")
@@ -352,7 +491,7 @@ async def aiquiz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             AI_QUIZ_SESSIONS.pop(uid, None)
             await asyncio.sleep(1)
             await _launch_ai_quiz(
-                uid, ctx, questions, topic, sess["timer"], sess["neg"], sess["cm"],
+                uid, ctx, questions, sess["topic"], sess["timer"], sess["neg"], sess["cm"],
                 sess.get("shuffle_q", False), sess.get("shuffle_o", False),
                 shuffle_o_count=sess.get("shuffle_o_count", 0), chat_id=chat_id,
                 chat_type=chat_type, update=update, show_explanation=show_expl,
@@ -362,43 +501,71 @@ async def aiquiz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def _aiquiz_generate_flow(uid: int, ctx: ContextTypes.DEFAULT_TYPE, msg: Any, sess: dict) -> None:
-    """Background task: generate questions, then move to timer settings."""
+    """Background task: generate questions, then move to timer settings.
+
+    Owns the per-user in-flight slot claimed by `aiquiz_callback` and always
+    releases it in `finally`, so a success, an empty result, an exception or a
+    cancellation all leave the user able to generate again.
+    """
     try:
         topic = sess["topic"]
         count = sess["count"]
-        lang = sess["lang"]
-        diff = sess["diff"]
+        lang = sess.get("lang", "en")
+        diff = sess.get("diff", "moderate")
         exam = sess["exam"]
         lang2 = sess.get("lang2")
 
         questions = await generate_in_chunks(uid, topic, count, lang, diff, exam, msg, bilingual_lang2=lang2)
 
+        # The user may have tapped Cancel, or started a fresh /aiquiz, while
+        # this was running. Either way the stored session is no longer *this*
+        # one, so drop the result instead of resurrecting a wizard the user
+        # has already left behind.
+        if AI_QUIZ_SESSIONS.get(uid) is not sess:
+            logger.info("aiquiz session for %s was replaced during generation -- discarding %d question(s)",
+                        uid, len(questions))
+            return
+
         if not questions:
+            # Keep the collected choices and offer Retry/Cancel: an empty
+            # result is a provider problem, not a bad topic, and making the
+            # user re-type /aiquiz + re-pick 5 settings is a dead end.
+            last_working_ai.pop(uid, None)
+            AI_QUIZ_SESSIONS[uid] = sess
             await _edit(
                 msg,
-                "❌ Failed to generate questions. Check your AI key or try a different topic.\n"
-                "Add a key: <code>/setkey gemini YOUR_KEY</code>",
+                f"❌ <b>No questions came back for:</b> {esc(topic)}\n\n"
+                "The provider returned an empty result. Check your AI key or try a "
+                "different topic.\nAdd a key: <code>/setkey gemini YOUR_KEY</code>",
+                _retry_kb(uid),
             )
-            AI_QUIZ_SESSIONS.pop(uid, None)
-            last_working_ai.pop(uid, None)
             return
 
         got = len(questions)
         shortfall_note = f"\n⚠️ Got {got}/{count} — starting with available questions." if got < count else ""
         bilingual_tag = ""
         if lang2:
-            l1 = AIQUIZ_LANG_UI.get(lang, lang)
-            l2 = AIQUIZ_LANG_UI.get(lang2, lang2)
+            l1 = esc(AIQUIZ_LANG_UI.get(lang, lang))
+            l2 = esc(AIQUIZ_LANG_UI.get(lang2, lang2))
             bilingual_tag = f"\n\U0001F310 <b>Bilingual:</b> {l1} / {l2}"
 
-        preview = f"✅ <b>{got} questions generated!</b>{shortfall_note}\n\n\U0001F4CC <b>Topic:</b> {topic}{bilingual_tag}\n<b>Preview (first 3):</b>\n"
+        # Everything below is model output: question text and options routinely
+        # contain "<", ">" and "&" (maths, HTML-ish snippets, "A & B"), which
+        # Telegram rejects outright in parse_mode=HTML. Truncate first, escape
+        # second, so a cut can never split an entity.
+        preview = (
+            f"✅ <b>{got} questions generated!</b>{shortfall_note}\n\n"
+            f"\U0001F4CC <b>Topic:</b> {esc(topic)}{bilingual_tag}\n<b>Preview (first 3):</b>\n"
+        )
         for i, q in enumerate(questions[:3], 1):
             cid = q["correct_option_id"]
             cids = cid if isinstance(cid, list) else [cid]
-            preview += f"\n<b>Q{i}.</b> {q['question'][:80]}{'...' if len(q['question']) > 80 else ''}\n"
+            qtext = str(q["question"])
+            preview += f"\n<b>Q{i}.</b> {esc(qtext[:80])}{'...' if len(qtext) > 80 else ''}\n"
             for j, opt in enumerate(q["options"]):
                 mark = "✅" if j in cids else "▪️"
-                preview += f"  {mark} {opt[:45]}{'...' if len(opt) > 45 else ''}\n"
+                otext = str(opt)
+                preview += f"  {mark} {esc(otext[:45])}{'...' if len(otext) > 45 else ''}\n"
         preview += "\n⏱ <b>Timer per question?</b>"
 
         sess["questions"] = questions
@@ -406,8 +573,12 @@ async def _aiquiz_generate_flow(uid: int, ctx: ContextTypes.DEFAULT_TYPE, msg: A
         await _edit(msg, preview, _kb("timer", uid))
     except Exception as e:
         logger.error("_aiquiz_generate_flow error: %s", e, exc_info=True)
-        await _edit(msg, f"❌ Generation error: {str(e)[:200]}")
-        AI_QUIZ_SESSIONS.pop(uid, None)
+        if AI_QUIZ_SESSIONS.get(uid) is sess:
+            sess.pop("questions", None)
+            AI_QUIZ_SESSIONS[uid] = sess
+            await _edit(msg, f"❌ <b>Generation error:</b> {esc(str(e)[:200])}", _retry_kb(uid))
+    finally:
+        _release_generation(uid)
 
 
 def register(application: Application) -> None:

@@ -18,6 +18,7 @@ from quizbot.shared import config
 from quizbot.shared.utils.http import request_json
 
 from .state import last_working_ai
+from .telegram_utils import esc
 
 logger = logging.getLogger(__name__)
 
@@ -333,9 +334,12 @@ async def generate_in_chunks(
         chunk_num += 1
 
         try:
+            # `topic` is free text the user typed after /aiquiz or /pdfquiz; a
+            # "<" or "&" in it makes Telegram reject this progress edit and the
+            # user watches a frozen "Generating..." for the whole run.
             await status_msg.edit_text(
                 f"🤖 <b>Generating...</b> ({len(all_q)}/{total} ready)\n"
-                f"📌 {topic} | Batch {chunk_num} — fetching {chunk} questions"
+                f"📌 {esc(topic)} | Batch {chunk_num} — fetching {chunk} questions"
                 + (f" | 🌐 {_short(lang1_name)}/{_short(lang2_name)}" if bilingual_lang2 else ""),
                 parse_mode="HTML",
             )

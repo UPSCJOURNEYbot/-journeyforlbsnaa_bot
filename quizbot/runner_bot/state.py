@@ -150,6 +150,18 @@ pending_quiz_settings: dict[int, dict[str, Any]] = {}
 # /aiquiz wizard state, keyed by the initiating user's id.
 AI_QUIZ_SESSIONS: dict[int, dict[str, Any]] = {}
 
+# Per-user in-flight guard for /aiquiz question generation:
+# user_id -> time.monotonic() when the generation task was spawned.
+# Generation takes 30-120s, and Telegram leaves an inline keyboard attached to
+# an edited message unless an explicitly empty one is passed -- so the buttons
+# stay tappable for the whole run and a second tap would start a second
+# concurrent provider call for the same user (double API spend, two tasks
+# racing to edit one message and to launch one quiz). Entries are always
+# dropped in `_aiquiz_generate_flow`'s finally block; the timestamp is kept so
+# a wedged entry can be aged out instead of locking a user out forever.
+# See handlers/ai_quiz.py.
+AI_QUIZ_INFLIGHT: dict[int, float] = {}
+
 # /pdfquiz wizard state, keyed by the initiating user's id.
 PDF_QUIZ_SESSIONS: dict[int, dict[str, Any]] = {}
 
