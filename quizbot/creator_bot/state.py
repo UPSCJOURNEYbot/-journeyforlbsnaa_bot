@@ -59,6 +59,14 @@ batch_sessions = SessionStore()
 # uid -> {term, results}
 search_state = SessionStore()
 
+# ─── Direct test-series file flow (bare /testseries) ─────────────────────
+# uid -> {step: "awaiting_file"|"awaiting_config", questions?, filename?, ts}
+testseries_upload = SessionStore()
+
+# ─── Professional test-series creation wizard (/newseries) ───────────────
+# uid -> {step, config, assets, quizzes, source, edit_return?, ...}
+testseries_create = SessionStore()
+
 # ─── Pending Razorpay payments awaiting the /start?pay_<token> callback ──
 # token -> {uid, days, plan_label, price, link_id, expires_at}
 pending_payments: dict[str, dict[str, Any]] = {}

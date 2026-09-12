@@ -69,6 +69,8 @@ class Database:
 
         await db.ai_keys.create_index([("user_id", 1), ("provider", 1)])
 
+        await db.podcast_keys.create_index("user_id", unique=True)
+
         await db.quiz_attempts.create_index("attempt_id", unique=True)
         await db.quiz_attempts.create_index("user_id")
         await db.quiz_attempts.create_index("qid")

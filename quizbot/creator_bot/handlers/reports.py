@@ -95,12 +95,19 @@ def _parse_testseries_args(raw: str) -> tuple[str, str, list[str]]:
     return mode, title, quiz_ids
 
 
-def _build_testseries_payload(quizzes: list[dict], mode: str, title: str) -> dict:
+def _build_testseries_payload(quizzes: list[dict], mode: str, title: str, *,
+                              institute_name: str | None = None,
+                              tagline: str | None = None,
+                              series_setup: dict | None = None) -> dict:
     """Build the /api/generate JSON payload from validated quiz dicts.
 
     Pure helper (no network): skips questions without options, passes the
     correct answer id(s) through verbatim, and maps the bot's mode onto the
-    service's `solution_display` contract ("inline" | "end").
+    service's `solution_display` contract ("inline" | "end"). The optional
+    overrides only fill existing contract fields (used by /newseries);
+    omitting them keeps the historical defaults. `series_setup` (also
+    /newseries only) is embedded verbatim when given; legacy callers omit
+    it and get the historical payload shape untouched.
     """
     questions_payload = []
     for quiz in quizzes:
@@ -119,21 +126,40 @@ def _build_testseries_payload(quizzes: list[dict], mode: str, title: str) -> dic
     if not questions_payload:
         raise RuntimeError("No usable questions (with options) found in the given quiz(es).")
 
-    return {
+    payload = {
         "questions_json": questions_payload,
-        "institute_name": "Quiz Creator",
-        "tagline": "Test Series",
+        "institute_name": institute_name or "Quiz Creator",
+        "tagline": tagline or "Test Series",
         "exam_title": title,
         "solution_display": "inline" if mode == "inline" else "end",
         "quiz_names": [str(q.get("quiz_name") or q.get("qid") or "") for q in quizzes],
         "async": True,
     }
+    if series_setup is not None:
+        payload["series_setup"] = series_setup
+    return payload
 
 
-async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll_timeout: int = 180) -> bytes:
+async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll_timeout: int = 180,
+                                tagline: str | None = None,
+                                institute_name: str | None = None,
+                                series_setup: dict | None = None) -> bytes:
     """Delegate PDF rendering to the external microservice at
-    `config.PDF_API_BASE`. Raises RuntimeError on any failure."""
-    payload = _build_testseries_payload(quizzes, mode, title)
+    `config.PDF_API_BASE`. Raises RuntimeError on any failure.
+
+    `tagline` (used only by the direct-file flow) overrides the cover
+    tagline; None keeps the default "Test Series". `institute_name`
+    (used only by /newseries) overrides the cover institute line; None
+    keeps the default "Quiz Creator". `series_setup` (also /newseries
+    only) carries the full wizard configuration to the renderer; None
+    keeps the historical request shape untouched.
+    """
+    payload = _build_testseries_payload(quizzes, mode, title,
+                                        series_setup=series_setup)
+    if tagline is not None:
+        payload["tagline"] = tagline
+    if institute_name is not None:
+        payload["institute_name"] = institute_name
 
     base = config.PDF_API_BASE.rstrip("/")
     status, job = await request_json("POST", f"{base}/api/generate", json_body=payload)
@@ -200,13 +226,11 @@ async def testseries_cmd(c: Client, m: Message) -> None:
 
     raw = m.text.split(maxsplit=1)[1].strip() if len(m.text.split(maxsplit=1)) > 1 else ""
     if not raw:
-        await m.reply(
-            "**Mock Test PDF Generator**\n\n"
-            "Usage: `/testseries QID1 [QID2 QID3...] [mode=inline|keyonly] [title=Your_Title]`\n\n"
-            "`mode=inline` -- answer & explanation after every question\n"
-            "`mode=keyonly` -- questions only, answer key at the end (default)\n\n"
-            "Example: `/testseries GGN123 GGN456 mode=keyonly title=SSC_Mock_2026`"
-        )
+        # Bare /testseries -- direct MCQ-file flow (additive; the QID flow
+        # below is unchanged). Local import: testseries_file imports this
+        # module's PDF helpers, so a top-level import would be circular.
+        from .testseries_file import start_upload_flow
+        await start_upload_flow(c, m)
         return
 
     mode, title, quiz_ids = _parse_testseries_args(raw)

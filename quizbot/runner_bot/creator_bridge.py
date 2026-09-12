@@ -330,13 +330,15 @@ async def _creator_callback_router(update, context):
     import logging
     logger = logging.getLogger(__name__)
     from quizbot.creator_bot import state
-    from quizbot.creator_bot.handlers import batches, quiz_creation, quiz_editing, quiz_management, settings
+    from quizbot.creator_bot.handlers import batches, quiz_creation, quiz_editing, quiz_management, settings, testseries_create
     data = update.callback_query.data or ""
     uid = update.effective_user.id
     cb = BridgeCallback(context.bot, update.callback_query)
     client = BridgeClient(context.bot)
 
     async def run():
+        if data.startswith("tsc_"):
+            return await testseries_create.creation_cb(client, cb)
         if data.startswith("cws_"):
             return await quiz_creation.creation_wizard_cb(client, cb)
         if data.startswith("bat_"):
@@ -389,6 +391,8 @@ class _CreatorStateFilter(BaseFilter):
             uid in state.quiz_creation
             or uid in state.batch_sessions
             or uid in state.edit_sessions
+            or uid in state.testseries_upload
+            or uid in state.testseries_create
         )
 
 
@@ -412,6 +416,33 @@ async def _creator_message_router(update, context):
         await handle_edit_text_input(client, bridge)
         return
 
+    # Direct test-series file flow: one document, then one config line.
+    if uid in state.testseries_upload and msg.chat.type == "private":
+        from quizbot.creator_bot.handlers import testseries_file as tsf
+        if msg.document:
+            await tsf.handle_testseries_document(client, bridge)
+            return
+        if msg.text and not msg.text.startswith("/"):
+            if (state.testseries_upload.get(uid) or {}).get("step") == "awaiting_config":
+                await tsf.handle_testseries_config(client, bridge)
+                return
+            await tsf.handle_testseries_text(client, bridge)
+            return
+
+    # Professional test-series setup: documents (MCQ file / images),
+    # photos (logo / watermark) and free text, routed by wizard step.
+    if uid in state.testseries_create and msg.chat.type == "private":
+        from quizbot.creator_bot.handlers import testseries_create as tsc
+        if msg.document:
+            await tsc.handle_create_document(client, bridge)
+            return
+        if msg.photo:
+            await tsc.handle_create_photo(client, bridge)
+            return
+        if msg.text and not msg.text.startswith("/"):
+            await tsc.handle_create_text(client, bridge)
+            return
+
     # Creation wizard accepts documents, photos, polls and free text.
     if uid in state.quiz_creation and msg.chat.type == "private":
         from quizbot.creator_bot.handlers.quiz_creation import handle_document, handle_photo, handle_creation_message
@@ -431,7 +462,7 @@ async def _creator_message_router(update, context):
 
 def register_creator_bridge(application):
     """Register all Creator commands/callbacks on the single PTB Application."""
-    from quizbot.creator_bot.handlers import admin, ai_keys, auth, batches, quiz_creation, quiz_editing, quiz_management, reports, settings
+    from quizbot.creator_bot.handlers import admin, ai_keys, auth, batches, quiz_creation, quiz_editing, quiz_management, reports, settings, testseries_create
 
     # Commands that are shared by Runner have intentionally been left to Runner.
     command_map = {
@@ -474,6 +505,7 @@ def register_creator_bridge(application):
         "testseries": reports.testseries_cmd,
         "tsr": reports.testseries_cmd,
         "mocktest": reports.testseries_cmd,
+        "newseries": testseries_create.newseries_cmd,
         "settings": settings.settings_cmd,
         "remove": settings.remove_words_cmd,
         "mywords": settings.mywords_cmd,
@@ -482,7 +514,8 @@ def register_creator_bridge(application):
     # Legacy Pyrogram registration marks /testseries (+aliases) private-only
     # (see creator_bot/handlers/reports.py::register). Enforce the same here
     # so group chats can never trigger (or receive) someone's test-series PDF.
-    _private_only = frozenset({"testseries", "tsr", "mocktest"})
+    # /newseries inherits the same restriction (it also yields a PDF).
+    _private_only = frozenset({"testseries", "tsr", "mocktest", "newseries"})
     for cmd, fn in command_map.items():
         if cmd in _private_only:
             application.add_handler(CommandHandler(
@@ -498,6 +531,10 @@ def register_creator_bridge(application):
     # callback handler.
     application.add_handler(
         CallbackQueryHandler(_creator_callback_router, pattern=r"^cws_"),
+        group=-2,
+    )
+    application.add_handler(
+        CallbackQueryHandler(_creator_callback_router, pattern=r"^tsc_"),
         group=-2,
     )
     application.add_handler(

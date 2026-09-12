@@ -237,6 +237,35 @@ def _segment_question_blocks(text: str) -> str:
     return "\n\n".join(blocks)
 
 
+def ocr_pdf_text(content: bytes, pages: int, max_pages: int = 30) -> str:
+    """Render PDF pages to images and OCR them with Tesseract (English+Hindi).
+
+    Shared helper used by the quiz-creation import and the test-series
+    file flow. Raises whatever the imaging/OCR stack raises; callers turn
+    that into a user-facing message. Capped at `max_pages` pages so the
+    bot stays responsive on huge scans.
+    """
+    from io import BytesIO
+
+    import fitz  # PyMuPDF
+    from PIL import Image
+    import pytesseract
+
+    doc = fitz.open(stream=content, filetype="pdf")
+    capped = min(pages, max_pages)
+    try:
+        ocr_pages: list[str] = []
+        for idx in range(capped):
+            pix = doc.load_page(idx).get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image = Image.open(BytesIO(pix.tobytes("png")))
+            ocr_pages.append(pytesseract.image_to_string(image, lang="eng+hin"))
+    finally:
+        doc.close()
+    if pages > capped:
+        logger.warning("PDF OCR capped at %d of %d pages", capped, pages)
+    return "\n\n".join(ocr_pages)
+
+
 def _process_pdf(content: bytes, remove_words: list[str], out_questions: list[dict]) -> tuple[int, int]:
     """Extract text from a PDF and parse it.
 
@@ -285,24 +314,7 @@ def _process_pdf(content: bytes, remove_words: list[str], out_questions: list[di
     # supporting image-based study material.
     ocr_error: Optional[Exception] = None
     try:
-        from io import BytesIO
-
-        from PIL import Image
-        import pytesseract
-
-        doc = fitz.open(stream=content, filetype="pdf")
-        max_ocr_pages = min(pages, 30)
-        try:
-            ocr_pages: list[str] = []
-            for idx in range(max_ocr_pages):
-                pix = doc.load_page(idx).get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                image = Image.open(BytesIO(pix.tobytes("png")))
-                ocr_pages.append(pytesseract.image_to_string(image, lang="eng+hin"))
-        finally:
-            doc.close()
-        if pages > max_ocr_pages:
-            logger.warning("PDF OCR capped at %d of %d pages", max_ocr_pages, pages)
-        ocr_text = "\n\n".join(ocr_pages)
+        ocr_text = ocr_pdf_text(content, pages)
         count = _process_text_content(_segment_question_blocks(ocr_text), remove_words, out_questions)
         if not count:
             count = _process_text_content(ocr_text, remove_words, out_questions)

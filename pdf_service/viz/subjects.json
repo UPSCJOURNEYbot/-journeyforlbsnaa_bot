@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "notes": "Subject detection keywords (English whole-word, Hindi substring with Devanagari-boundary guards) plus per-subject visual-type preference order. Order of subjects is the deterministic tie-break.",
+  "visual_types": [
+    "location_map",
+    "historical_map",
+    "regional_map",
+    "process",
+    "flowchart",
+    "concept_map",
+    "mind_map",
+    "timeline",
+    "comparison",
+    "cause_effect",
+    "cycle",
+    "labelled_diagram",
+    "classification",
+    "infographic"
+  ],
+  "subjects": [
+    {
+      "id": "geography",
+      "label_en": "Geography",
+      "label_hi": "भूगोल",
+      "keywords_en": ["geography", "river", "mountain", "lake", "plateau", "plain", "desert", "climate", "monsoon", "latitude", "longitude", "equator", "tropic", "glacier", "volcano", "earthquake", "soil", "waterfall", "strait", "gulf", "bay", "peninsula", "island", "ocean", "sea", "coast", "delta", "tributary", "dam", "rainfall", "map", "located", "location", "capital", "continent", "country", "census"],
+      "keywords_hi": ["भूगोल", "नदी", "पर्वत", "झील", "पठार", "मैदान", "रेगिस्तान", "जलवायु", "मानसून", "अक्षांश", "देशांतर", "भूमध्य", "हिमनद", "ज्वालामुखी", "भूकंप", "मिट्टी", "जलप्रपात", "जलडमरूमध्य", "खाड़ी", "प्रायद्वीप", "द्वीप", "महासागर", "सागर", "तट", "डेल्टा", "सहायक नदी", "बाँध", "वर्षा", "मानचित्र", "राजधानी", "महाद्वीप", "जनगणना"],
+      "preferred": ["location_map", "regional_map", "classification", "cycle", "cause_effect", "comparison", "concept_map", "infographic"],
+      "notes": "Use real location/distribution maps whenever reliable geographic data exists. Never substitute a generic lat/long diagram for a location question."
+    },
+    {
+      "id": "history",
+      "label_en": "History",
+      "label_hi": "इतिहास",
+      "keywords_en": ["history", "ancient", "medieval", "empire", "kingdom", "dynasty", "ruler", "king", "queen", "emperor", "battle", "war", "revolt", "rebellion", "movement", "freedom", "independence", "partition", "civilisation", "civilization", "treaty", "annexation", "mutiny", "satyagraha", "mauryan", "mughal", "gupta", "chola", "vijayanagara", "maratha", "viceroy", "century", "archaeological", "inscription", "veda", "sultanate"],
+      "keywords_hi": ["इतिहास", "प्राचीन", "मध्यकालीन", "आधुनिक", "साम्राज्य", "वंश", "शासक", "राजा", "रानी", "सम्राट", "युद्ध", "विद्रोह", "आंदोलन", "स्वतंत्रता", "विभाजन", "सभ्यता", "संधि", "शताब्दी", "पुरातत्व", "मुगल", "मौर्य", "गुप्त", "चोल", "मराठा", "अंग्रेज", "वायसराय", "अभिलेख", "वेद", "सल्तनत"],
+      "preferred": ["timeline", "comparison", "flowchart", "concept_map", "infographic", "location_map", "regional_map"],
+      "notes": "Prefer timelines and historically relevant maps/routes/territories. Never fabricate historical boundaries; without reliable boundary data, emit no historical map."
+    },
+    {
+      "id": "polity",
+      "label_en": "Polity",
+      "label_hi": "राजव्यवस्था",
+      "keywords_en": ["constitution", "fundamental rights", "directive principles", "parliament", "lok sabha", "rajya sabha", "president", "prime minister", "governor", "chief minister", "supreme court", "high court", "judiciary", "election", "amendment", "article", "schedule", "federal", "panchayat", "municipality", "emergency", "ordinance", "bill", "citizenship", "preamble", "legislature", "executive", "fifth schedule", "sixth schedule"],
+      "keywords_hi": ["संविधान", "मौलिक अधिकार", "नीति निदेशक", "संसद", "लोकसभा", "राज्यसभा", "राष्ट्रपति", "प्रधानमंत्री", "राज्यपाल", "मुख्यमंत्री", "सर्वोच्च न्यायालय", "उच्च न्यायालय", "न्यायपालिका", "चुनाव", "संशोधन", "अनुच्छेद", "अनुसूची", "संघीय", "पंचायत", "नगरपालिका", "आपातकाल", "अध्यादेश", "विधेयक", "अधिनियम", "नागरिकता", "प्रस्तावना", "विधायिका", "कार्यपालिका"],
+      "preferred": ["flowchart", "concept_map", "classification", "comparison", "process", "infographic"],
+      "notes": "Prefer clear constitutional/institutional/process flowcharts and relationship diagrams."
+    },
+    {
+      "id": "economy",
+      "label_en": "Economy",
+      "label_hi": "अर्थव्यवस्था",
+      "keywords_en": ["economy", "gdp", "inflation", "deflation", "fiscal", "monetary", "rbi", "bank", "budget", "tax", "gst", "deficit", "surplus", "recession", "growth", "development", "poverty", "unemployment", "trade", "export", "import", "balance of payments", "industry", "agriculture", "service sector", "niti aayog", "planning commission", "liberalisation", "privatisation", "fdi", "stock", "market", "rupee", "currency", "demonetisation", "repo rate"],
+      "keywords_hi": ["अर्थव्यवस्था", "जीडीपी", "मुद्रास्फीति", "राजकोषीय", "मौद्रिक", "रिजर्व बैंक", "बजट", "कर", "जीएसटी", "घाटा", "मंदी", "विकास", "गरीबी", "बेरोजगारी", "व्यापार", "निर्यात", "आयात", "उद्योग", "कृषि", "नीति आयोग", "योजना आयोग", "उदारीकरण", "निजीकरण", "वैश्वीकरण", "शेयर", "बाजार", "रुपया", "मुद्रा", "नोटबंदी", "रेपो दर"],
+      "preferred": ["cycle", "cause_effect", "flowchart", "process", "comparison", "infographic", "concept_map"],
+      "notes": "Prefer economic cycles, process diagrams, trade/resource maps and cause-effect visuals."
+    },
+    {
+      "id": "environment",
+      "label_en": "Environment",
+      "label_hi": "पर्यावरण",
+      "keywords_en": ["environment", "ecosystem", "biodiversity", "species", "endangered", "extinct", "wildlife", "sanctuary", "national park", "biosphere", "tiger reserve", "forest", "wetland", "pollution", "climate change", "global warming", "ozone", "carbon", "greenhouse", "red data", "iucn", "convention", "protocol", "kyoto", "paris agreement", "ramsar", "food chain", "ecological", "mangrove", "coral"],
+      "keywords_hi": ["पर्यावरण", "पारिस्थितिकी", "जैव विविधता", "प्रजाति", "लुप्तप्राय", "विलुप्त", "वन्यजीव", "अभयारण्य", "राष्ट्रीय उद्यान", "बायोस्फीयर", "टाइगर रिजर्व", "वन", "आर्द्रभूमि", "प्रदूषण", "जलवायु परिवर्तन", "ग्लोबल वार्मिंग", "ओजोन", "कार्बन", "ग्रीनहाउस", "रेड डाटा", "क्योटो", "पेरिस समझौता", "रामसर", "खाद्य श्रृंखला", "मैंग्रोव", "प्रवाल"],
+      "preferred": ["cycle", "classification", "cause_effect", "location_map", "regional_map", "comparison", "flowchart", "infographic"],
+      "notes": "Prefer species/ecosystem/distribution/location maps, cycles and classification visuals."
+    },
+    {
+      "id": "science",
+      "label_en": "Science",
+      "label_hi": "विज्ञान",
+      "keywords_en": ["physics", "chemistry", "biology", "cell", "atom", "molecule", "element", "compound", "metal", "acid", "base", "salt", "photosynthesis", "respiration", "digestion", "nervous", "hormones", "genes", "dna", "evolution", "gravity", "motion", "force", "energy", "light", "sound", "electricity", "magnet", "chemical reaction", "periodic table", "tissue", "organ", "disease", "vaccine", "bacteria", "virus", "fungus"],
+      "keywords_hi": ["भौतिकी", "रसायन", "जीव विज्ञान", "कोशिका", "परमाणु", "अणु", "तत्व", "यौगिक", "धातु", "अम्ल", "क्षार", "लवण", "प्रकाश संश्लेषण", "श्वसन", "पाचन", "तंत्रिका", "हार्मोन", "जीन", "डीएनए", "गुरुत्व", "गति", "बल", "ऊर्जा", "प्रकाश", "ध्वनि", "विद्युत", "चुंबक", "रासायनिक अभिक्रिया", "आवर्त सारणी", "ऊतक", "अंग", "रोग", "टीका", "जीवाणु", "विषाणु", "कवक"],
+      "preferred": ["classification", "process", "cycle", "flowchart", "comparison", "concept_map", "infographic"],
+      "notes": "Prefer accurate labelled scientific/technical diagrams, processes and classification visuals. Never fabricate scientific facts; labelled anatomy/geometry needs curated data (not in milestone 1)."
+    },
+    {
+      "id": "art_culture",
+      "label_en": "Art & Culture",
+      "label_hi": "कला एवं संस्कृति",
+      "keywords_en": ["art", "culture", "dance", "music", "painting", "sculpture", "architecture", "temple", "monument", "festival", "classical", "folk", "unesco", "heritage", "literature", "theatre", "craft", "miniature", "bharatanatyam", "kathak", "sitar", "tabla", "cave", "stupa"],
+      "keywords_hi": ["कला", "संस्कृति", "नृत्य", "संगीत", "चित्रकला", "मूर्तिकला", "वास्तुकला", "मंदिर", "स्मारक", "त्योहार", "शास्त्रीय", "लोक", "यूनेस्को", "धरोहर", "साहित्य", "नाटक", "शिल्प", "भरतनाट्यम", "कथक", "सितार", "तबला", "गुफा", "स्तूप"],
+      "preferred": ["timeline", "classification", "concept_map", "location_map", "regional_map", "comparison", "infographic"],
+      "notes": "Prefer cultural-region maps, timelines and classification/relationship visuals."
+    },
+    {
+      "id": "ir",
+      "label_en": "International Relations",
+      "label_hi": "अंतर्राष्ट्रीय संबंध",
+      "keywords_en": ["international", "foreign policy", "bilateral", "multilateral", "summit", "united nations", "unsc", "wto", "brics", "g20", "saarc", "asean", "neighbour", "neighbor", "border dispute", "diplomacy", "ambassador", "sanctions", "global", "treaty", "grouping"],
+      "keywords_hi": ["अंतर्राष्ट्रीय", "विदेश नीति", "द्विपक्षीय", "बहुपक्षीय", "शिखर सम्मेलन", "संयुक्त राष्ट्र", "विश्व व्यापार संगठन", "ब्रिक्स", "सार्क", "आसियान", "पड़ोसी", "सीमा विवाद", "कूटनीति", "राजदूत", "प्रतिबंध", "वैश्विक", "संधि", "समूह"],
+      "preferred": ["comparison", "concept_map", "cause_effect", "location_map", "regional_map", "flowchart", "infographic"],
+      "notes": "Prefer real-world/regional maps and relationship/geographic visuals where appropriate."
+    }
+  ]
+}
