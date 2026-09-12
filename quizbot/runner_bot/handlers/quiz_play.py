@@ -42,8 +42,11 @@ from quizbot.shared.utils import is_premium_user
 
 from ..pdf_reports import render_quiz_pdf
 from ..quiz_utils import (
+    MIN_EFFECTIVE_TIMER,
+    effective_poll_timer,
     get_section_for_question,
     is_correct,
+    parse_timer_arg,
     resolve_quiz_access,
     section_marks,
     shuffle_options_multi,
@@ -51,6 +54,7 @@ from ..quiz_utils import (
 from ..state import channel_poll_tasks, rate_limiter, session_mgr, tasks, translation_mgr
 from ..telegram_utils import (
     _get_topic_thread_id,
+    esc,
     prepare_poll_data,
     safe_send_message,
     safe_send_poll,
@@ -225,7 +229,7 @@ async def _private_section_start(chat_id: int, section: dict, skip: int = 0) -> 
     ctx = s["context"]
     msg = await safe_send_message(
         ctx, chat_id,
-        f"\U0001F4DA <b>{name}</b> started\n⏱️ Timer: {timer}s\n\U0001F4CB Q{start_idx}–{end_idx}",
+        f"\U0001F4DA <b>{esc(name)}</b> started\n⏱️ Timer: {timer}s\n\U0001F4CB Q{start_idx}–{end_idx}",
         parse_mode=ParseMode.HTML,
     )
     if msg:
@@ -275,7 +279,7 @@ async def send_private_question(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, id
 
         if target_lang and target_lang != "en":
             await safe_send_message(
-                ctx, chat_id, f"\U0001F4DD <b>Original</b>\n\n{original_q['question']}", parse_mode=ParseMode.HTML
+                ctx, chat_id, f"\U0001F4DD <b>Original</b>\n\n{esc(original_q['question'])}", parse_mode=ParseMode.HTML
             )
             await asyncio.sleep(0.5)
 
@@ -316,9 +320,12 @@ async def send_private_question(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, id
             await safe_send_message(ctx, chat_id, overflow, parse_mode=ParseMode.HTML)
             await asyncio.sleep(0.5)
 
-        timer = s.get("current_section_timer", s["quiz_data"]["timer"])
-        timer += s.get("modified_timer_offset", 0)
-        timer = max(timer, 10)
+        # DM quizzes always auto-advance, so a 0/None timer falls back to the
+        # 10s floor instead of a never-closing poll.
+        timer = effective_poll_timer(
+            s.get("current_section_timer", s["quiz_data"]["timer"]),
+            s.get("modified_timer_offset", 0),
+        ) or MIN_EFFECTIVE_TIMER
 
         poll_kwargs: dict[str, Any] = {}
         if is_multi:
@@ -481,7 +488,7 @@ async def end_private_quiz(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None
         qname = quiz_data.get("quiz_name", "Unnamed Quiz")
         txt = (
             f"\U0001F3C6 <b>Quiz Completed!</b>\n\n"
-            f"\U0001F4DD Quiz: {qname}\n\U0001F4CA Total: {total}\n\n"
+            f"\U0001F4DD Quiz: {esc(qname)}\n\U0001F4CA Total: {total}\n\n"
             f"\U0001F4C8 <b>Your Performance:</b>\n"
             f"✅ Correct: {correct}\n❌ Wrong: {wrong}\n"
             f"\U0001F3AF Score: {score:.2f}\n⏱️ Time: {int(minutes)}m {int(seconds)}s\n"
@@ -544,7 +551,7 @@ async def _run_flat_quiz(chat_id, ctx, questions, quiz, protect, update, skip) -
             await asyncio.sleep(2)
             continue
 
-        timer = max(base_timer + session.get("modified_timer_offset", 0), 10)
+        timer = effective_poll_timer(base_timer, session.get("modified_timer_offset", 0)) or MIN_EFFECTIVE_TIMER
         timer = _apply_char_boost(questions[idx], timer)
         await asyncio.sleep(timer + 2)
 
@@ -595,7 +602,7 @@ async def _run_sectioned_quiz(chat_id, ctx, questions, quiz, sections, protect, 
 
         sec_msg = await safe_send_message(
             ctx, chat_id,
-            f"\U0001F4DA <b>{sec_name}</b>\n\U0001F4CB Q{start_q}–{end_q}  ({n_qs_sec} questions)\n"
+            f"\U0001F4DA <b>{esc(sec_name)}</b>\n\U0001F4CB Q{start_q}–{end_q}  ({n_qs_sec} questions)\n"
             f"{mode_lbl}  ·  Marks: +{sec_cm} / -{sec_neg}",
             parse_mode=ParseMode.HTML,
         )
@@ -643,7 +650,7 @@ async def _run_sectioned_quiz(chat_id, ctx, questions, quiz, sections, protect, 
                 mins_r, secs_r = divmod(int(remaining + close_budget), 60)
                 await safe_send_message(
                     ctx, chat_id,
-                    f"⏳ <b>{sec_name}</b> — all {len(sec_questions)} questions sent!\n"
+                    f"⏳ <b>{esc(sec_name)}</b> — all {len(sec_questions)} questions sent!\n"
                     f"Section closes in <b>{mins_r}m {secs_r}s</b>.",
                     parse_mode=ParseMode.HTML,
                 )
@@ -651,7 +658,7 @@ async def _run_sectioned_quiz(chat_id, ctx, questions, quiz, sections, protect, 
 
             await _close_section_polls(ctx, chat_id, sec_questions)
             await safe_send_message(
-                ctx, chat_id, f"\U0001F514 <b>{sec_name}</b> — time's up! All polls closed.", parse_mode=ParseMode.HTML
+                ctx, chat_id, f"\U0001F514 <b>{esc(sec_name)}</b> — time's up! All polls closed.", parse_mode=ParseMode.HTML
             )
         else:
             for idx in sec_questions:
@@ -670,7 +677,7 @@ async def _run_sectioned_quiz(chat_id, ctx, questions, quiz, sections, protect, 
                     await asyncio.sleep(2)
                     continue
 
-                timer = max(sec_timer + session.get("modified_timer_offset", 0), 10)
+                timer = effective_poll_timer(sec_timer, session.get("modified_timer_offset", 0)) or MIN_EFFECTIVE_TIMER
                 timer = _apply_char_boost(questions[idx], timer)
                 await asyncio.sleep(timer + 2)
 
@@ -719,7 +726,7 @@ async def _send_group_question(chat_id, ctx, questions, idx, total, base_timer, 
 
         if target_lang and target_lang != "en":
             await safe_send_message(
-                ctx, chat_id, f"\U0001F4DD <b>Original</b>\n\n{original_q['question']}", parse_mode=ParseMode.HTML
+                ctx, chat_id, f"\U0001F4DD <b>Original</b>\n\n{esc(original_q['question'])}", parse_mode=ParseMode.HTML
             )
             await asyncio.sleep(0.5)
 
@@ -770,9 +777,8 @@ async def _send_group_question(chat_id, ctx, questions, idx, total, base_timer, 
             await safe_send_message(ctx, chat_id, overflow, parse_mode=ParseMode.HTML)
             await asyncio.sleep(0.3)
 
-        timer = base_timer + session.get("modified_timer_offset", 0)
-        if timer > 0:
-            timer = max(timer, 10)
+        # None => non-expiring poll (slot-mode sections / base_timer 0).
+        timer = effective_poll_timer(base_timer, session.get("modified_timer_offset", 0))
 
         poll_kwargs: dict[str, Any] = {}
         if is_multi:
@@ -788,7 +794,7 @@ async def _send_group_question(chat_id, ctx, questions, idx, total, base_timer, 
 
         poll_msg = await safe_send_poll(
             ctx, chat_id, question=poll_q, options=poll_opts, type=Poll.QUIZ,
-            explanation=poll_expl, is_anonymous=False, open_period=timer if timer > 0 else None,
+            explanation=poll_expl, is_anonymous=False, open_period=timer,
             protect_content=protect, **poll_kwargs,
         )
 
@@ -872,7 +878,7 @@ async def _send_mid_quiz_leaderboard(chat_id: int, ctx: ContextTypes.DEFAULT_TYP
         text = f"\U0001F4CA <b>Live Leaderboard</b> — after Q{q_num}/{total}\n{'─' * 28}\n"
         for rank, r in enumerate(rows[:10], 1):
             icon = {1: "\U0001F947", 2: "\U0001F948", 3: "\U0001F949"}.get(rank, f"{rank}.")
-            text += f"{icon} <b>{str(r['name'])[:25]}</b>  ✅{r['correct']} ❌{r['wrong']}  \U0001F3AF {r['score']:.1f}\n"
+            text += f"{icon} <b>{esc(str(r['name'])[:25])}</b>  ✅{r['correct']} ❌{r['wrong']}  \U0001F3AF {r['score']:.1f}\n"
         await safe_send_message(ctx, chat_id, text, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error("_send_mid_quiz_leaderboard error: %s", e)
@@ -1238,7 +1244,7 @@ async def _send_pdf_report(
         if pdf_ok and os.path.exists(pdf_path):
             try:
                 caption = (
-                    f"\U0001F4C4 <b>{quiz_name}</b>\n\U0001F4DA {chat_title}\n"
+                    f"\U0001F4C4 <b>{esc(quiz_name)}</b>\n\U0001F4DA {esc(chat_title)}\n"
                     f"\U0001F465 {len(leaderboard)} participant(s)\n\n"
                     f"<i>Full quiz report with questions, answers &amp; results</i>"
                 )
@@ -1282,8 +1288,8 @@ async def result_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         ended = attempt.get("time_ended") or ""
         text = (
             "📊 <b>Latest Quiz Result</b>\n\n"
-            f"📝 <b>{quiz_name}</b>\n"
-            f"🆔 <code>{attempt.get('qid', 'N/A')}</code>\n\n"
+            f"📝 <b>{esc(quiz_name)}</b>\n"
+            f"🆔 <code>{esc(attempt.get('qid', 'N/A'))}</code>\n\n"
             f"📚 Questions: <b>{total}</b>\n"
             f"✅ Correct: <b>{correct}</b>\n"
             f"❌ Wrong: <b>{wrong}</b>\n"
@@ -1293,7 +1299,7 @@ async def result_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             f"⏱ Time: <b>{mins}m {secs}s</b>"
         )
         if ended:
-            text += f"\n\n🕒 Completed: <code>{ended} UTC</code>"
+            text += f"\n\n🕒 Completed: <code>{esc(ended)} UTC</code>"
         await safe_send_message(ctx, chat.id, text, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error("result_command error: %s", e, exc_info=True)
@@ -1387,7 +1393,7 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if play_btn:
                 await safe_send_message(
                     ctx, chat_id,
-                    f"✨ <b>{quiz.get('quiz_name', 'Quiz')}</b>\n\nTap below to play:",
+                    f"✨ <b>{esc(quiz.get('quiz_name', 'Quiz'))}</b>\n\nTap below to play:",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[play_btn]]),
                 )
@@ -1468,13 +1474,13 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _send_access_denied(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz: dict, batch: Optional[dict]) -> None:
     creator_id = quiz.get("creator_id")
     if batch:
-        msg = f"\U0001F512 <b>Paid Quiz — Access Required</b>\n\n\U0001F4E6 Batch: <b>{batch.get('name', '')}</b>\n"
+        msg = f"\U0001F512 <b>Paid Quiz — Access Required</b>\n\n\U0001F4E6 Batch: <b>{esc(batch.get('name', ''))}</b>\n"
         if batch.get("description"):
-            msg += f"\U0001F4DD {batch['description']}\n"
+            msg += f"\U0001F4DD {esc(batch['description'])}\n"
         if batch.get("payment_link"):
-            msg += f"\n\U0001F4B3 <b>Pay here:</b> {batch['payment_link']}\n"
+            msg += f"\n\U0001F4B3 <b>Pay here:</b> {esc(batch['payment_link'])}\n"
         if batch.get("contact_info"):
-            msg += f"\U0001F4DE <b>Contact:</b> {batch['contact_info']}\n"
+            msg += f"\U0001F4DE <b>Contact:</b> {esc(batch['contact_info'])}\n"
         msg += "\nAfter payment, send screenshot to the contact above."
         await safe_send_message(ctx, chat_id, msg, parse_mode=ParseMode.HTML)
     else:
@@ -1578,14 +1584,30 @@ async def resume_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _adjust_timer(update: Update, ctx: ContextTypes.DEFAULT_TYPE, delta: int) -> None:
+    """Shared body of /slow and /fast.
+
+    ``delta`` is the default adjustment (+5 for /slow, -5 for /fast). An
+    explicit argument overrides the *magnitude* only; the direction always
+    comes from the command itself, so ``/fast 10`` and ``/fast -10`` both
+    shorten the timer by 10s. Non-numeric arguments are rejected instead of
+    silently falling back to the default.
+    """
     chat_id = update.message.chat.id
     chat_type = update.message.chat.type
     is_anon = _is_anon_admin(update.message)
     user_id = None if is_anon else (update.message.from_user.id if update.message.from_user else None)
 
-    seconds = abs(delta)
-    if ctx.args and ctx.args[0].isdigit():
-        seconds = int(ctx.args[0])
+    arg = parse_timer_arg(ctx.args[0]) if ctx.args else None
+    if ctx.args and (arg is None or arg == 0):
+        cmd = "slow" if delta > 0 else "fast"
+        await safe_send_message(
+            ctx, chat_id,
+            f"⚠️ Invalid amount. Usage: <code>/{cmd} [seconds]</code> (a positive number).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    seconds = abs(arg) if arg is not None else abs(delta)
     if delta < 0:
         seconds = -seconds
 
@@ -1601,7 +1623,11 @@ async def _adjust_timer(update: Update, ctx: ContextTypes.DEFAULT_TYPE, delta: i
     offset = session.get("modified_timer_offset", 0) + seconds
     await session_mgr.update(chat_id, {"modified_timer_offset": offset})
     direction = "decreased" if seconds < 0 else "increased"
-    await safe_send_message(ctx, chat_id, f"⏱️ Timer {direction} by {abs(seconds)}s per question.")
+    sign = "+" if offset >= 0 else "-"
+    await safe_send_message(
+        ctx, chat_id,
+        f"⏱️ Timer {direction} by {abs(seconds)}s per question (total adjustment: {sign}{abs(offset)}s).",
+    )
 
 
 async def fast_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

@@ -23,7 +23,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from quizbot.database import QuizRepository, get_db
 from quizbot.shared.utils import is_premium_user
 
-from ..telegram_utils import safe_send_message
+from ..telegram_utils import esc, safe_send_message
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ class ScheduledQuizManager:
 
             await safe_send_message(
                 ctx, chat_id,
-                f"\U0001F3AF <b>Scheduled Quiz Starting!</b>\n\nQuiz ID: <code>{qid}</code>\n"
+                f"\U0001F3AF <b>Scheduled Quiz Starting!</b>\n\nQuiz ID: <code>{esc(qid)}</code>\n"
                 f"Started at: {datetime.now(IST).strftime('%I:%M %p')}\n"
                 f"⏱ Timer: {quiz.get('timer', 30)}s | Questions: {len(quiz.get('questions', []))}",
                 parse_mode=ParseMode.HTML,
@@ -250,7 +250,7 @@ async def schedule_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         mins, _ = divmod(rem, 60)
         await safe_send_message(
             ctx, chat_id,
-            f"✅ <b>Scheduled!</b>\n\n\U0001F4DD {quiz.get('quiz_name', 'Quiz')}\n"
+            f"✅ <b>Scheduled!</b>\n\n\U0001F4DD {esc(quiz.get('quiz_name', 'Quiz'))}\n"
             f"\U0001F550 {sched_time.strftime('%I:%M %p, %d %b')}\n⏱️ In {hrs}h {mins}m",
             parse_mode=ParseMode.HTML,
         )
@@ -285,7 +285,7 @@ async def viewschedule_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
                 until = f"{h}h {m}m"
             else:
                 until = "Starting soon..."
-            text += f"{i}. <code>{s['quiz_id']}</code>\n   \U0001F550 {s['scheduled_time'].strftime('%I:%M %p, %d %b')} (in {until})\n\n"
+            text += f"{i}. <code>{esc(s['quiz_id'])}</code>\n   \U0001F550 {s['scheduled_time'].strftime('%I:%M %p, %d %b')} (in {until})\n\n"
         await safe_send_message(ctx, chat_id, text, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error("viewschedule_command error: %s", e)

@@ -21,7 +21,7 @@ from quizbot.shared.utils import is_premium_user
 
 from ..quiz_utils import check_batch_access, resolve_quiz_access
 from ..state import pending_quiz_settings, rate_limiter, session_mgr, tasks
-from ..telegram_utils import safe_send_message
+from ..telegram_utils import esc, safe_send_message
 
 logger = logging.getLogger(__name__)
 
@@ -436,9 +436,9 @@ async def _handle_anon_verify(query, ctx: ContextTypes.DEFAULT_TYPE, parts: list
     allowed, batch = await resolve_quiz_access(anon_qid, quiz, anon_chat_id, "group", real_user_id, ctx=ctx)
     if not allowed:
         if batch:
-            msg = f"\U0001F512 <b>Paid Quiz — Access Required</b>\n\n\U0001F4E6 Batch: <b>{batch.get('name', '')}</b>\n"
+            msg = f"\U0001F512 <b>Paid Quiz — Access Required</b>\n\n\U0001F4E6 Batch: <b>{esc(batch.get('name', ''))}</b>\n"
             if batch.get("payment_link"):
-                msg += f"\n\U0001F4B3 <b>Pay here:</b> {batch['payment_link']}\n"
+                msg += f"\n\U0001F4B3 <b>Pay here:</b> {esc(batch['payment_link'])}\n"
             await safe_send_message(ctx, anon_chat_id, msg, parse_mode=ParseMode.HTML)
         else:
             await safe_send_message(ctx, anon_chat_id, f"❌ Contact creator ID {quiz.get('creator_id')} for access.")
@@ -563,7 +563,7 @@ async def _send_start_card(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz: d
     shuffle_o = "✅" if quiz.get("shuffle_options") else "❌"
     neg_str = f"-{neg}" if neg else "None"
 
-    card = f"\U0001F3AF <b>{quiz.get('quiz_name', 'Quiz')}</b>\n{'─' * 30}\n\U0001F4CB <b>Questions:</b> {total_q}"
+    card = f"\U0001F3AF <b>{esc(quiz.get('quiz_name', 'Quiz'))}</b>\n{'─' * 30}\n\U0001F4CB <b>Questions:</b> {total_q}"
     if skip:
         card += f" <i>(starting from Q{skip + 1})</i>"
     card += f"\n⏱ <b>Timer:</b> {timer}s per question"
@@ -571,7 +571,7 @@ async def _send_start_card(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz: d
         card += f"\n\U0001F4C2 <b>Sections:</b> {len(sections)}"
         for sec in sections:
             r = sec.get("question_range", (0, 0))
-            card += f"\n   • {sec.get('name', '?')} — Q{r[0]}–{r[1]} ({sec.get('timer', timer)}s)"
+            card += f"\n   • {esc(sec.get('name', '?'))} — Q{r[0]}–{r[1]} ({sec.get('timer', timer)}s)"
     card += (
         f"\n✅ <b>Correct mark:</b> +{cm}\n➖ <b>Negative:</b> {neg_str}\n"
         f"\U0001F500 <b>Shuffle Q:</b> {shuffle_q}  |  <b>Options:</b> {shuffle_o}\n"

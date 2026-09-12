@@ -8,6 +8,7 @@ The codebase has been reviewed and verified with the assistance of Claude AI.
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import logging
 import random
 from typing import Any, Optional
@@ -34,6 +35,18 @@ EXPLANATION_TRIM = 200
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 1.5
 POLL_SEND_DELAY = 0.3
+
+
+def esc(value: Any) -> str:
+    """HTML-escape a user-controlled value for a ``parse_mode=HTML`` message.
+
+    Quiz names, section names, participant names, chat titles, batch
+    descriptions etc. are free text typed by users; a stray ``<`` or ``&``
+    in them makes Telegram reject the whole message with
+    ``Can't parse entities`` and the send is silently dropped. Quotes are
+    left alone (Telegram does not require them to be escaped in text).
+    """
+    return _html.escape("" if value is None else str(value), quote=False)
 
 
 async def send_raw_api(ctx: ContextTypes.DEFAULT_TYPE, method: str, params: dict[str, Any]) -> Any:

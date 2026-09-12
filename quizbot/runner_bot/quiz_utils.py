@@ -12,6 +12,62 @@ from typing import Any, Optional
 
 from quizbot.database import AuthChatRepository, BatchRepository, QuizRepository, get_db
 
+# Telegram Bot API hard limits for ``open_period`` on sendPoll.
+TG_OPEN_PERIOD_MIN = 5
+TG_OPEN_PERIOD_MAX = 600
+
+# The bot's own lower bound for a per-question timer once a /slow or /fast
+# adjustment has been applied (kept at the historical 10s floor).
+MIN_EFFECTIVE_TIMER = 10
+
+
+def effective_poll_timer(base_timer: Any, offset: Any = 0) -> Optional[int]:
+    """Return the ``open_period`` to use for a quiz poll, or ``None`` for a
+    non-expiring poll.
+
+    * ``base_timer <= 0`` (slot-mode sections, /pollquiz) means "no per-poll
+      timer": the poll must stay open regardless of any /slow or /fast
+      offset, so ``None`` is returned.
+    * Otherwise the offset is applied and the result is clamped into
+      ``[MIN_EFFECTIVE_TIMER, TG_OPEN_PERIOD_MAX]`` so ``sendPoll`` never
+      receives an out-of-range value (Telegram rejects anything outside
+      5-600s with a BadRequest, which previously made the question get
+      skipped -- or, when the offset drove the value negative, produced a
+      poll that never closed).
+    """
+    try:
+        base = int(base_timer or 0)
+    except (TypeError, ValueError):
+        base = 0
+    if base <= 0:
+        return None
+    try:
+        off = int(offset or 0)
+    except (TypeError, ValueError):
+        off = 0
+    return max(MIN_EFFECTIVE_TIMER, min(TG_OPEN_PERIOD_MAX, base + off))
+
+
+def parse_timer_arg(raw: Optional[str]) -> Optional[int]:
+    """Parse the optional integer argument of /slow and /fast.
+
+    Accepts an optional leading sign and an optional trailing ``s``
+    (``"15"``, ``"+15"``, ``"-5"``, ``"20s"``). Returns ``None`` when the
+    argument is missing or not a number so callers can complain instead of
+    silently falling back to a default.
+    """
+    if raw is None:
+        return None
+    txt = str(raw).strip().lower()
+    if txt.endswith("s"):
+        txt = txt[:-1]
+    if not txt:
+        return None
+    try:
+        return int(txt)
+    except ValueError:
+        return None
+
 
 def shuffle_options(options: list[str], correct_id: int) -> tuple[list[str], int]:
     """Shuffle all options, remapping a single correct index."""
