@@ -227,11 +227,24 @@ async def mywords_cmd(c: Client, m: Message) -> None:
     if not words:
         await m.reply("📝 Your filter list is empty.\nAdd words: `/remove word1 word2`")
         return
-    lines = "\n".join(f"{i + 1}. `{w}`" for i, w in enumerate(words))
-    await m.reply(
-        f"📝 **Your Word Filter List** ({len(words)} words)\n\n{lines}\n\n"
-        f"These are auto-removed from quiz text.\nClear all: /clearlist"
-    )
+    # Telegram caps messages at 4096 chars; an unbounded list would fail
+    # with a silent BadRequest via the bridge. Truncate oldest-first.
+    header = f"📝 **Your Word Filter List** ({len(words)} words)\n\n"
+    footer = "\n\nThese are auto-removed from quiz text.\nClear all: /clearlist"
+    budget = 4096 - len(header) - len(footer) - 64
+    lines, shown = [], 0
+    used = 0
+    for i, w in enumerate(words):
+        line = f"{i + 1}. `{w}`"
+        if used + len(line) + 1 > budget:
+            break
+        lines.append(line)
+        used += len(line) + 1
+        shown += 1
+    body = "\n".join(lines)
+    if shown < len(words):
+        body += f"\n... +{len(words) - shown} more (list truncated)"
+    await m.reply(f"{header}{body}{footer}")
 
 
 @ratelimit("default")

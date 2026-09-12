@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from typing import Any, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -20,7 +21,8 @@ from quizbot.database import QuizPrefsRepository, get_db
 from quizbot.shared.utils import is_premium_user
 
 from ..quiz_utils import check_batch_access, resolve_quiz_access
-from ..state import pending_quiz_settings, rate_limiter, session_mgr, tasks
+from ..state import (pending_quiz_settings, pending_setup_live,
+                     rate_limiter, session_mgr, tasks)
 from ..telegram_utils import esc, safe_send_message
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,7 @@ async def show_correct_mark_prompt(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int)
         [InlineKeyboardButton(str(n), callback_data=f"qs_cm_{chat_id}_{n}") for n in range(1, 6)],
         [InlineKeyboardButton("⏭ Skip (default 1)", callback_data=f"qs_cm_{chat_id}_skip")],
         [InlineKeyboardButton(qs_label, callback_data=f"qs_qs_{chat_id}_go")],
+        [InlineKeyboardButton("✖ Cancel setup", callback_data=f"qs_cancel_{chat_id}_x")],
     ])
     msg = await safe_send_message(
         ctx, chat_id,
@@ -273,6 +276,9 @@ async def quiz_setup_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             await query.answer()
             return
 
+        if len(parts) < 2:
+            await query.answer("❌ Bad data")
+            return
         step = parts[1]
 
         # Anonymous-admin identity verification: qs_anon_verify_{chat_id}_{qid}
@@ -280,10 +286,17 @@ async def quiz_setup_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             await _handle_anon_verify(query, ctx, parts)
             return
 
-        chat_id = int(parts[2])
-        value = parts[3]
+        if len(parts) < 3:
+            await query.answer("❌ Bad data")
+            return
+        try:
+            chat_id = int(parts[2])
+        except (TypeError, ValueError):
+            await query.answer("❌ Bad data")
+            return
 
-        if chat_id not in pending_quiz_settings:
+        if not pending_setup_live(chat_id):
+            pending_quiz_settings.pop(chat_id, None)
             await query.edit_message_text("❌ Session expired. Start again.")
             return
 
@@ -291,6 +304,17 @@ async def quiz_setup_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         if query.from_user.id != ps.get("initiator_id"):
             await query.answer("❌ Only the quiz initiator can configure this.", show_alert=True)
             return
+
+        if step == "cancel":
+            pending_quiz_settings.pop(chat_id, None)
+            await query.edit_message_text("✖ Quiz setup cancelled.")
+            await query.answer()
+            return
+
+        if len(parts) < 4:
+            await query.answer("❌ Bad data")
+            return
+        value = parts[3]
 
         if step == "cm":
             ps["correct_mark"] = 1.0 if value == "skip" else float(value)
@@ -340,15 +364,17 @@ async def quiz_setup_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             prev = await _get_quiz_prefs(chat_id)
             for key in ("correct_mark", "neg_mark", "shuffle_q", "shuffle_o", "shuffle_o_count", "show_explanation", "timer_override", "anti_cheat"):
                 ps[key] = prev[key]
+            # Claim the setup BEFORE the slow launch: a second tap while the
+            # launch is in flight must see "expired", not spawn a 2nd quiz.
+            pending_quiz_settings.pop(chat_id, None)
             await query.edit_message_text("⚡ <b>Quick Start!</b> Launching with your last-used settings...", parse_mode=ParseMode.HTML)
             await _launch_quiz_from_settings(chat_id, ctx, ps)
-            del pending_quiz_settings[chat_id]
 
         elif step == "tm":
             if value == "start":
+                pending_quiz_settings.pop(chat_id, None)
                 await query.edit_message_text("\U0001F680 Starting quiz...")
                 await _launch_quiz_from_settings(chat_id, ctx, ps)
-                del pending_quiz_settings[chat_id]
             elif value == "default":
                 ps["timer_override"] = None
                 await query.edit_message_text("✅ Timer: quiz default")
@@ -357,6 +383,8 @@ async def quiz_setup_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                 ps["timer_override"] = int(value)
                 await query.edit_message_text(f"✅ Timer: {value}s")
                 await _show_section_mode_prompt(ctx, chat_id)
+        else:
+            await query.answer()
     except Exception as e:
         logger.error("quiz_setup_callback error: %s", e, exc_info=True)
 
@@ -413,7 +441,6 @@ async def _handle_anon_verify(query, ctx: ContextTypes.DEFAULT_TYPE, parts: list
     real_user_id = query.from_user.id
     anon_chat_id = int(parts[3])
     anon_qid = "_".join(parts[4:])
-    await query.edit_message_text("✅ <b>Identity confirmed!</b> Starting quiz setup...", parse_mode=ParseMode.HTML)
 
     if not await is_premium_user(real_user_id):
         await safe_send_message(ctx, anon_chat_id, "Please help us to make this project more valuable by purchasing premium! Thanks")
@@ -422,9 +449,17 @@ async def _handle_anon_verify(query, ctx: ContextTypes.DEFAULT_TYPE, parts: list
         await safe_send_message(ctx, anon_chat_id, "⏱️ Too many requests. Wait a moment.")
         return
     if not anon_qid:
+        # Bare /start needs no setup: same welcome a normal user gets.
+        from .quiz_play import _START_WELCOME_TEXT
+        await safe_send_message(ctx, anon_chat_id, _START_WELCOME_TEXT, parse_mode=ParseMode.HTML)
         return
+    await query.edit_message_text("✅ <b>Identity confirmed!</b> Starting quiz setup...", parse_mode=ParseMode.HTML)
+
     if session_mgr.get(anon_chat_id):
         await safe_send_message(ctx, anon_chat_id, "⚠️ A quiz is already running. /stop it first.")
+        return
+    if pending_setup_live(anon_chat_id):
+        await safe_send_message(ctx, anon_chat_id, "⚠️ Quiz setup already in progress. Finish it, cancel it, or wait for it to expire.")
         return
 
     quiz_repo = QuizRepository(get_db())
@@ -453,6 +488,7 @@ async def _handle_anon_verify(query, ctx: ContextTypes.DEFAULT_TYPE, parts: list
     # account, matching the original's `protect = True; if anon_chat_id ==
     # creator_id: protect = False`.
     pending_quiz_settings[anon_chat_id] = {
+        "created_at": time.time(),
         "quiz": quiz, "update": query, "skip": 0,
         "protect": anon_chat_id != quiz.get("creator_id"), "chat_type": "group",
         "correct_mark": float(quiz.get("correct_marks", 1)),

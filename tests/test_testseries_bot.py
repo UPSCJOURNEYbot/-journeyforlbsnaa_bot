@@ -162,10 +162,12 @@ class HiddenCommandCases(unittest.TestCase):
                           f"/{alias} must be private-chat only")
         # Regression anchors: neighbours untouched.
         self.assertIn("whtml", by_command)
-        # PTB gives every CommandHandler a default UpdateType.MESSAGES
-        # filter; /whtml must keep exactly that (no private restriction).
-        self.assertNotIn("PRIVATE", repr(by_command["whtml"][0].filters),
-                         "/whtml wiring must not change")
+        # Part 4 audit fix: legacy registers /whtml with filters.private
+        # (reports.py) -- the bridge used to drop that filter, leaking full
+        # quiz reports (questions + answers) into groups. /whtml must be
+        # private-chat only, matching legacy.
+        self.assertIn("PRIVATE", repr(by_command["whtml"][0].filters),
+                      "/whtml must be private-chat only (legacy parity)")
         self.assertNotIn("start", by_command,
                          "/start belongs to the Runner, not the bridge")
 

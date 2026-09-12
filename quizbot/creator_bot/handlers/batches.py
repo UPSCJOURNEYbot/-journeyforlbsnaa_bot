@@ -12,7 +12,7 @@ import logging
 from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from quizbot.database import BatchRepository, get_db
+from quizbot.database import BatchRepository, QuizRepository, get_db
 from quizbot.shared.utils import is_premium_user
 
 from .. import state
@@ -123,9 +123,26 @@ async def searchbatch_cmd(c: Client, m: Message) -> None:
 async def batch_cb(c: Client, cb: CallbackQuery) -> None:
     """`bat_<action>_...` -- the full batch-management callback tree."""
     uid = cb.from_user.id
-    parts = cb.data.split("_")
-    action = parts[1]
+    try:
+        parts = (cb.data or "").split("_")
+        if len(parts) < 2:
+            raise ValueError("bad callback")
+        action = parts[1]
+        if not action:
+            raise ValueError("bad callback")
+    except (ValueError, IndexError, AttributeError):
+        await cb.answer("⚠️ Bad data", show_alert=True)
+        return
     repo = BatchRepository(get_db())
+    try:
+        return await _batch_cb_inner(c, cb, uid, parts, action, repo)
+    except (ValueError, IndexError) as exc:
+        logger.debug("batch_cb bad data %r: %s", cb.data, exc)
+        await cb.answer("⚠️ Bad data", show_alert=True)
+        return
+
+
+async def _batch_cb_inner(c: Client, cb: CallbackQuery, uid: int, parts: list, action: str, repo) -> None:
 
     if action == "list":
         if uid != int(parts[2]):
@@ -177,6 +194,9 @@ async def batch_cb(c: Client, cb: CallbackQuery) -> None:
         bid, qid, target_uid = parts[2], parts[3], int(parts[4])
         if uid != target_uid:
             await cb.answer("⚠️ Not yours", show_alert=True)
+            return
+        if not await QuizRepository(get_db()).get(qid):
+            await cb.answer("❌ Quiz not found", show_alert=True)
             return
         await repo.add_quiz(bid, qid)
         await cb.answer("✅ Quiz attached!")
@@ -337,7 +357,11 @@ async def batch_input(c: Client, m: Message) -> None:
     uid = m.from_user.id
     session = state.batch_sessions[uid]
     step = session.get("step", "")
-    text = m.text.strip()
+    text = (m.text or "").strip()
+    if text.lower() == "cancel":
+        state.batch_sessions.pop(uid, None)
+        await m.reply("❌ Batch operation cancelled.")
+        return
     repo = BatchRepository(get_db())
 
     if step == "name":
@@ -391,6 +415,10 @@ async def batch_input(c: Client, m: Message) -> None:
         return
 
     if step == "addqz":
+        quiz = await QuizRepository(get_db()).get(text)
+        if not quiz:
+            await m.reply(f"❌ Quiz `{text}` not found. Send a valid quiz ID or `cancel`.")
+            return
         await repo.add_quiz(session["bid"], text)
         bid = session["bid"]
         state.batch_sessions.pop(uid, None)

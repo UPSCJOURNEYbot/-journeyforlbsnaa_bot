@@ -147,6 +147,28 @@ channel_poll_tasks: dict[int, asyncio.Task] = {}
 # See handlers/setup_wizard.py for the qs_* callback flow that populates this.
 pending_quiz_settings: dict[int, dict[str, Any]] = {}
 
+# Abandoned setup wizards expire after this long, so a chat can never be
+# stuck behind a dead setup (and stale buttons stop working).
+PENDING_SETUP_TTL_SECONDS = 15 * 60
+
+
+def pending_setup_live(chat_id: int) -> bool:
+    """True while a setup wizard is still usable for this chat.
+
+    Entries without a `created_at` predate TTL tracking and are treated as
+    live (fail-open: never brick a chat on a bookkeeping gap).
+    """
+    ps = pending_quiz_settings.get(chat_id)
+    if ps is None:
+        return False
+    created = ps.get("created_at")
+    if created is None:
+        return True
+    try:
+        return (time.time() - float(created)) < PENDING_SETUP_TTL_SECONDS
+    except (TypeError, ValueError):
+        return True
+
 # /aiquiz wizard state, keyed by the initiating user's id.
 AI_QUIZ_SESSIONS: dict[int, dict[str, Any]] = {}
 

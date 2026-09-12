@@ -75,6 +75,20 @@ HELP_TEXT = (
     "**Account**\n"
     "`/settings` -- creator settings\n"
     "`/features` -- feature overview\n"
+    "\n"
+    "**Playing quizzes (any chat)**\n"
+    "`/start <quiz_id> [skip]` -- launch a quiz\n"
+    "`/pause`, `/resume`, `/stop` -- control the running quiz\n"
+    "`/slow`, `/fast`, `/normal` -- adjust the per-question timer\n"
+    "`/leaderboard` -- show a live leaderboard mid-quiz\n"
+    "`/result` -- show your latest quiz result\n"
+    "`/pollquiz <quiz_id>`, `/pollstop` -- non-expiring poll mode\n"
+    "`/mix <count> <id1> <id2> ...` -- combine quizzes\n"
+    "`/aiquiz <topic>` -- AI-generated quiz\n"
+    "`/pdfquiz` -- reply to a PDF to generate a quiz from it\n"
+    "`/html`, `/pdf` -- toggle report generation for this chat\n"
+    "`/trans <lang>` -- live question translation\n"
+    "`/schedule`, `/viewschedule`, `/cancelschedule` -- schedule a quiz\n"
 )
 
 
@@ -126,35 +140,67 @@ async def gcast_cmd(c: Client, m: Message) -> None:
 
     state.broadcast.active = True
     bm = m.reply_to_message
-    users = await UserRepository(get_db()).get_all(limit=1_000_000)
-    total, sent, failed = len(users), 0, 0
-    progress = await m.reply(f"Starting broadcast: 0/{total}")
+    progress = None
+    total, sent, failed = 0, 0, 0
+    try:
+        users = await UserRepository(get_db()).get_all(limit=1_000_000)
+        total = len(users)
+        progress = await m.reply(f"Starting broadcast: 0/{total}")
 
-    for i, u in enumerate(users):
-        if not state.broadcast.active:
-            await progress.edit_text(f"Stopped at {sent}/{total}")
-            return
-        cid = u["chat_id"]
+        for i, u in enumerate(users):
+            if not state.broadcast.active:
+                try:
+                    await progress.edit_text(f"Stopped at {sent}/{total}")
+                except Exception:
+                    pass
+                return
+            cid = u.get("chat_id") if isinstance(u, dict) else None
+            if cid is None:
+                failed += 1
+                continue
+            try:
+                if bm.text:
+                    await c.send_message(cid, bm.text, reply_markup=bm.reply_markup)
+                elif bm.photo:
+                    await c.send_photo(cid, bm.photo.file_id, caption=bm.caption or "", reply_markup=bm.reply_markup)
+                elif bm.video:
+                    await c.send_video(cid, bm.video.file_id, caption=bm.caption or "", reply_markup=bm.reply_markup)
+                elif bm.document:
+                    await c.send_document(cid, bm.document.file_id, caption=bm.caption or "", reply_markup=bm.reply_markup)
+                else:
+                    await bm.copy(cid)
+                sent += 1
+            except Exception:
+                # Typed sends force Markdown parsing: source text/captions
+                # with special chars fail for EVERY user. Fall back to a
+                # server-side copy, which preserves entities exactly.
+                try:
+                    await bm.copy(cid)
+                    sent += 1
+                except Exception:
+                    failed += 1
+            if (i + 1) % 100 == 0:
+                try:
+                    await progress.edit_text(f"Progress: {sent}/{total}")
+                except Exception:
+                    pass
+                await asyncio.sleep(10)
+    except Exception:
+        logger.exception("gcast_cmd failed")
+        if progress is not None:
+            try:
+                await progress.edit_text(f"⚠️ Broadcast interrupted at {sent}/{total}.")
+            except Exception:
+                pass
+        return
+    finally:
+        state.broadcast.active = False
+
+    if progress is not None:
         try:
-            if bm.text:
-                await c.send_message(cid, bm.text, reply_markup=bm.reply_markup)
-            elif bm.photo:
-                await c.send_photo(cid, bm.photo.file_id, caption=bm.caption or "", reply_markup=bm.reply_markup)
-            elif bm.video:
-                await c.send_video(cid, bm.video.file_id, caption=bm.caption or "", reply_markup=bm.reply_markup)
-            elif bm.document:
-                await c.send_document(cid, bm.document.file_id, caption=bm.caption or "", reply_markup=bm.reply_markup)
-            else:
-                await bm.copy(cid)
-            sent += 1
+            await progress.edit_text(f"Done: {sent}/{total} sent, {failed} failed")
         except Exception:
-            failed += 1
-        if (i + 1) % 100 == 0:
-            await progress.edit_text(f"Progress: {sent}/{total}")
-            await asyncio.sleep(10)
-
-    state.broadcast.active = False
-    await progress.edit_text(f"Done: {sent}/{total} sent, {failed} failed")
+            pass
 
 
 async def stopcast_cmd(c: Client, m: Message) -> None:
@@ -182,9 +228,11 @@ async def statses_cmd(c: Client, m: Message) -> None:
             f"Paid: `{quiz_stats['paid_quizzes']}`\n"
             f"Free: `{quiz_stats['free_quizzes']}`"
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("statses_cmd failed")
-        await status.edit_text(f"Error: {exc}")
+        # Generic text: /statses is open to every user, so raw exception
+        # details (DB topology, paths) must never leak here.
+        await status.edit_text("❌ Error: could not load stats right now.")
 
 
 async def testapi_cmd(c: Client, m: Message) -> None:

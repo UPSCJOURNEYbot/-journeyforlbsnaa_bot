@@ -42,10 +42,12 @@ async def _send_quiz_page(target, quizzes: list[dict], page: int, uid: int) -> N
     lines = []
     for i, q in enumerate(chunk, start=start + 1):
         qid = q.get("qid", "N/A")
+        qtype = str(q.get("quiz_type", "free") or "free")
+        type_icon = "🆓" if qtype.lower() == "free" else "💎"
         lines.append(
             f"**{i}. {q.get('quiz_name', 'Unnamed')[:100]}**\n"
             f"    ID: `{qid}`\n"
-            "    🆓 Free\n"
+            f"    {type_icon} {qtype.title()}\n"
             f"    Plays: {q.get('total_participants', 0)}\n"
             f"    Edit: `/edit {qid}`\n"
             f"────────────────"
@@ -87,24 +89,38 @@ async def myquizzes_cmd(c: Client, m: Message) -> None:
         msg = f"🔍 No quizzes found for **{search_term}**" if search_term else "📋 No quizzes yet."
         await pending.edit_text(msg)
         return
-    if not search_term:
-        state.save_quiz_list_cache(uid, quizzes)
+    state.save_quiz_list_cache(uid, quizzes)
     await _send_quiz_page(pending, quizzes, 0, uid)
 
 
 async def pagination_cb(c: Client, cb: CallbackQuery) -> None:
     """`prev:<page>:<uid>` / `next:<page>:<uid>` / `refresh:<uid>` -- quiz
     list pagination for /myquizzes."""
-    parts = cb.data.split(":")
-    action, uid = parts[0], int(parts[-1])
+    try:
+        parts = (cb.data or "").split(":")
+        action = parts[0]
+        uid = int(parts[-1])
+        page = int(parts[1]) if action in ("prev", "next") else 0
+        if action not in ("prev", "next", "refresh"):
+            raise ValueError("bad action")
+        if action in ("prev", "next") and len(parts) != 3:
+            raise ValueError("bad shape")
+        if action == "refresh" and len(parts) != 2:
+            raise ValueError("bad shape")
+    except (ValueError, IndexError, AttributeError):
+        await cb.answer("⚠️ Bad data", show_alert=True)
+        return
+    if cb.from_user.id != uid:
+        await cb.answer("⚠️ Not yours", show_alert=True)
+        return
     if action == "refresh":
         state.clear_quiz_list_cache(uid)
+        await cb.answer()
         try:
             await cb.message.delete()
         except Exception:
             pass
         return
-    page = int(parts[1])
     cached = state.load_quiz_list_cache(uid)
     if not cached:
         await cb.answer("⚠️ Expired -- run /myquizzes again", show_alert=True)
@@ -135,29 +151,72 @@ async def del_quiz_cmd(c: Client, m: Message) -> None:
 
 
 async def delall_cmd(c: Client, m: Message) -> None:
-    """/delall -- (owner only) delete every quiz on the platform."""
+    """/delall CONFIRM -- (owner only) delete every quiz on the platform.
+    A bare /delall only previews the blast radius; the wipe requires an
+    explicit CONFIRM so a typo can never nuke the platform."""
     if not _is_owner_or_admin(m.from_user.id):
         return
-    repo = QuizRepository(get_db())
-    quizzes = await repo.list_all(limit=1_000_000)
-    for q in quizzes:
-        await repo.delete(q["qid"])
-    await m.reply(f"🗑️ Deleted {len(quizzes)} quizzes.")
+    try:
+        repo = QuizRepository(get_db())
+        quizzes = await repo.list_all(limit=1_000_000)
+        parts = (m.text or "").strip().split()
+        if len(parts) < 2 or parts[1].upper() != "CONFIRM":
+            await m.reply(
+                f"⚠️ This will permanently delete **{len(quizzes)}** quizzes.\n"
+                f"Re-run as `/delall CONFIRM` to proceed."
+            )
+            return
+        deleted, failed = 0, 0
+        for q in quizzes:
+            try:
+                await repo.delete(q["qid"])
+                deleted += 1
+            except Exception:
+                logger.exception("delall_cmd: failed to delete %s", q.get("qid"))
+                failed += 1
+        text = f"🗑️ Deleted {deleted} quizzes."
+        if failed:
+            text += f" {failed} failed."
+        await m.reply(text)
+    except Exception:
+        logger.exception("delall_cmd failed")
+        await m.reply("❌ Could not complete the wipe. Check the logs and retry.")
 
 
 @ratelimit("default")
 async def convertall_cmd(c: Client, m: Message) -> None:
-    """/convertall -- (owner/admin only) convert every paid quiz to free.
-    Intended for use inside a designated admin group chat."""
+    """/convertall CONFIRM -- (owner/admin only) convert every paid quiz
+    to free. Paid->free is lossy (the original paid set is unrecoverable),
+    so a bare /convertall only previews; CONFIRM executes."""
     if not _is_owner_or_admin(m.from_user.id):
         return
-    status = await m.reply("🔄 Converting...")
-    repo = QuizRepository(get_db())
-    quizzes = await repo.list_all(limit=1_000_000)
-    paid = [q for q in quizzes if q.get("quiz_type") == "paid"]
-    for q in paid:
-        await repo.update_field(q["qid"], "quiz_type", "free")
-    await status.edit_text(f"✅ Converted {len(paid)} quizzes to free.")
+    try:
+        repo = QuizRepository(get_db())
+        quizzes = await repo.list_all(limit=1_000_000)
+        paid = [q for q in quizzes if q.get("quiz_type") == "paid"]
+        parts = (m.text or "").strip().split()
+        if len(parts) < 2 or parts[1].upper() != "CONFIRM":
+            await m.reply(
+                f"⚠️ This will convert **{len(paid)}** paid quizzes to free.\n"
+                f"Re-run as `/convertall CONFIRM` to proceed."
+            )
+            return
+        status = await m.reply("🔄 Converting...")
+        done, failed = 0, 0
+        for q in paid:
+            try:
+                await repo.update_field(q["qid"], "quiz_type", "free")
+                done += 1
+            except Exception:
+                logger.exception("convertall_cmd: failed on %s", q.get("qid"))
+                failed += 1
+        text = f"✅ Converted {done} quizzes to free."
+        if failed:
+            text += f" {failed} failed."
+        await status.edit_text(text)
+    except Exception:
+        logger.exception("convertall_cmd failed")
+        await m.reply("❌ Could not complete the conversion. Check the logs and retry.")
 
 
 @ratelimit("default")
@@ -305,22 +364,42 @@ async def ban_cmd(c: Client, m: Message) -> None:
     if not creator_id:
         await m.reply("❌ No creator on this quiz.")
         return
-    if config.CHANNEL_ID:
-        try:
-            await c.ban_chat_member(config.CHANNEL_ID, creator_id)
-            await m.reply(f"🚫 Banned {creator_id}.")
-        except Exception as exc:
-            await m.reply(f"⚠️ Ban failed: {exc}")
     try:
         creator_quizzes = await repo.list_by_creator(creator_id)
+        parts = (m.text or "").strip().split()
+        if len(parts) < 3 or parts[2].upper() != "CONFIRM":
+            await m.reply(
+                f"⚠️ This will ban creator `{creator_id}` from the channel and "
+                f"permanently delete their **{len(creator_quizzes)}** quizzes.\n"
+                f"Re-run as `/ban {args[1]} CONFIRM` to proceed."
+            )
+            return
+        if config.CHANNEL_ID:
+            try:
+                await c.ban_chat_member(config.CHANNEL_ID, creator_id)
+                await m.reply(f"🚫 Banned {creator_id}.")
+            except Exception as exc:
+                await m.reply(f"⚠️ Ban failed: {exc}")
+        else:
+            await m.reply("ℹ️ CHANNEL_ID not set -- skipped channel ban.")
+        deleted, failed = 0, 0
         for q in creator_quizzes:
-            await repo.delete(q["qid"])
-        await m.reply(f"🗑️ Deleted {len(creator_quizzes)} quizzes by {creator_id}.")
-    except Exception as exc:
-        logger.exception("ban_cmd deletion failed")
-        await m.reply(f"⚠️ Deletion error: {exc}")
+            try:
+                await repo.delete(q["qid"])
+                deleted += 1
+            except Exception:
+                logger.exception("ban_cmd: failed to delete %s", q.get("qid"))
+                failed += 1
+        text = f"🗑️ Deleted {deleted} quizzes by {creator_id}."
+        if failed:
+            text += f" {failed} failed."
+        await m.reply(text)
+    except Exception:
+        logger.exception("ban_cmd failed")
+        await m.reply("❌ Could not complete the ban. Check the logs and retry.")
 
 
+@ratelimit("default")
 async def listquiz_cmd(c: Client, m: Message) -> None:
     """/listquiz -- (in a designated group chat) list every quiz on the
     platform, one message per quiz."""
