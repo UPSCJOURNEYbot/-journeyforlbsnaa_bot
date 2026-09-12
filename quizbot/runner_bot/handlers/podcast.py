@@ -7,8 +7,11 @@ custom selection accepts comma-separated numbers and ranges such as
 ``1,3,7-10`` (maximum 10 items).
 
 Every user generates podcasts with their OWN Gemini API key, saved once via
-/podcast and stored encrypted (see podcast_security). The shared
-GEMINI_API_KEY env fallback was removed in Phase 6 by design.
+/podcast and stored encrypted (see podcast_security). A shared
+GEMINI_API_KEY env var is still honored as a *compatibility fallback* when
+the caller has no per-user key (so VPS deployments that still carry a
+legacy env key keep working), but per-user keys always take precedence
+and the env fallback is never logged or exposed.
 """
 from __future__ import annotations
 
@@ -29,7 +32,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from quizbot.database import PodcastKeyRepository, QuizRepository, get_db
+from quizbot.database import AIKeyRepository, PodcastKeyRepository, QuizRepository, get_db
 from quizbot.runner_bot.podcast_security import (
     decrypt_api_key,
     encrypt_api_key,
@@ -736,19 +739,56 @@ async def _load_user_key(uid: int) -> Optional[str]:
     Missing rows, DB blips and undecryptable blobs (e.g. after a master
     secret rotation) all map to None -- the caller then asks for a key.
     Plaintext keys are never logged here.
+
+    Compatibility (Phase 6 fix): if the per-user podcast key is missing or
+    undecryptable, we also check the generic AI-key store (AIKeyRepository)
+    for a ``gemini`` provider key (users who used ``/setkey gemini`` before
+    the podcast feature) and finally the legacy ``GEMINI_API_KEY`` env var
+    (shared fallback for VPS deployments that still carry it). Per-user
+    podcast keys always win; fallbacks are never logged and never stored
+    into the podcast collection.
     """
+    # 1) Primary: per-user encrypted podcast key
     try:
         enc = await _key_repo().get_encrypted(uid)
     except Exception:
         logger.exception("podcast key lookup failed for user %s", uid)
         return None
-    if not enc:
-        return None
+    if enc:
+        try:
+            return decrypt_api_key(enc)
+        except ValueError:
+            logger.warning("podcast key undecryptable for user %s (re-set needed)", uid)
+            # fall through to compatibility checks rather than returning None
+        except Exception:
+            logger.warning("podcast key undecryptable for user %s (re-set needed)", uid)
+            # fall through
+
+    # 2) Compatibility: generic AI keys (``/setkey gemini``)
     try:
-        return decrypt_api_key(enc)
-    except ValueError:
-        logger.warning("podcast key undecryptable for user %s (re-set needed)", uid)
+        akeys = await AIKeyRepository(get_db()).list_for_provider(uid, "gemini")
+        if akeys:
+            # AIKeyRepository stores api_key as plaintext; take the first
+            # (round-robin ordering) and treat it as the user's Gemini key.
+            candidate = (akeys[0].get("api_key") or "").strip()
+            if candidate and len(candidate) >= 8:
+                return candidate
+    except Exception:
+        logger.debug("podcast AIKey fallback lookup failed for user %s", uid, exc_info=True)
+
+    # 3) Compatibility: legacy shared env key (server-wide fallback)
+    try:
+        env_key = (getattr(config, "GEMINI_API_KEY", None) or "").strip()
+        if env_key and len(env_key) >= 8:
+            return env_key
+    except Exception:
+        pass
+
+    # No key available from any source
+    if enc:
+        # We had an unreadable per-user blob and no viable fallback
         return None
+    return None
 
 
 async def _send_key_prompt(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,

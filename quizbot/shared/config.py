@@ -122,6 +122,20 @@ MINI_APP_REQUIRE_PREMIUM: bool = _env_bool("MINI_APP_REQUIRE_PREMIUM", False)
 OPENROUTER_DEFAULT_KEYS: list[str] = [
     k for k in _env("OPENROUTER_DEFAULT_KEYS", "").split(",") if k
 ]
+# Gemini key compatibility: many VPS deployments still carry a legacy
+# GEMINI_API_KEY (pre-Phase 6 shared key) in .env. Phase 6 deliberately
+# removed the shared-key path in favor of per-user encrypted keys, but we
+# keep reading the env var as a *fallback* for compatibility — if a user
+# has no per-user key, the shared key (if configured) is used rather than
+# asking for a key again. No new code should set GEMINI_API_KEY; users
+# should set their own via /podcast. The env var is never logged.
+GEMINI_API_KEY: str | None = _env("GEMINI_API_KEY") or _env("GOOGLE_API_KEY") or None
+# Also accept the plural form some operators used.
+if not GEMINI_API_KEY:
+    plural = _env("GEMINI_API_KEYS", "")
+    if plural:
+        GEMINI_API_KEY = plural.split(",")[0].strip() or None
+
 GEMINI_URL: str = _env(
     "GEMINI_URL",
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
