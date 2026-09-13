@@ -58,12 +58,20 @@ sys.exit(0)
 '''
 
 FAKE_PGREP = r'''#!/usr/bin/env python3
-import os, pathlib
+import os, pathlib, re, sys
 state_dir = pathlib.Path(os.environ["FAKE_STATE_DIR"])
-pids = [p for p in (state_dir / "procs").read_text().split() if p.strip()]
+pattern = sys.argv[-1] if len(sys.argv) > 1 else ".*"
 app_dir = os.environ["FAKE_APP_DIR"]
-for pid in pids:
-    print(f"{pid} python {app_dir}/run.py")
+# procs file lines: "<pid>|<cmdline>"
+for line in (state_dir / "procs").read_text().splitlines():
+    if not line.strip():
+        continue
+    pid, _, cmdline = line.partition("|")
+    # Honour the pgrep -f regex (bracket forms like [r]un.py are literal once
+    # the char class matches its single character) and the APP_DIR filter the
+    # gate applies afterwards.
+    if re.search(pattern, cmdline) and app_dir in cmdline:
+        print(f"{pid} {cmdline}")
 '''
 
 FAKE_JOURNALCTL = r'''#!/usr/bin/env python3
@@ -118,13 +126,17 @@ class HealthGateTests(unittest.TestCase):
         self.decoys.append(proc)
         return proc.pid
 
-    def _run_gate(self, scenario, n_procs=1, stable=2, interval=1, grace=5):
+    def _run_gate(self, scenario, n_procs=1, stable=2, interval=1, grace=5,
+                  process_match=None, cmdline=None):
         pid = self._spawn_decoy()
-        pids = [str(pid)]
+        if cmdline is None:
+            cmdline = f"python {APP_DIR}/run.py"
+        proc_lines = [f"{pid}|{cmdline}"]
         if n_procs > 1:
-            pids.append(str(self._spawn_decoy()))
+            extra = self._spawn_decoy()
+            proc_lines.append(f"{extra}|{cmdline}")
         (self.state_dir / "pid").write_text(str(pid))
-        (self.state_dir / "procs").write_text("\n".join(pids) + "\n")
+        (self.state_dir / "procs").write_text("\n".join(proc_lines) + "\n")
         (self.state_dir / "scenario").write_text(scenario)
         env = os.environ.copy()
         env.update({
@@ -136,9 +148,11 @@ class HealthGateTests(unittest.TestCase):
             "HEALTH_INTERVAL": str(interval),
             "SUDO": "",
         })
+        argv = ["bash", str(GATE), "quizbot", APP_DIR]
+        if process_match:
+            argv.append(process_match)
         return subprocess.run(
-            ["bash", str(GATE), "quizbot", APP_DIR],
-            capture_output=True, text=True, env=env, timeout=60)
+            argv, capture_output=True, text=True, env=env, timeout=60)
 
     def test_healthy_service_passes(self):
         r = self._run_gate("healthy")
@@ -163,10 +177,28 @@ class HealthGateTests(unittest.TestCase):
         r = self._run_gate("healthy", n_procs=2)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("DEPLOY FAILED", r.stdout + r.stderr)
-        self.assertIn("run.py processes", r.stdout + r.stderr)
+        self.assertIn("processes matching", r.stdout + r.stderr)
+        self.assertIn("duplicate instances", r.stdout + r.stderr)
 
     def test_crash_after_window_caught_by_final_recheck(self):
         r = self._run_gate("latecrash")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("DEPLOY FAILED", r.stdout + r.stderr)
+
+    def test_custom_process_pattern_for_pdf_service(self):
+        cmdline = f"/opt/quizbot/.venv/bin/python -m pdf_service.server"
+        r = self._run_gate("healthy",
+                           process_match="pdf_service[.]server",
+                           cmdline=cmdline)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("pdf_service[.]server", r.stdout)
+
+    def test_wrong_process_pattern_counts_zero(self):
+        # Gate looking for the PDF service must not be satisfied by a bot
+        # run.py process (and vice versa).
+        r = self._run_gate("healthy",
+                           process_match="pdf_service[.]server",
+                           cmdline=f"python {APP_DIR}/run.py")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("DEPLOY FAILED", r.stdout + r.stderr)
 
@@ -213,6 +245,30 @@ class DeployScriptWiringTests(unittest.TestCase):
     def test_restart_policy_untouched(self):
         # Hardening must not disable production's restart-on-crash.
         self.assertIn("Restart=always", self.deploy)
+
+
+class PdfServiceDeployWiringTests(unittest.TestCase):
+    """The PDF microservice deploy must use the same stability gate."""
+
+    def setUp(self):
+        self.pdf_deploy = (REPO_ROOT / "deploy_pdf_service.sh").read_text()
+
+    def test_pdf_deploy_invokes_gate_with_pdf_pattern(self):
+        self.assertIn('deploy_health_gate.sh" "$SERVICE_NAME" "$APP_DIR" '
+                      '"pdf_service[.]server"', self.pdf_deploy)
+
+    def test_pdf_deploy_no_oneshot_sleep5_active_check(self):
+        self.assertNotIn('sleep 5\n$SUDO systemctl is-active', self.pdf_deploy)
+
+    def test_pdf_success_only_after_gate_and_functional_verify(self):
+        gate_pos = self.pdf_deploy.index("pdf_service[.]server")
+        verify_pos = self.pdf_deploy.index("verify_service\n", gate_pos)
+        ok_pos = self.pdf_deploy.index("PDF DEPLOY OK")
+        self.assertLess(gate_pos, verify_pos)
+        self.assertLess(verify_pos, ok_pos)
+
+    def test_pdf_service_keeps_restart_policy(self):
+        self.assertIn("Restart=always", self.pdf_deploy)
 
 
 if __name__ == "__main__":

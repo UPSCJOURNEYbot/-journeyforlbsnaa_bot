@@ -1113,6 +1113,7 @@ class ArchitectureTests(unittest.TestCase):
             "quizbot/database/db.py",
             "quizbot/analytics/gamification.py",
             "deploy_health_gate.sh",
+            "deploy_pdf_service.sh",
             "tests/test_motor_startup_compat.py",
             "tests/test_deploy_health_gate.py",
             "tests/test_part3_aiquiz_schedule.py",

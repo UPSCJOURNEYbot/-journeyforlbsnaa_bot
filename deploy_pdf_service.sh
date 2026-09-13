@@ -183,16 +183,21 @@ $SUDO systemctl daemon-reload
 $SUDO systemctl enable "$SERVICE_NAME"
 $SUDO systemctl restart "$SERVICE_NAME"
 log "Service enabled (starts on boot) and restarted."
-sleep 5
-$SUDO systemctl is-active --quiet "$SERVICE_NAME" || {
-  $SUDO systemctl status "$SERVICE_NAME" --no-pager || true
-  $SUDO journalctl -u "$SERVICE_NAME" -n 40 --no-pager || true
-  fail "Service $SERVICE_NAME is not active. See logs above."
-}
-log "Service state: active."
+# Same stability gate as the bot deploy: a one-shot is-active probe cannot
+# distinguish a healthy service from a Restart=always crash loop. The gate
+# requires active(running) to hold across a stability window with one stable
+# PID and exactly one pdf_service process; the functional end-to-end render
+# check below then proves the service actually serves PDFs.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/deploy_health_gate.sh" ] || fail "Missing $SCRIPT_DIR/deploy_health_gate.sh (checkout incomplete?)."
+if ! SUDO="$SUDO" HEALTH_START_GRACE="${HEALTH_START_GRACE:-60}" \
+     HEALTH_STABLE_SECS="${HEALTH_STABLE_SECS:-30}" HEALTH_INTERVAL="${HEALTH_INTERVAL:-2}" \
+     "$SCRIPT_DIR/deploy_health_gate.sh" "$SERVICE_NAME" "$APP_DIR" "pdf_service[.]server"; then
+  fail "PDF service did not pass the stability health gate — DEPLOY FAILED. Inspect the journal above, fix the startup error, and re-run (idempotent; .env and data untouched)."
+fi
 verify_service
 
-log "PDF DEPLOY OK — $SERVICE_NAME is active and renders valid PDFs."
+log "PDF DEPLOY OK — $SERVICE_NAME passed the stability gate and renders valid PDFs end to end."
 log "NEXT: set PDF_API_BASE=http://127.0.0.1:$(pdf_port) in $APP_DIR/.env,"
 log "THEN restart the bot once so it picks up the new value:"
 log "  sudo systemctl restart quizbot"

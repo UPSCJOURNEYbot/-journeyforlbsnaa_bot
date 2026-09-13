@@ -27,7 +27,12 @@
 # a genuinely healthy deployment keeps restart-on-crash/reboot behaviour.
 #
 # Usage:
-#   deploy_health_gate.sh SERVICE_NAME APP_DIR
+#   deploy_health_gate.sh SERVICE_NAME APP_DIR [PROCESS_MATCH]
+#
+#   PROCESS_MATCH  pgrep -f regex identifying THIS service's process
+#                  (default "[r]un.py"; the PDF microservice passes
+#                  "pdf_service[.]server"). The match is additionally
+#                  constrained to APP_DIR, and exactly ONE must remain.
 #
 # Tunables (env overrides, mainly for fast automated tests):
 #   HEALTH_START_GRACE  seconds to wait for active(running)      (default 60)
@@ -37,8 +42,9 @@
 #
 set -euo pipefail
 
-SERVICE_NAME="${1:?usage: deploy_health_gate.sh SERVICE_NAME APP_DIR}"
-APP_DIR="${2:?usage: deploy_health_gate.sh SERVICE_NAME APP_DIR}"
+SERVICE_NAME="${1:?usage: deploy_health_gate.sh SERVICE_NAME APP_DIR [PROCESS_MATCH]}"
+APP_DIR="${2:?usage: deploy_health_gate.sh SERVICE_NAME APP_DIR [PROCESS_MATCH]}"
+PROCESS_MATCH="${3:-[r]un.py}"
 START_GRACE="${HEALTH_START_GRACE:-60}"
 STABLE_SECS="${HEALTH_STABLE_SECS:-30}"
 INTERVAL="${HEALTH_INTERVAL:-2}"
@@ -58,11 +64,14 @@ prop() {
 }
 
 matching_process_count() {
-  # Exactly one 'run.py' whose command line belongs to THIS app directory.
+  # Exactly one service process whose command line both matches the service
+  # pattern AND belongs to THIS app directory. Callers pass the pattern in
+  # the classic self-excluding bracket form ("[r]un.py",
+  # "pdf_service[.]server") so pgrep never matches its own command line.
   local matches
-  matches="$(pgrep -af "[r]un.py" 2>/dev/null | grep -F "$APP_DIR" || true)"
+  matches="$(pgrep -af "$PROCESS_MATCH" 2>/dev/null | grep -F "$APP_DIR" || true)"
   if [ -z "$matches" ]; then printf '0\n'; else
-    printf '%s\n' "$matches" | grep -c .
+    printf '%s\n' "$matches" | grep -c . || true
   fi
 }
 
@@ -117,8 +126,8 @@ check_stable() {
     if [ "$c_count" = "0" ]; then
       fail "$label: no run.py process found for $APP_DIR although systemd reports active (state=$c_state)."
     fi
-    pgrep -af "[r]un.py" 2>/dev/null | grep -F "$APP_DIR" >&2 || true
-    fail "$label: $c_count run.py processes match $APP_DIR — duplicate polling would cause Telegram getUpdates conflicts."
+    pgrep -af "$PROCESS_MATCH" 2>/dev/null | grep -F "$APP_DIR" >&2 || true
+    fail "$label: $c_count processes matching '$PROCESS_MATCH' in $APP_DIR — duplicate instances of $SERVICE_NAME would conflict (Telegram getUpdates for the bot, port bind for the PDF service)."
   fi
   return 0
 }
@@ -141,5 +150,5 @@ done
 sleep "$INTERVAL"
 check_stable "final post-window re-check"
 
-log "Service ACTIVE and STABLE for ${STABLE_SECS}s (pid=$base_pid, NRestarts=$base_restarts, exactly one run.py process)."
+log "Service ACTIVE and STABLE for ${STABLE_SECS}s (pid=$base_pid, NRestarts=$base_restarts, exactly one '${PROCESS_MATCH}' process)."
 log "HEALTH GATE PASSED — safe to report DEPLOY OK. Restart-on-crash/reboot policy is unchanged."

@@ -158,6 +158,29 @@ class GamificationSourceAuditTests(unittest.TestCase):
         self.assertEqual(violations, [],
                          f"db.collection(...) calls remain at lines {violations}")
 
+    def test_every_index_bootstrap_uses_raw_motor_safe_resolution(self):
+        """Any function that creates indexes may receive a RAW MotorDatabase
+        during startup, so it must never spell ``.collection(...)``. This
+        guards future bootstrap functions from repeating the B12 crash."""
+        for py in (REPO_ROOT / "quizbot").rglob("*.py"):
+            tree = ast.parse(py.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                body_src = ast.get_source_segment(
+                    py.read_text(encoding="utf-8"), node) or ""
+                if "create_index" not in body_src:
+                    continue
+                for sub in ast.walk(node):
+                    if (isinstance(sub, ast.Call)
+                            and isinstance(sub.func, ast.Attribute)
+                            and sub.func.attr == "collection"):
+                        self.fail(
+                            f"{py.relative_to(REPO_ROOT)}:{sub.lineno} index "
+                            f"bootstrap {node.name}() calls .collection() — "
+                            "invalid on a raw MotorDatabase; use db['name'] "
+                            "or attribute access.")
+
 
 if __name__ == "__main__":
     unittest.main()
