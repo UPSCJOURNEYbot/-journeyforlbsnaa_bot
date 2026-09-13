@@ -447,6 +447,23 @@ class GamificationService:
     def _applied(doc: dict, field: str, key: str) -> bool:
         return key in (doc.get(field) or [])
 
+    @staticmethod
+    def _pin(doc: dict, field: str, value: Any) -> dict:
+        """Equality CAS pin that is lazy-migration safe.
+
+        Once a field exists it is matched *exactly* (strict optimistic
+        concurrency). A lazily-created/partial legacy document may omit
+        ``rev``/counter fields entirely; an exact ``{field: value}`` filter
+        would then never match in Mongo (a missing field is not ``0``),
+        livelocking the CAS forever. For a missing/null field we additionally
+        accept ``null``/absent -- the very first successful write always sets
+        the real value (via ``$inc``/``$set``), after which strict exact
+        matching applies, so OCC is not weakened beyond that first write.
+        """
+        if doc.get(field) is not None:
+            return {field: value}
+        return {field: {"$in": [value, None]}}
+
     async def _reserve_event(
         self, user_id: int, event_type: str, event_key: str, day: str,
         payload: dict,
@@ -563,7 +580,8 @@ class GamificationService:
             if planned is _SKIP:
                 return {"applied": False, "skipped": True}
             extra_filter, update, summary = planned
-            filt = {"user_id": user_id, "rev": int(doc.get("rev", 0))}
+            filt = {"user_id": user_id}
+            filt.update(self._pin(doc, "rev", int(doc.get("rev", 0))))
             filt.update(extra_filter)
             update.setdefault("$inc", {})["rev"] = 1
             update.setdefault("$set", {})["updated_at"] = _utc_now_iso()
@@ -603,13 +621,14 @@ class GamificationService:
             award = min(desired, allowed)
             new_total = int(doc.get("total_xp") or 0) + award
 
-            extra_filter = {
-                "xp_day": pin_day,
-                "last_activity_day": doc.get("last_activity_day"),
-                "applied_streaks": {"$ne": key},
-            }
+            extra_filter: dict = {}
+            extra_filter.update(self._pin(doc, "xp_day", pin_day))
+            extra_filter.update(
+                self._pin(doc, "last_activity_day", doc.get("last_activity_day"))
+            )
+            extra_filter["applied_streaks"] = {"$ne": key}
             if not rollover:
-                extra_filter["xp_earned_today"] = base
+                extra_filter.update(self._pin(doc, "xp_earned_today", base))
             set_fields = {
                 "current_streak": new_streak,
                 "longest_streak": longest,
@@ -701,13 +720,12 @@ class GamificationService:
             tc = int(doc.get("total_completions") or 0)
             new_total = int(doc.get("total_xp") or 0) + award
 
-            extra_filter = {
-                "xp_day": pin_day,
-                "total_completions": tc,
-                "applied_attempts": {"$ne": key},
-            }
+            extra_filter: dict = {}
+            extra_filter.update(self._pin(doc, "xp_day", pin_day))
+            extra_filter.update(self._pin(doc, "total_completions", tc))
+            extra_filter["applied_attempts"] = {"$ne": key}
             if not rollover:
-                extra_filter["xp_earned_today"] = base
+                extra_filter.update(self._pin(doc, "xp_earned_today", base))
             set_fields = {"current_level": level_for_xp(new_total)}
             inc = {"total_xp": award, "total_completions": 1}
             if rollover:

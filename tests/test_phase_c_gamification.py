@@ -794,6 +794,33 @@ class ServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["current_streak"], 3)
         self.assertEqual(out["longest_streak"], 6)
 
+    async def test_22b_partial_doc_missing_rev_and_counters_still_credits(self):
+        # A lazily created/partial user_xp document (no optimistic version,
+        # no applied arrays) must not livelock the CAS. The pin tolerates a
+        # missing field on the first write, then becomes exact.
+        db = new_db()
+        await ensure_gamification_indexes(db)
+        db.collection("user_xp").docs.append({
+            "_id": "legacy", "user_id": 1, "total_xp": 100,
+            "xp_earned_today": 100, "xp_day": DAY0, "total_completions": 3,
+            "current_level": 2, "current_streak": 2, "longest_streak": 2,
+            "last_activity_day": DAY0,  # deliberately NO rev / applied_*
+        })
+        ev = results(n_correct=1, time_each=10)  # gross 12, next day
+        out = await complete(service(db), user=1, attempt="legacy1", at=AT2,
+                             question_results=ev)
+        self.assertTrue(out["eligible"], out)
+        doc = user_doc(db, 1)
+        self.assertEqual(doc["total_completions"], 4)  # migrated, incremented
+        self.assertIn("rev", doc)
+        self.assertEqual(doc["rev"], 2)  # one CAS commit for streak + attempt
+        # a concurrent second credit now uses strict exact-version matching
+        out2 = await complete(service(db), user=1, attempt="legacy2", at=AT2,
+                              question_results=ev)
+        self.assertTrue(out2["eligible"])
+        self.assertEqual(user_doc(db, 1)["total_completions"], 5)
+        self.assertLessEqual(user_doc(db, 1)["xp_earned_today"], DAILY_XP_CAP)
+
     async def test_23_user_isolation(self):
         ev = results(n_correct=2, time_each=10)
         await complete(service(self.db), user=1, attempt="u1",
