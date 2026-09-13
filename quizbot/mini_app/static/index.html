@@ -770,6 +770,17 @@
   };
 
   function sanitizeNode(node) {
+    // Browsers strip ASCII control chars/whitespace inside a URL scheme
+    // when navigating (e.g. "java\tscript:" can be treated as
+    // "javascript:"), so normalise before recognising dangerous schemes.
+    function isSafeUrlAttr(attrName, value, tag) {
+      var v = String(value == null ? "" : value).replace(/[\u0000-\u0020]+/g, "");
+      if (/^(javascript|vbscript|file):/i.test(v)) { return false; }
+      // A data: link navigates the player to an attacker HTML document;
+      // data: images stay allowed (inert pixels rendered, not navigated).
+      if (attrName === "href" && /^data:/i.test(v)) { return false; }
+      return true;
+    }
     var toRemove = [];
     (function walk(n) {
       var children = Array.prototype.slice.call(n.children || []);
@@ -784,7 +795,7 @@
           var name = attr.name.toLowerCase();
           if (name.indexOf("on") === 0) { child.removeAttribute(attr.name); return; }
           if (allowedAttrs.indexOf(name) === -1) { child.removeAttribute(attr.name); return; }
-          if ((name === "href" || name === "src") && /^\s*javascript:/i.test(attr.value)) {
+          if ((name === "href" || name === "src") && !isSafeUrlAttr(name, attr.value, tag)) {
             child.removeAttribute(attr.name);
           }
         });
@@ -1061,9 +1072,9 @@
         var r3 = el("div"); r3.innerHTML = '<span class="label">Contact: </span>' + esc(b.contact_info); card.appendChild(r3);
       }
       extra.appendChild(card);
-      if (b.payment_link) {
+      if (b.payment_link && /^(https?:|tg:)/i.test(b.payment_link.trim())) {
         var a = document.createElement("a");
-        a.href = b.payment_link;
+        a.href = b.payment_link.trim();
         a.target = "_blank";
         a.rel = "noopener noreferrer";
         a.className = "link-btn";

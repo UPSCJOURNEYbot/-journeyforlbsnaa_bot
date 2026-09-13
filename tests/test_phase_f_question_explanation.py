@@ -1064,6 +1064,8 @@ class ArchitectureTests(unittest.TestCase):
             "quizbot/runner_bot/pdf_reports.py",
             "quizbot/runner_bot/ai_providers.py",
             "quizbot/mini_app/player_service.py",
+            "quizbot/mini_app/routes.py",
+            "quizbot/mini_app/static/index.html",
             "quizbot/creator_bot/handlers/reports.py",
             "quizbot/creator_bot/handlers/file_import.py",
             "tests/test_phase_f_question_explanation.py",
@@ -1089,6 +1091,7 @@ class ArchitectureTests(unittest.TestCase):
             "tests/test_pdf_config_resolution.py",
             "tests/test_runner_pdf_report.py",
             "tests/test_url_import_ssrf.py",
+            "tests/test_mini_app_batch_safety.py",
         }
         for path in changed:
             self.assertIn(path, allowed, f"unexpected change: {path}")
