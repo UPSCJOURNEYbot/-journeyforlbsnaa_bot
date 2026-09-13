@@ -1092,11 +1092,31 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(snap_docs), 3)
         ids = {s["snapshot_id"] for s in snap_docs}
         self.assertTrue(all(len(i) == 64 for i in ids))
-        # Stored shape is the minimal reconstructable snapshot only.
+        # Stored shape is the minimal reconstructable snapshot, optionally
+        # carrying Phase F explanation companions (non-identity; absent
+        # entirely for questions without explanations, as Q1/Q2 are here).
+        minimal = {"_id", "snapshot_id", "question", "options",
+                   "correct_option_id", "created_at"}
+        allowed = minimal | {"explanation", "explanation_detail"}
         for doc in snap_docs:
-            self.assertEqual(
-                set(doc), {"_id", "snapshot_id", "question", "options",
-                           "correct_option_id", "created_at"})
+            self.assertTrue(minimal.issubset(set(doc)), doc)
+            self.assertTrue(set(doc) <= allowed, doc)
+        without_explanation = [
+            d for d in snap_docs if d["question"] in ("Q1", "Q2")]
+        self.assertEqual(len(without_explanation), 2)
+        self.assertTrue(
+            all(set(d) == minimal for d in without_explanation))
+        q0 = next(d for d in snap_docs if d["question"] == "Q0")
+        self.assertEqual(q0.get("explanation"), "e")
+        # Explanation companions never change the identity hash: adding one
+        # to an identical-content snapshot keeps the same id.
+        from quizbot.analytics.metadata import build_snapshot
+        s_with = build_snapshot(make_quiz()["questions"][0])
+        s_core = {"question": "Q0", "options": ["a", "b", "c", "d"],
+                  "correct_option_id": 1}
+        from quizbot.analytics.metadata import snapshot_content_hash
+        self.assertEqual(snapshot_content_hash(s_with),
+                         snapshot_content_hash(s_core))
         # Every event and every mistake row references a snapshot; none embeds.
         for ev in self.db.collection("question_events").docs:
             self.assertNotIn("question_snapshot", ev)

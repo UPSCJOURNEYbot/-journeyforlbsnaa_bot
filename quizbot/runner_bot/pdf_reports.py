@@ -431,6 +431,7 @@ def _build_questions_html(
         else:
             shuffled_options = orig_options
             correct_ids_final = orig_correct_ids
+            idx_list = None
 
         opts_html = ""
         for j, opt in enumerate(shuffled_options):
@@ -438,10 +439,17 @@ def _build_questions_html(
             cls = "opt-correct" if is_correct else "opt-normal"
             opts_html += f'<div class="{cls}"><span class="opt-letter">{letters[j]})</span> {_safe_html(str(opt))}</div>'
 
-        expl_raw = q.get("explanation", "")
+        # Phase F: structured explanations compose into the same box;
+        # legacy single explanations are escaped/rendered exactly as before
+        # via the module's math-aware escaper. Option notes are re-based onto
+        # the shuffled letter order the page actually prints.
+        from quizbot.shared.explanations import render_report_html
+        expl_display_order = idx_list if shuffle_options else None
+        expl_inner = render_report_html(
+            q, esc=_safe_html, display_order=expl_display_order)
         expl_html = (
-            f'<div class="explanation-box"><strong>\U0001F4A1 Explanation:</strong> {_safe_html(str(expl_raw))}</div>'
-            if expl_raw else ""
+            f'<div class="explanation-box"><strong>\U0001F4A1 Explanation:</strong> {expl_inner}</div>'
+            if expl_inner else ""
         )
         reply_raw = q.get("reply_text", "")
         reply_html = (

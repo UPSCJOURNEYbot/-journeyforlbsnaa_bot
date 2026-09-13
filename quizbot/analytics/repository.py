@@ -67,13 +67,24 @@ class QuestionSnapshotRepository:
         for snapshot in snapshots or []:
             sid = snapshot_content_hash(snapshot)
             if sid and sid not in by_hash:
-                by_hash[sid] = {
+                doc = {
                     "snapshot_id": sid,
                     "question": snapshot["question"],
                     "options": list(snapshot["options"]),
                     "correct_option_id": snapshot["correct_option_id"],
                     "created_at": at or _iso_now(),
                 }
+                # Phase F: optional non-identity explanation companions ride
+                # along on the same append-only document ($setOnInsert below
+                # means a richer/edited explanation never rewrites history).
+                from quizbot.shared.explanations import DETAIL_KEY
+                explanation = snapshot.get("explanation")
+                if isinstance(explanation, str) and explanation.strip():
+                    doc["explanation"] = explanation
+                detail = snapshot.get(DETAIL_KEY)
+                if isinstance(detail, dict) and detail:
+                    doc[DETAIL_KEY] = detail
+                by_hash[sid] = doc
         if by_hash:
             ops = [
                 UpdateOne(
@@ -104,11 +115,21 @@ class QuestionSnapshotRepository:
         out: dict[str, dict] = {}
         cursor = self.col.find({"snapshot_id": {"$in": ids}})
         async for row in cursor:
-            out[row["snapshot_id"]] = {
+            doc = {
                 "question": row.get("question", ""),
                 "options": row.get("options", []),
                 "correct_option_id": row.get("correct_option_id"),
             }
+            # Phase F: present only on snapshot docs written with
+            # explanations; legacy docs simply lack these keys (no
+            # migration, callers treat absence as "no explanation known").
+            explanation = row.get("explanation")
+            if isinstance(explanation, str) and explanation.strip():
+                doc["explanation"] = explanation
+            detail = row.get("explanation_detail")
+            if isinstance(detail, dict) and detail:
+                doc["explanation_detail"] = detail
+            out[row["snapshot_id"]] = doc
         return out
 
 

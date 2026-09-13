@@ -17,6 +17,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from quizbot.database import AuthChatRepository, QuizRepository, get_db
 from quizbot.shared.bold_words import apply_bold_to_poll_fields, format_bold_html
+from quizbot.shared.explanations import poll_explanation
 from quizbot.shared.rich_quiz import RichDispatchResult, enrich_question_dispatch
 from quizbot.shared.utils import is_premium_user
 
@@ -72,7 +73,7 @@ async def _pollquiz_send_one(
 
         _q_text = rich_res.poll_question_override or q["question"]
         poll_q, poll_opts, poll_expl, overflow, poll_desc = prepare_poll_data(
-            _q_text, options, correct_ids[0], q.get("explanation"), _rt, idx, total
+            _q_text, options, correct_ids[0], poll_explanation(q), _rt, idx, total
         )
         if rich_res.poll_options_override:
             poll_opts = rich_res.poll_options_override

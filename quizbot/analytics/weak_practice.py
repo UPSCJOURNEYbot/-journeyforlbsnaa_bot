@@ -600,6 +600,14 @@ class WeakPracticeService:
                 "correct_option_id": snap.get("correct_option_id"),
                 "analytics": analytics,
             }
+            # Phase F: snapshot documents may carry explanation companions
+            # (absent on legacy snapshots -> honest explanation-free item).
+            snap_expl = snap.get("explanation")
+            if isinstance(snap_expl, str) and snap_expl.strip():
+                question["explanation"] = snap_expl
+            snap_detail = snap.get("explanation_detail")
+            if isinstance(snap_detail, dict) and snap_detail:
+                question["explanation_detail"] = snap_detail
             if not self.revision._usable(question) or not str(
                     question["question"]).strip():
                 excluded += 1

@@ -79,6 +79,17 @@ _LABEL_KEYS = ("subject", "topic", "subtopic")
 # documents bloating an event record.
 SNAPSHOT_QUESTION_LIMIT = 4000
 SNAPSHOT_OPTION_LIMIT = 1000
+# Phase F: explanations ride along on snapshot *documents* (so Phase D/E
+# snapshot fallback recovery can still show them) but are deliberately NOT
+# part of the identity hash -- editing an explanation must not orphan the
+# provenance of a question whose wording/options/answer never changed.
+SNAPSHOT_EXPLANATION_LIMIT = 4000
+SNAPSHOT_DETAIL_NOTE_LIMIT = 300
+
+# The three fields that define a question's identity. snapshot_content_hash
+# projects exactly these, which also keeps hashes stable for snapshot docs
+# created before Phase F (those documents contained only these keys).
+SNAPSHOT_IDENTITY_KEYS = ("question", "options", "correct_option_id")
 
 
 def normalize_difficulty(value: Any) -> Optional[str]:
@@ -153,14 +164,22 @@ def normalize_question(question: Any) -> Any:
     """Return a copy of a stored question carrying its optional ``analytics``
     block -- and nothing else changed.
 
-    Wording, options, correct answer(s), explanations and media are never
-    modified. Questions with no metadata are returned structurally
-    unchanged (no empty ``analytics`` dict is injected).
+    Wording, options, correct answer(s), explanation text and media are never
+    modified; the optional Phase F ``explanation_detail`` companion (if
+    present) is only *validated* into its canonical shape. Questions with no
+    metadata are returned structurally unchanged (no empty ``analytics`` or
+    ``explanation_detail`` dict is injected).
     """
     if not isinstance(question, dict):
         return question
-    q = dict(question)
-    analytics = extract_question_analytics(q)
+    # Phase F: keep optional structured explanations well-formed at the
+    # single storage chokepoint. A plain/absent explanation is byte-identical
+    # afterwards (the helper removes nothing but malformed companion data).
+    from quizbot.shared.explanations import normalize_question_explanation
+    options = question.get("options")
+    option_count = len(options) if isinstance(options, list) else None
+    q = normalize_question_explanation(dict(question), option_count)
+    analytics = extract_question_analytics(question)
     if analytics:
         q["analytics"] = analytics
     return q
@@ -258,8 +277,12 @@ def build_snapshot(question: Optional[dict]) -> Optional[dict]:
     Stores just enough to guarantee that a mistake recorded months ago keeps
     pointing at the *same* question even if the quiz is later edited in
     place: question text, the option list (verbatim) and the correct answer.
-    Explanations/media are deliberately excluded to avoid duplicating large
-    blobs. Returns None when the input is unusable.
+    Phase F additionally carries the (optional) explanation and validated
+    ``explanation_detail`` on the snapshot *document* as non-identity fields
+    -- they let recovered snapshots in mistake revision and /weakquiz still
+    teach the concept, they never participate in the content hash, and they
+    are omitted entirely for questions that have none. Media stays excluded.
+    Returns None when the input is unusable.
     """
     if not isinstance(question, dict):
         return None
@@ -274,25 +297,45 @@ def build_snapshot(question: Optional[dict]) -> Optional[dict]:
         correct_ids = [int(correct)]
     else:
         correct_ids = []
-    return {
+    snapshot = {
         "question": str(question.get("question", "") or "")[:SNAPSHOT_QUESTION_LIMIT],
         "options": options,
         "correct_option_id": correct_ids if len(correct_ids) != 1 else correct_ids[0],
     }
+    # Non-identity, optional Phase F companions (bounded).
+    explanation = question.get("explanation")
+    if isinstance(explanation, str) and explanation.strip():
+        snapshot["explanation"] = explanation.strip()[:SNAPSHOT_EXPLANATION_LIMIT]
+    from quizbot.shared.explanations import (
+        DETAIL_KEY,
+        normalize_explanation_detail,
+    )
+    detail = normalize_explanation_detail(
+        question.get(DETAIL_KEY), len(options),
+        note_limit=SNAPSHOT_DETAIL_NOTE_LIMIT)
+    if detail:
+        snapshot[DETAIL_KEY] = detail
+    return snapshot
 
 
 def snapshot_content_hash(snapshot: Optional[dict]) -> Optional[str]:
-    """Stable content hash (sha256 hex) of a minimal snapshot.
+    """Stable content hash (sha256 hex) of a snapshot's IDENTITY fields.
 
     The identity of a historical question is its exact wording, option list
     and correct answer: editing any of those (or deleting the quiz) yields a
     different hash and therefore a different, never-repointed snapshot,
     while every replay/attempt of the *same* question content shares one
     snapshot row instead of duplicating the text on every event.
+
+    Extra document fields added later (Phase F explanation companions) are
+    projected out before hashing, and projecting the original three-key
+    documents leaves them byte-identical -- historical snapshot ids are
+    therefore stable.
     """
     if not isinstance(snapshot, dict):
         return None
+    identity = {key: snapshot.get(key) for key in SNAPSHOT_IDENTITY_KEYS}
     canonical = json.dumps(
-        snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        identity, sort_keys=True, ensure_ascii=False, separators=(",", ":")
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
