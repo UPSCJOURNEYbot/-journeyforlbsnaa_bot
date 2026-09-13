@@ -1146,6 +1146,85 @@ class MistakeRepository:
     async def list_open(self, user_id: int, limit: int = 50) -> list[dict]:
         return await self.list_for_user(user_id, limit=limit, status=self.STATUS_OPEN)
 
+    # ------------------------------------------------------------------
+    # Phase D: bounded, projected reads powering /mistakes revision.
+    # These never pull the (bounded but unbounded-in-principle)
+    # revision_history / attempt-id guard arrays, and never scan the whole
+    # collection -- every filter is user-scoped and index-backed.
+    # ------------------------------------------------------------------
+
+    #: Only ever reason over a bounded recent window, even for a very heavy
+    #: user (1 CPU / 2 GB VPS). Revision is about current weaknesses, not the
+    #: user's entire lifetime.
+    REVISION_CANDIDATE_CAP = 200
+
+    _REVISION_PROJECTION = {
+        "_id": 0, "user_id": 1, "qid": 1, "q_index": 1, "snapshot_id": 1,
+        "subject": 1, "topic": 1, "subtopic": 1, "difficulty": 1,
+        "topic_source": 1, "wrong_count": 1, "correct_count": 1, "status": 1,
+        "first_wrong_at": 1, "last_wrong_at": 1, "last_correct_at": 1,
+        "resolved_at": 1, "first_seen_attempt_id": 1,
+    }
+
+    # Deterministic ordering shared by every revision read: currently-open
+    # first, most-recently-missed first, then stable identity tie-breakers.
+    _REVISION_SORT = [
+        ("status", 1), ("last_wrong_at", -1), ("qid", 1), ("q_index", 1),
+    ]
+
+    async def query_revision_rows(
+        self, user_id: int, *, only_open: bool = False,
+        topic: Optional[str] = None, limit: int = REVISION_CANDIDATE_CAP,
+        skip: int = 0,
+    ) -> list[dict]:
+        """Lean, bounded, deterministic mistake rows for revision selection.
+
+        ``only_open`` matches the existing ``(user_id, status, last_wrong_at)``
+        index (legacy rows without ``status`` are open, hence ``$ne
+        resolved``). ``topic`` narrows within one user's rows (real stored
+        metadata only)."""
+        filt: dict[str, Any] = {"user_id": user_id}
+        if only_open:
+            filt["status"] = {"$ne": self.STATUS_RESOLVED}
+        if topic:
+            filt["topic"] = topic
+        cursor = (
+            self.col.find(filt, self._REVISION_PROJECTION)
+            .sort(self._REVISION_SORT)
+            .skip(int(skip))
+            .limit(int(limit))
+        )
+        return [_clean(r) async for r in cursor]
+
+    async def list_mistake_topics(self, user_id: int, limit: int = 20) -> list[dict]:
+        """Distinct topics actually present in THIS user's mistake rows.
+
+        No UPSC taxonomy is hardcoded: a topic only ever appears here because
+        it is stored on one of the user's own mistake rows. Bounded by the
+        candidate window; deterministic (open groups first, then label)."""
+        rows = await self.query_revision_rows(user_id, limit=self.REVISION_CANDIDATE_CAP)
+        facets: dict[str, dict] = {}
+        for r in rows:
+            topic = r.get("topic")
+            if not topic:
+                continue
+            f = facets.setdefault(topic, {
+                "topic": topic,
+                "subject": r.get("subject"),
+                "open_count": 0, "total_count": 0,
+            })
+            f["total_count"] += 1
+            if r.get("status") != self.STATUS_RESOLVED:
+                f["open_count"] += 1
+            # Keep a subject if the first/any row for the topic provides one.
+            if not f.get("subject") and r.get("subject"):
+                f["subject"] = r["subject"]
+        ordered = sorted(
+            facets.values(),
+            key=lambda f: (-f["open_count"], -f["total_count"], f["topic"]),
+        )
+        return ordered[:int(limit)]
+
     async def totals(self, user_id: int) -> dict:
         total = await self.col.count_documents({"user_id": user_id})
         resolved = await self.col.count_documents(
