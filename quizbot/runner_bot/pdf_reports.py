@@ -556,6 +556,15 @@ def render_quiz_pdf(
     except ImportError:
         logger.error("WeasyPrint not installed. Run: pip install weasyprint")
         return False
+    except Exception as exc:  # native pango/cairo/gdk-pixbuf libs missing
+        # An ImportError is only the missing-package case; a mis-provisioned
+        # host raises OSError ("cannot load library 'pango-1.0-0'") instead.
+        # Degrade to a failure result (caller reports a generic message)
+        # rather than crashing the quiz-end flow in an executor thread.
+        logger.error(
+            "WeasyPrint unavailable (native rendering libraries missing? "
+            "install pango/cairo/gdk-pixbuf): %s", exc)
+        return False
 
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
 

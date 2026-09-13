@@ -1347,6 +1347,25 @@ async def _send_pdf_report(
                     os.remove(pdf_path)
                 except OSError:
                     pass
+        else:
+            # Rendering failed (e.g. WeasyPrint native libraries missing).
+            # Tell the user instead of silently producing nothing.
+            logger.error(
+                "PDF report render returned failure for chat=%s qid=%s "
+                "(check WeasyPrint/Pango install)", chat_id,
+                quiz_data.get("qid"),
+            )
+            try:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=("⚠️ The PDF report could not be generated on this "
+                          "server (the rendering library is unavailable). "
+                          "Please ask the operator to install the PDF "
+                          "dependencies, or use the HTML report."),
+                    **({"message_thread_id": thread_id} if thread_id else {}),
+                )
+            except Exception:
+                logger.debug("could not send PDF-unavailable notice", exc_info=True)
     except Exception as e:
         logger.error("PDF report error: %s", e, exc_info=True)
 

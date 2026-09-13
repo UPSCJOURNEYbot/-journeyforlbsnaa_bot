@@ -142,7 +142,12 @@ if env_has OWNER_ID; then log ".env check: OWNER_ID present (value hidden) — O
 else log ".env check: OWNER_ID — MISSING"; missing=1; fi
 # Feature-relevant but optional: warn only, never block the whole deployment.
 env_has GEMINI_API_KEY || log ".env note: GEMINI_API_KEY empty — /podcast voice generation will report its own error until set."
-env_has PDF_API_BASE   || log ".env note: PDF_API_BASE empty — /testseries will reply that PDF generation is not configured (existing behavior)."
+if grep -Eq '^[[:space:]]*PDF_API_BASE=[[:space:]]*(off|none|disabled|false|0)[[:space:]]*$' "$APP_DIR/.env"; then
+  log ".env note: PDF_API_BASE explicitly disabled — /testseries will reply that PDF generation is not configured."
+else
+  log ".env note: PDF generation targets the local microservice at 127.0.0.1:8090 (blank defaults there)."
+  log "           Run ./deploy_pdf_service.sh on THIS host to install quizbot-pdf.service, otherwise /testseries reports the PDF service unreachable."
+fi
 [ -z "${MINI_APP_DOMAIN_FROM_ENV:-}" ] || true
 if grep -Eq '^[[:space:]]*MINI_APP_DOMAIN=[[:space:]]*"?https?://[^[:space:]"]' "$APP_DIR/.env"; then
   log ".env note: MINI_APP_DOMAIN set — Mini App HTTP server will also start INSIDE the same single process (no extra poller)."
@@ -175,7 +180,8 @@ if [ "$SKIP_APT" -eq 0 ] && command -v apt-get >/dev/null 2>&1; then
     git python3 python3-venv python3-pip \
     ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin \
     libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libcairo2 \
-    libffi-dev shared-mime-info fonts-liberation
+    libffi-dev shared-mime-info fonts-liberation \
+    fonts-noto-core fonts-deva
 else
   log "Skipping apt-get (flag or non-Debian system). Ensuring ffmpeg/python exist ..."
   command -v python3 >/dev/null 2>&1 || fail "python3 not found."

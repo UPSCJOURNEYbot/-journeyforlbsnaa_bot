@@ -1338,6 +1338,21 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 # HANDLER
 # ===========================================================================
 
+_HANDLER_STUB_NAMES = ["admin", "ai_quiz", "mix", "mistakes", "pdf_quiz",
+                       "poll_quiz", "podcast", "quiz_play", "reports",
+                       "scheduling", "setup_wizard", "translation", "weakquiz"]
+
+
+def _restore_handler_modules():
+    """Drop the whole handlers package subtree (stubs + any real sibling
+    imported while stubs were present) so later test files rebuild the REAL
+    handler chain (prevents import-order-dependent failures)."""
+    for key in [k for k in sys.modules
+                if k == "quizbot.runner_bot.handlers"
+                or k.startswith("quizbot.runner_bot.handlers.")]:
+        sys.modules.pop(key, None)
+
+
 def _install_handler():
     captured = {}
     for name in ["admin", "ai_quiz", "mix", "mistakes", "pdf_quiz",
@@ -1440,6 +1455,10 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         cls.mod, cls.pkg, cls.captured = _install_handler()
+
+    @classmethod
+    def tearDownClass(cls):
+        _restore_handler_modules()
 
     async def asyncSetUp(self):
         self.db = new_db()

@@ -92,9 +92,31 @@ PLANS: dict[str, dict] = {
 }
 
 # ---------------------------------------------------------------------------
-# PDF generation microservice (optional external service)
+# PDF generation microservice
+#
+# deploy_pdf_service.sh installs the renderer as `quizbot-pdf.service`
+# listening on 127.0.0.1:8090 of the SAME host. To guarantee the bot can use
+# it on the standard topology without a fragile extra .env edit (and so the
+# "PDF generation is not configured (no PDF_API_BASE set)" dead-end cannot
+# occur in the standard deployment), an UNSET/BLANK value defaults to that
+# local address. To deliberately run WITHOUT the microservice, set
+# PDF_API_BASE=off (or none/disabled/false/0) -- the commands then reply with
+# the explicit "not configured" notice instead of timing out.
 # ---------------------------------------------------------------------------
-PDF_API_BASE: str | None = _env("PDF_API_BASE")
+_DEFAULT_PDF_API_BASE = "http://127.0.0.1:8090"
+_PDF_DISABLED_TOKENS = {"off", "none", "disabled", "false", "0"}
+
+
+def _resolve_pdf_api_base() -> str | None:
+    raw = (_env("PDF_API_BASE") or "").strip()
+    if raw.lower() in _PDF_DISABLED_TOKENS:
+        return None
+    if not raw:
+        return _DEFAULT_PDF_API_BASE
+    return raw.rstrip("/")
+
+
+PDF_API_BASE: str | None = _resolve_pdf_api_base()
 
 # ---------------------------------------------------------------------------
 # Quiz Player Mini App (Telegram WebApp)
