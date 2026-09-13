@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import secrets
 import time
-from typing import Any, Optional
+from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType, ParseMode
@@ -244,7 +244,7 @@ async def _launch(
     # the setup-wizard's ad-hoc DM launch.
     from .quiz_play import start_private_quiz
     await start_private_quiz(user_id, ctx, questions, quiz_obj, qid)
-    scope = f" ({topic})" if topic else ""
+    scope = f" ({esc(topic)})" if topic else ""
     return (f"\U0001F4DD Starting <b>{mode}</b> revision{scope} with "
             f"<b>{built['size']}</b> question"
             f"{'s' if built['size'] != 1 else ''}. Answer them to update your "

@@ -334,11 +334,18 @@ class AnalyticsService:
         # operation: it must never block completion, results/HTML/PDF, the
         # normal analytics writes above, or the Phase C XP/streak step below.
         revision_folded = 0
-        if revision_origins is None and isinstance(questions, list):
+        # Revision sessions are ALWAYS ad-hoc DM quizzes (never a stored
+        # quiz), so the provenance key is only honoured on that path. This
+        # keeps a (crafted) stored question from ever triggering a fold.
+        if (
+            revision_origins is None
+            and not quiz_persisted
+            and isinstance(questions, list)
+        ):
             # Origins ride along hidden on each in-memory revision question
             # under a private key the play engine ignores; aligned to canonical
             # question index, so option/question shuffling cannot misroute a
-            # fold. A normal quiz carries no such key -> stay None (no fold).
+            # fold. A normal/ad-hoc quiz carries no such key -> stay None.
             extracted = [
                 q.get("_revision_origins") if isinstance(q, dict) else None
                 for q in questions

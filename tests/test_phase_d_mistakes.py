@@ -783,6 +783,19 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(built["excluded"], 1)             # honestly reported
         self.assertEqual(built["questions"], [])           # never fabricated
 
+    async def test_stored_quiz_never_folds_even_with_planted_key(self):
+        # Confused-deputy defense: a stored quiz whose question doc carries
+        # the private provenance key (e.g. crafted content) must never fold.
+        questions = copy.deepcopy(self.questions)
+        questions[0]["_revision_origins"] = [{"qid": "evilQuiz", "q_index": 0}]
+        out = await complete(self.db, user=1, attempt="a1", qid="qA",
+                             results=[qr(0, OUTCOME_INCORRECT, [1])],
+                             questions=questions, persisted=True)
+        self.assertEqual(out["revision_folded"], 0)
+        # Only the normal stored-quiz mistake exists; nothing for evilQuiz.
+        self.assertEqual(len(mistake_rows(self.db, 1, "qA")), 1)
+        self.assertEqual(mistake_rows(self.db, 1, "evilQuiz"), [])
+
     async def test_normal_adhoc_quiz_does_not_fold_or_write_mistakes(self):        # An ad-hoc AI-style DM quiz (persisted=False) without provenance:
         # XP works, but no origin mistakes and no fold.
         out = await complete(self.db, user=1, attempt="ai1", qid="AI123",
@@ -1123,6 +1136,20 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         for q in self.captured["questions"]:
             self.assertIn("_revision_origins", q)  # provenance survives in list
             self.assertTrue(q["_revision_origins"])
+
+    async def test_topic_special_chars_are_escaped_in_launch_status(self):
+        await self._seed_mistake(repeats=1, topic="P<G & H")
+        # The topics list is re-derived server side; launch via its index.
+        topics = await self.mod.mr.MistakeRevisionService(self.db).topics(1)
+        idx = next(i for i, t in enumerate(topics) if t["topic"] == "P<G & H")
+        upd, ctx = FakeUpdate(1), FakeCtx()
+        upd.callback_query.data = self.mod._cb("topic", 1, str(idx))
+        await self.mod.mistakes_callback(upd, ctx)
+        self.assertTrue(self.captured["called"])
+        # The follow-up status is HTML; the user-controlled topic is escaped.
+        texts = [t for _, t, _ in ctx.bot.sent]
+        self.assertTrue(any("P&lt;G &amp; H" in t for t in texts))
+        self.assertFalse(any("P<G" in t for t in texts))
 
     async def test_repeated_insufficient_message(self):
         await self._seed_mistake(repeats=1)
