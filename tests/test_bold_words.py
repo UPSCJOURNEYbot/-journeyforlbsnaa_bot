@@ -286,10 +286,28 @@ class WiringTests(unittest.TestCase):
         self.assertNotIn("apply_bold_to_poll_fields", src)
 
     def test_explanation_message_applies_bolding(self):
+        # Phase F centralised explanation formatting in the shared renderer
+        # (quizbot.shared.explanations.render_telegram_messages), which applies
+        # bold_important_words and tag-aware chunking. The sender must delegate
+        # to it; verify BOTH the wiring and the real rendered output.
         from quizbot.runner_bot.handlers import quiz_play
+        from quizbot.shared.explanations import render_telegram_messages
 
         src = inspect.getsource(quiz_play._send_explanation_after_poll)
-        self.assertIn("format_bold_html", src)
+        self.assertIn("render_telegram_messages", src)
+
+        quiz = {"explanation": (
+            "The Fundamental Duties under the Constitution of India are "
+            "explained in Article 51A.")}
+        messages = render_telegram_messages(quiz)
+        self.assertTrue(messages)
+        body = "\n".join(messages)
+        self.assertIn("<b>", body)
+        # presentation-only: stripping tags + unescaping returns the original
+        plain = _B_TAG_RE.sub("", body)
+        self.assertEqual(
+            html.unescape(plain).strip(),
+            "💡 Explanation:\n\n" + quiz["explanation"])
 
     def test_gemini_prompt_untouched(self):
         """The AI question-generation prompts must not mention bolding."""

@@ -126,6 +126,64 @@ class ParserFormatBCases(unittest.TestCase):
             self.assertEqual(r.questions[0].correct_index, 2, value)
 
 
+class ParenthesizedOptionCases(unittest.TestCase):
+    """The documented format is ``(A)/(B)/(C)/(D)``; these used to be
+    rejected because the option regex only accepted suffixed letters
+    (``A)`` / ``A.``). Both spellings (and full-width parens) must work."""
+
+    PAREN = (
+        "Q1. संविधान का अनुच्छेद 14 किससे संबंधित है?\n"
+        "(A) स्वतंत्रता का अधिकार\n"
+        "(B) विधि के समक्ष समानता\n"
+        "(C) धर्म की स्वतंत्रता\n"
+        "(D) संपत्ति का अधिकार\n"
+        "Answer: (B)\n"
+        "Explanation: अनुच्छेद 14 समानता का अधिकार देता है।\n"
+    )
+
+    def test_ascii_parenthesized_options_parse(self):
+        r = tsf.parse_testseries_text(self.PAREN)
+        self.assertTrue(r.ok, r.problems)
+        self.assertEqual(len(r.questions), 1)
+        q = r.questions[0]
+        self.assertEqual(
+            q.options,
+            ["स्वतंत्रता का अधिकार", "विधि के समक्ष समानता",
+             "धर्म की स्वतंत्रता", "संपत्ति का अधिकार"])
+        self.assertEqual(q.correct_index, 1)
+        self.assertIn("अनुच्छेद 14", q.explanation)
+
+    def test_parenthesized_spelling_variants(self):
+        for line, letter, text in [
+            ("(A) alpha", "A", "alpha"),
+            ("(A)alpha", "A", "alpha"),
+            ("(a). alpha", "A", "alpha"),
+            ("（B）बीटा", "B", "बीटा"),       # full-width CJK parens
+            ("(C)-gamma", "C", "gamma"),
+        ]:
+            m = tsf._match_option(line)
+            self.assertIsNotNone(m, line)
+            self.assertEqual(m.group(1).upper(), letter, line)
+            self.assertEqual(m.group(2).strip(), text, line)
+
+    def test_mixed_paren_and_suffix_in_one_file(self):
+        text = (
+            "Q1. First?\n(A) one\n(B) two ✅\n(C) three\n(D) four\n"
+            "Explanation: two.\n\n"
+            "Q2. Second?\nA) alpha\nB) beta\nC) gamma ✅\nD) delta\n"
+            "Answer: C\n"
+        )
+        r = tsf.parse_testseries_text(text)
+        self.assertTrue(r.ok, r.problems)
+        self.assertEqual(len(r.questions), 2)
+        self.assertEqual(r.questions[0].correct_index, 1)
+        self.assertEqual(r.questions[1].correct_index, 2)
+
+    def test_bare_paren_letter_without_text_rejected(self):
+        # "(A)" with no option text is not an option (no silent garbage).
+        self.assertIsNone(tsf._match_option("(A)"))
+
+
 class ParserMixedCases(unittest.TestCase):
     def test_mixed_a_and_b_in_one_file(self):
         r = tsf.parse_testseries_text(FORMAT_A + "\n" + FORMAT_B + "\n" + FORMAT_B_TEXT_ANSWER)

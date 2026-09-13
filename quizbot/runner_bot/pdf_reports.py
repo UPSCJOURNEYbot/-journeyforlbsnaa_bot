@@ -77,6 +77,36 @@ def _safe_html(text: str, render_math: bool = True) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
 
 
+def _safe_md_url(url: str, *, image: bool = False) -> Optional[str]:
+    """Validate a markdown link/image URL for embedding in a WeasyPrint PDF.
+
+    Input has already been HTML-escaped, so quote/angle-bracket breakout is
+    neutralised; here we restrict schemes so author content cannot make the
+    renderer read local files (``file://``), hit the loopback/metadata via
+    auto-loaded images, or use ``javascript:``. Returns the URL when allowed,
+    else None. Images allow http(s) and inline ``data:image/*`` only; links
+    additionally allow ``mailto:``. Relative/protocol-relative URLs are denied
+    (they resolve against the server filesystem with ``base_url='.'``).
+    """
+    url = (url or "").strip()
+    if not url or url.startswith(("//", "/", "#", "?")):
+        return None
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", url):
+        return None  # no scheme -> relative path -> deny
+    lowered = url.lower()
+    if lowered.startswith(("http://", "https://")):
+        # WeasyPrint auto-loads image resources: block loopback/private/
+        # link-local (metadata) literal hosts and internal names. No DNS at
+        # render time so offline rendering never drops valid public images.
+        from quizbot.shared.utils.netguard import is_safe_resource_url
+        return url if is_safe_resource_url(url, resolve=False) else None
+    if not image and lowered.startswith("mailto:"):
+        return url
+    if image and lowered.startswith("data:image/"):
+        return url
+    return None
+
+
 def render_markdown_to_html(text: str) -> str:
     """Convert a GitHub-flavored-markdown subset (tables, lists, blockquotes,
     inline code/code blocks, bold/italic/strikethrough, headings, math,
@@ -90,7 +120,7 @@ def render_markdown_to_html(text: str) -> str:
     def _save_code_block(match: re.Match) -> str:
         nonlocal code_counter
         code_counter += 1
-        placeholder = f"__CODE_BLOCK_{code_counter}__"
+        placeholder = f"\ue000CB{code_counter}\ue001"
         code_blocks[placeholder] = match.group(0)
         return placeholder
 
@@ -102,11 +132,20 @@ def render_markdown_to_html(text: str) -> str:
     def _save_inline_code(match: re.Match) -> str:
         nonlocal inline_counter
         inline_counter += 1
-        placeholder = f"__INLINE_CODE_{inline_counter}__"
+        placeholder = f"\ue000IC{inline_counter}\ue001"
         inline_codes[placeholder] = match.group(0)
         return placeholder
 
     text = re.sub(r"`([^`]+)`", _save_inline_code, text)
+
+    # SECURITY: this output is rendered server-side by WeasyPrint, which does
+    # not run JavaScript but DOES fetch referenced resources. Code spans /
+    # fenced blocks have already been replaced with alphanumeric placeholders,
+    # so escape every angle bracket / quote / ampersand in the remaining
+    # author text BEFORE generating our own trusted markdown tags. This makes
+    # raw <img>/<style>/<script> injection impossible; markdown-produced URLs
+    # are scheme-validated separately below (_safe_md_url).
+    text = _escape_html(text)
 
     lines = text.split("\n")
     html_lines: list[str] = []
@@ -155,16 +194,31 @@ def render_markdown_to_html(text: str) -> str:
             if placeholder in line:
                 code_content = code[1:-1]
                 line = line.replace(placeholder, f"<code>{_escape_html(code_content)}</code>")
-        line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2" target="_blank">\1</a>', line)
-        line = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r'<img src="\2" alt="\1" style="max-width:100%;"/>', line)
+        def _md_link(m: re.Match) -> str:
+            label, url = m.group(1), m.group(2).strip()
+            safe = _safe_md_url(url, image=False)
+            return f'<a href="{safe}" target="_blank">{label}</a>' if safe else label
+
+        def _md_image(m: re.Match) -> str:
+            alt, url = m.group(1), m.group(2).strip()
+            safe = _safe_md_url(url, image=True)
+            return (f'<img src="{safe}" alt="{alt}" style="max-width:100%;"/>'
+                    if safe else "")
+
+        # Images must be substituted before links (image syntax begins with
+        # '!' + the link pattern); the reverse order swallowed the '!' marker.
+        line = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", _md_image, line)
+        line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _md_link, line)
+        # Math content was HTML-escaped in the pre-pass; do NOT re-escape here
+        # (double-escaping would render entities such as "&lt;" literally).
         line = re.sub(
             r"\$\$([\s\S]+?)\$\$",
-            lambda m: f'<div class="math-display">\\[ {_escape_html(m.group(1))} \\]</div>',
+            lambda m: f'<div class="math-display">\\[ {m.group(1)} \\]</div>',
             line,
         )
         line = re.sub(
             r"(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)",
-            lambda m: f'<span class="math-inline">\\( {_escape_html(m.group(1))} \\)</span>',
+            lambda m: f'<span class="math-inline">\\( {m.group(1)} \\)</span>',
             line,
         )
         return line
@@ -184,8 +238,13 @@ def render_markdown_to_html(text: str) -> str:
             _flush_paragraph()
             _flush_blockquote()
             _flush_list()
-            code_html = _escape_html("\n".join(code_block_content))
-            lang_class = f' class="language-{_escape_html(code_block_lang)}"' if code_block_lang else ""
+            # These lines come from the post-escape input (only unmatched
+            # fences reach this path), so do NOT escape again -- that would
+            # double-encode entities. Well-formed paired fences were already
+            # extracted as raw placeholders and are restored (escaped once)
+            # at the end.
+            code_html = "\n".join(code_block_content)
+            lang_class = f' class="language-{code_block_lang}"' if code_block_lang else ""
             html_lines.append(f"<pre><code{lang_class}>{code_html}</code></pre>")
             i += 1
             continue
@@ -214,19 +273,26 @@ def render_markdown_to_html(text: str) -> str:
             i += 1
             continue
 
-        if line.strip().startswith(">"):
+        stripped = line.strip()
+        # After the input pre-escape the '>' marker arrives as '&gt;'.
+        if stripped.startswith("&gt;") or stripped.startswith(">"):
             if not in_blockquote:
                 _flush_paragraph()
                 _flush_list()
                 in_blockquote = True
-            content = line.strip()[1:].strip()
+            if stripped.startswith("&gt;"):
+                content = stripped[len("&gt;"):].strip()
+            else:
+                content = stripped[1:].strip()
             blockquote_lines.append(_process_inline_markdown(content) if content else "")
             i += 1
             continue
         if in_blockquote:
             _flush_blockquote()
 
-        if "|" in line and not line.strip().startswith("<!--"):
+        # Raw HTML comments were escaped to '&lt;!--'; exclude both forms from
+        # being interpreted as table rows.
+        if "|" in line and not stripped.startswith(("<!--", "&lt;!--")):
             cells = [c.strip() for c in line.split("|")[1:-1]]
             if all(re.match(r"^[\s\-:]+$", c) for c in cells if c):
                 table_header = True
@@ -555,6 +621,15 @@ def render_quiz_pdf(
         from weasyprint import HTML
     except ImportError:
         logger.error("WeasyPrint not installed. Run: pip install weasyprint")
+        return False
+    except Exception as exc:  # native pango/cairo/gdk-pixbuf libs missing
+        # An ImportError is only the missing-package case; a mis-provisioned
+        # host raises OSError ("cannot load library 'pango-1.0-0'") instead.
+        # Degrade to a failure result (caller reports a generic message)
+        # rather than crashing the quiz-end flow in an executor thread.
+        logger.error(
+            "WeasyPrint unavailable (native rendering libraries missing? "
+            "install pango/cairo/gdk-pixbuf): %s", exc)
         return False
 
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")

@@ -59,7 +59,23 @@ _Q_START = re.compile(
     r"^\s*(?:Q\s*\.?\s*(\d{1,4})|Question\s*(\d{1,4})|प्रश्न\s*(\d{1,4}))\s*[.)]?\s*(.*)$",
     re.IGNORECASE,
 )
-_OPTION = re.compile(r"^\s*([A-Za-z])\s*[).:–-]\s*(\S(?:.*)?)\s*$")
+# Two supported option spellings (the letter is captured as group 1 and
+# the option text as group 2 via the helper below):
+#   * parenthesized:  "(A) text", "（A）text", "(A). text", "(A) text"
+#   * suffixed:       "A) text", "A. text", "A: text", "A- text", "A– text"
+_OPTION_PAREN = re.compile(r"^\s*[\(（]\s*([A-Za-z])\s*[\)）]\s*[).:–-]?\s*(\S.*?)\s*$")
+_OPTION_SUFFIX = re.compile(r"^\s*([A-Za-z])\s*[).:–-]\s*(\S(?:.*)?)\s*$")
+
+
+def _match_option(line: str) -> re.Match | None:
+    """Return a 2-group match (letter, text) for parenthesized or suffixed
+    option lines, normalising both shapes to one capture layout."""
+    m = _OPTION_PAREN.match(line)
+    if m:
+        return m
+    return _OPTION_SUFFIX.match(line)
+
+
 _ANSWER = re.compile(r"^\s*(?:Answers?|Ans\.?|उत्तर)\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _EXPLAIN = re.compile(r"^\s*(Ex\.?|Explanation|व्याख्या)\s*:\s*(.*)$", re.IGNORECASE)
 _SOLUTION = re.compile(r"^\s*(Solutions?|हल)\s*:\s*(.*)$", re.IGNORECASE)
@@ -206,7 +222,7 @@ def _parse_block(number: int | None, head: str, body: list[str], label: str) -> 
         # Option-looking lines AFTER explanations started are explanation
         # content (e.g. "e. g. ..."), not options -- the options region
         # is closed once answers/explanations begin.
-        opt = _OPTION.match(line)
+        opt = _match_option(line)
         if opt is not None and not (phase == "t" and options):
             content = opt.group(2)
             options.append(

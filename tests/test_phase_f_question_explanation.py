@@ -1049,6 +1049,7 @@ class ArchitectureTests(unittest.TestCase):
         changed = subprocess.run(
             ["git", "diff", "--name-only", "origin/main...HEAD"],
             cwd=REPO_ROOT, capture_output=True, text=True).stdout.split()
+        # Phase F surfaces ...
         allowed = {
             "quizbot/shared/explanations.py",
             "quizbot/shared/html/quiz_report.py",
@@ -1063,10 +1064,34 @@ class ArchitectureTests(unittest.TestCase):
             "quizbot/runner_bot/pdf_reports.py",
             "quizbot/runner_bot/ai_providers.py",
             "quizbot/mini_app/player_service.py",
+            "quizbot/mini_app/routes.py",
+            "quizbot/mini_app/static/index.html",
             "quizbot/creator_bot/handlers/reports.py",
             "quizbot/creator_bot/handlers/file_import.py",
             "tests/test_phase_f_question_explanation.py",
             "tests/test_phase_b_foundation.py",
+            # ... plus the pre-deployment audit hardening change set
+            # (PDF default config, (A) parser, XSS/SSRF hardening, runner
+            # PDF robustness, Hindi fonts/swap provisioning, BotFather menu):
+            ".env.example",
+            "BOTFATHER_COMMANDS.txt",
+            "Dockerfile",
+            "deploy_vps.sh",
+            "requirements.txt",
+            "quizbot/shared/config.py",
+            "quizbot/shared/utils/netguard.py",
+            "quizbot/creator_bot/handlers/testseries_create.py",
+            "quizbot/creator_bot/handlers/testseries_file.py",
+            "tests/test_bold_words.py",
+            "tests/test_part2_command_audit.py",
+            "tests/test_phase_d_mistakes.py",
+            "tests/test_phase_e_weak_practice.py",
+            "tests/test_testseries_file.py",
+            "tests/test_html_report_security.py",
+            "tests/test_pdf_config_resolution.py",
+            "tests/test_runner_pdf_report.py",
+            "tests/test_url_import_ssrf.py",
+            "tests/test_mini_app_batch_safety.py",
         }
         for path in changed:
             self.assertIn(path, allowed, f"unexpected change: {path}")

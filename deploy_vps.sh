@@ -142,7 +142,12 @@ if env_has OWNER_ID; then log ".env check: OWNER_ID present (value hidden) — O
 else log ".env check: OWNER_ID — MISSING"; missing=1; fi
 # Feature-relevant but optional: warn only, never block the whole deployment.
 env_has GEMINI_API_KEY || log ".env note: GEMINI_API_KEY empty — /podcast voice generation will report its own error until set."
-env_has PDF_API_BASE   || log ".env note: PDF_API_BASE empty — /testseries will reply that PDF generation is not configured (existing behavior)."
+if grep -Eq '^[[:space:]]*PDF_API_BASE=[[:space:]]*(off|none|disabled|false|0)[[:space:]]*$' "$APP_DIR/.env"; then
+  log ".env note: PDF_API_BASE explicitly disabled — /testseries will reply that PDF generation is not configured."
+else
+  log ".env note: PDF generation targets the local microservice at 127.0.0.1:8090 (blank defaults there)."
+  log "           Run ./deploy_pdf_service.sh on THIS host to install quizbot-pdf.service, otherwise /testseries reports the PDF service unreachable."
+fi
 [ -z "${MINI_APP_DOMAIN_FROM_ENV:-}" ] || true
 if grep -Eq '^[[:space:]]*MINI_APP_DOMAIN=[[:space:]]*"?https?://[^[:space:]"]' "$APP_DIR/.env"; then
   log ".env note: MINI_APP_DOMAIN set — Mini App HTTP server will also start INSIDE the same single process (no extra poller)."
@@ -175,11 +180,41 @@ if [ "$SKIP_APT" -eq 0 ] && command -v apt-get >/dev/null 2>&1; then
     git python3 python3-venv python3-pip \
     ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin \
     libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libcairo2 \
-    libffi-dev shared-mime-info fonts-liberation
+    libffi-dev shared-mime-info fonts-liberation \
+    fonts-noto-core fonts-deva
 else
   log "Skipping apt-get (flag or non-Debian system). Ensuring ffmpeg/python exist ..."
   command -v python3 >/dev/null 2>&1 || fail "python3 not found."
   command -v ffmpeg  >/dev/null 2>&1 || fail "ffmpeg not found (required for /podcast MP3 creation)."
+fi
+
+# ---------------------------------------------------------------------------
+# 2b. Swap on small VMs (target box is 2 GB/1 vCPU). WeasyPrint report renders
+#     and ffmpeg /podcast encoding can spike RSS; without swap the OOM killer
+#     can terminate the bot (systemd restarts it, but an in-flight job is
+#     lost). Idempotent and NON-fatal: skip if swap already exists, if not
+#     root, on non-Debian hosts, or when SKIP_SWAP=1.
+# ---------------------------------------------------------------------------
+SWAP_SIZE_MB="${SWAP_SIZE_MB:-2048}"
+if [ "${SKIP_SWAP:-0}" -eq 0 ] && [ -z "$(swapon --show 2>/dev/null)" ] && [ ! -f /swapfile ]; then
+  if [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
+    log "No swap detected and this is a small VPS -- creating a ${SWAP_SIZE_MB}MB /swapfile (non-fatal) ..."
+    if $SUDO dd if=/dev/zero of=/swapfile bs=1M count="$SWAP_SIZE_MB" status=none 2>/dev/null \
+       && $SUDO chmod 600 /swapfile \
+       && $SUDO mkswap /swapfile >/dev/null 2>&1 \
+       && $SUDO swapon /swapfile >/dev/null 2>&1; then
+      if ! grep -q '^/swapfile ' /etc/fstab 2>/dev/null; then
+        echo '/swapfile none swap sw 0 0' | $SUDO tee -a /etc/fstab >/dev/null 2>&1 || true
+      fi
+      $SUDO sysctl -q vm.swappiness=10 2>/dev/null || true
+      log "Swap enabled (${SWAP_SIZE_MB}MB)."
+    else
+      $SUDO rm -f /swapfile 2>/dev/null || true
+      log "Swap setup failed/unsupported here (continuing; the service auto-restarts if the OOM killer ever fires)."
+    fi
+  fi
+else
+  log "Swap already configured (or SKIP_SWAP=1) -- leaving as-is."
 fi
 
 # ---------------------------------------------------------------------------

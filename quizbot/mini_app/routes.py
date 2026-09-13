@@ -69,6 +69,34 @@ def _clamp_optional_float(value: Optional[float], lo: float, hi: float) -> Optio
     return max(lo, min(hi, float(value)))
 
 
+# Only these URL schemes may appear on a batch "Get access" link shown to a
+# player. A creator-supplied batch is semi-trusted relative to the player, so
+# never echo a javascript:/data: href into the Mini App.
+_SAFE_LINK_SCHEMES = ("http://", "https://", "tg://")
+_BATCH_FIELD_CAP = 500
+
+
+def _safe_batch_payload(batch: Optional[dict]) -> Optional[dict]:
+    """Project a stored batch into the fields the UI needs, sanitising the
+    payment link scheme and bounding free-text length."""
+    if not isinstance(batch, dict):
+        return None
+
+    def _clean(value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        return value.strip()[:_BATCH_FIELD_CAP] or None
+
+    raw_link = (batch.get("payment_link") or "").strip()
+    payment_link = raw_link if raw_link.lower().startswith(_SAFE_LINK_SCHEMES) else None
+    return {
+        "name": _clean(batch.get("name")),
+        "description": _clean(batch.get("description")),
+        "payment_link": payment_link,
+        "contact_info": _clean(batch.get("contact_info")),
+    }
+
+
 def _require_bot_token() -> str:
     # Whichever bot's token the Mini App is registered under -- both bots
     # can point their WebApp buttons at the same Mini App, and initData is
@@ -131,13 +159,9 @@ async def quiz_info(
     access = await check_play_access(quiz, user_id)
     if not access.allowed:
         payload = {"error": "access_denied", "reason": access.reason}
-        if access.batch:
-            payload["batch"] = {
-                "name": access.batch.get("name"),
-                "description": access.batch.get("description"),
-                "payment_link": access.batch.get("payment_link"),
-                "contact_info": access.batch.get("contact_info"),
-            }
+        safe_batch = _safe_batch_payload(access.batch)
+        if safe_batch:
+            payload["batch"] = safe_batch
         raise HTTPException(status_code=403, detail=payload)
 
     return {
@@ -177,13 +201,9 @@ async def create_session(
     access = await check_play_access(quiz, user_id)
     if not access.allowed:
         payload = {"error": "access_denied", "reason": access.reason}
-        if access.batch:
-            payload["batch"] = {
-                "name": access.batch.get("name"),
-                "description": access.batch.get("description"),
-                "payment_link": access.batch.get("payment_link"),
-                "contact_info": access.batch.get("contact_info"),
-            }
+        safe_batch = _safe_batch_payload(access.batch)
+        if safe_batch:
+            payload["batch"] = safe_batch
         raise HTTPException(status_code=403, detail=payload)
 
     # Clamp/validate player-chosen overrides server-side -- never trust the

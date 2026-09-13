@@ -133,9 +133,14 @@ def _build_testseries_payload(quizzes: list[dict], mode: str, title: str, *,
                 PDF_SERVICE_EXPLANATION_MAX,
                 render_plain_text,
             )
-            explanation = render_plain_text(
+            # The wire contract (pre-Phase-F) delivered a trimmed
+            # explanation string; the renderer preserves raw whitespace for
+            # other surfaces, so trim at THIS boundary (the microservice's
+            # sanitiser trims too, but keep the outgoing field identical to
+            # the historical contract).
+            explanation = (render_plain_text(
                 q, max_len=PDF_SERVICE_EXPLANATION_MAX,
-                display_order=survivor_order)
+                display_order=survivor_order) or "").strip()
             if not explanation:
                 explanation = str(q.get("explanation") or "").strip()[
                     :PDF_SERVICE_EXPLANATION_MAX]
@@ -186,7 +191,18 @@ async def _generate_pdf_via_api(quizzes: list[dict], mode: str, title: str, poll
         payload["institute_name"] = institute_name
 
     base = config.PDF_API_BASE.rstrip("/")
-    status, job = await request_json("POST", f"{base}/api/generate", json_body=payload)
+    try:
+        status, job = await request_json(
+            "POST", f"{base}/api/generate", json_body=payload)
+    except (asyncio.TimeoutError, OSError) as exc:
+        # Unreachable local microservice (connection refused / DNS / timeout).
+        # Give an actionable message instead of a raw traceback; the bot keeps
+        # running and HTML reports remain available via /whtml.
+        raise RuntimeError(
+            "the PDF service is unreachable. The operator should start the "
+            "PDF microservice (quizbot-pdf.service) at the configured address. "
+            "Use /whtml for an interactive HTML report meanwhile."
+        ) from exc
     if status != 200 or not isinstance(job, dict):
         raise RuntimeError(f"PDF API rejected the request (HTTP {status}): {job}")
     if job.get("error"):
@@ -231,7 +247,7 @@ async def testseries_cmd(c: Client, m: Message) -> None:
 
     if not config.PDF_API_BASE:
         await m.reply(
-            "PDF generation is not configured on this bot (no PDF_API_BASE set). "
+            "PDF generation is not configured on this bot (PDF microservice disabled: set PDF_API_BASE or deploy it with deploy_pdf_service.sh). "
             "Ask the bot operator to configure a PDF microservice, or use /whtml "
             "for an interactive HTML report instead."
         )

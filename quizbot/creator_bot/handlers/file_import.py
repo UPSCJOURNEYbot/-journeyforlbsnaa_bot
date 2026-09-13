@@ -12,9 +12,13 @@ import logging
 import re
 from typing import Optional
 
+from quizbot.shared.utils.netguard import assert_public_http_url
 from ..parsing import filter_words, parse_question_block, strip_source_noise
 
 logger = logging.getLogger(__name__)
+
+# Backwards-compatible alias for callers/tests importing it from this module.
+_assert_public_http_url = assert_public_http_url
 
 
 def _process_txt(content: str, remove_words: list[str], out_questions: list[dict]) -> int:
@@ -375,6 +379,11 @@ def _extract_html_text(html: str) -> str:
     return soup.get_text("\n", strip=True)
 
 
+# Cap on a single imported web page / document (also defends memory against a
+# huge or endless response during the SSRF-protected fetch below).
+_PUBLIC_URL_MAX_BYTES = 25 * 1024 * 1024
+
+
 async def process_public_url(
     url: str, out_questions: list[dict], remove_words: list[str]
 ) -> tuple[Optional[int], Optional[str]]:
@@ -383,22 +392,52 @@ async def process_public_url(
     Works for public pages that expose their content in HTML. Dynamic/private
     pages may intentionally return no question text; the caller gets a clear
     error instead of silently accepting an empty import.
+
+    The fetched host is SSRF-validated (public IPs only) for the original URL
+    and each redirect hop, and the response is size-capped.
     """
     import aiohttp
-    from urllib.parse import urlparse
+    from urllib.parse import urljoin, urlparse
 
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return None, "❌ Please send a valid public http/https link."
     try:
-        timeout = aiohttp.ClientTimeout(total=25)
+        _assert_public_http_url(url)
+    except ValueError as exc:
+        return None, f"❌ {str(exc).capitalize()}"
+    data = b""
+    ctype = ""
+    try:
+        timeout = aiohttp.ClientTimeout(total=25, sock_read=20)
         headers = {"User-Agent": "Mozilla/5.0 (Quizbot Question Importer)"}
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(url, allow_redirects=True, max_redirects=5) as resp:
-                if resp.status >= 400:
-                    return None, f"❌ Link could not be opened (HTTP {resp.status})."
-                ctype = (resp.headers.get("content-type") or "").lower()
-                data = await resp.read()
+            current = url
+            # Follow redirects manually so every hop is re-validated against
+            # the SSRF guard (an open-redirect to 127.0.0.1/169.254.x must fail).
+            for _hop in range(6):
+                async with session.get(current, allow_redirects=False) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("location")
+                        if not location:
+                            return None, f"❌ Link redirected without a target (HTTP {resp.status})."
+                        current = urljoin(current, location)
+                        try:
+                            _assert_public_http_url(current)
+                        except ValueError as exc:
+                            return None, f"❌ {str(exc).capitalize()}"
+                        continue
+                    if resp.status >= 400:
+                        return None, f"❌ Link could not be opened (HTTP {resp.status})."
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    chunks = []
+                    size = 0
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        size += len(chunk)
+                        if size > _PUBLIC_URL_MAX_BYTES:
+                            return None, "❌ The linked page is too large to import (25 MB limit)."
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                    break
+            else:
+                return None, "❌ The link redirected too many times."
         if "pdf" in ctype or url.lower().split("?", 1)[0].endswith(".pdf"):
             count, _ = _process_pdf(data, remove_words, out_questions)
         else:
@@ -414,7 +453,14 @@ async def process_public_url(
             return 0, "❌ Link opened, but no valid MCQ questions were found. The AI share page may require login or JavaScript rendering."
         return count, None
     except Exception as exc:
-        logger.exception("Public URL import failed: %s", url)
+        # Log only scheme/host/path -- never the raw URL, which may carry a
+        # signed token or credentials in its query string.
+        try:
+            _p = urlparse(url)
+            safe_target = f"{_p.scheme}://{_p.netloc}{_p.path}"
+        except Exception:
+            safe_target = "<unparseable url>"
+        logger.exception("Public URL import failed for %s", safe_target)
         return None, f"⚠️ Could not import this link: {exc}"
 
 def process_uploaded_file(
