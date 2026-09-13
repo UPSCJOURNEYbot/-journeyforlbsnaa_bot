@@ -324,6 +324,106 @@ class QuizRepository:
     async def increment_participants(self, qid: str) -> None:
         await self.col.update_one({"qid": qid}, {"$inc": {"total_participants": 1}})
 
+    # ------------------------------------------------------------------
+    # Phase E: bounded practice-candidate extraction. The qid set is
+    # already restricted to the user's recently-played/owned quizzes, so
+    # this never scans the whole bank; matching embedded questions and
+    # projection happen server-side (no full quiz documents cross the
+    # wire), and the result is capped.
+    # ------------------------------------------------------------------
+
+    async def list_qids_by_creator(
+        self, creator_id: int, limit: int = 50
+    ) -> list[str]:
+        """Lean qid-only listing of quizzes owned by this user."""
+        cursor = (
+            self.col.find({"creator_id": creator_id}, {"_id": 0, "qid": 1})
+            .sort("created_at", -1)
+            .limit(int(limit))
+        )
+        return [r["qid"] async for r in cursor if r.get("qid")]
+
+    async def topic_candidate_questions(
+        self,
+        qids: list[str],
+        buckets: list[tuple],
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return stored questions whose explicit analytics metadata matches
+        one of the chosen practice ``buckets`` (``(subject, topic)``; topic
+        None selects the subject-only/'untagged' bucket).
+
+        Output rows: ``{"qid", "q_index", "question"}``. Assignment to a
+        bucket is finalized by the caller using each question's OWN
+        metadata, so over-broad document-level ``$or`` pre-filters can
+        never mislabel a question into the wrong topic or subject."""
+        if not qids or not buckets:
+            return []
+
+        def _bucket_cond(prefix: str, subject: Optional[str],
+                         topic: Optional[str]) -> Optional[dict]:
+            if topic is None and not subject:
+                return None
+            cond: dict[str, Any] = {}
+            if subject:
+                cond[f"{prefix}subject"] = subject
+            if topic is None:
+                # Subject-only bucket: subject present, topic absent/null.
+                cond["$and"] = cond.get("$and", []) + [
+                    {"$or": [
+                        {f"{prefix}topic": None},
+                        {f"{prefix}topic": {"$exists": False}},
+                    ]},
+                ]
+            else:
+                cond[f"{prefix}topic"] = topic
+            return cond
+
+        doc_ors, elem_ors = [], []
+        for subject, topic in buckets:
+            # After ``$unwind "$questions"`` the field keeps the name
+            # `questions` but holds a single element object; the rename to
+            # `question` happens in the later $project.
+            doc_c = _bucket_cond("questions.analytics.", subject, topic)
+            elem_c = _bucket_cond("questions.analytics.", subject, topic)
+            if doc_c:
+                doc_ors.append(doc_c)
+            if elem_c:
+                elem_ors.append(elem_c)
+        if not doc_ors or not elem_ors:
+            return []
+        pipeline = [
+            {"$match": {"qid": {"$in": list(qids)}, "$or": doc_ors}},
+            {"$unwind": {"path": "$questions", "includeArrayIndex": "q_index"}},
+            {"$match": {"$or": elem_ors}},
+            {"$limit": int(limit)},
+            {"$project": {
+                "_id": 0, "qid": 1, "q_index": 1, "question": "$questions",
+            }},
+        ]
+        rows = [r async for r in self.col.aggregate(pipeline)]
+        wanted = {(s, t) for s, t in buckets}
+        out = []
+        for r in rows:
+            question = r.get("question")
+            if not isinstance(question, dict):
+                continue
+            analytics = question.get("analytics") or {}
+            subject = analytics.get("subject")
+            topic = analytics.get("topic")
+            # Exact bucket assignment from the question's own metadata;
+            # the subject-only bucket matches explicitly (topic absent).
+            key = (subject, topic)
+            key_untagged = (subject, None)
+            if key not in wanted and key_untagged not in wanted:
+                continue
+            out.append({"qid": r.get("qid"),
+                        "q_index": r.get("q_index"),
+                        "question": question})
+            if len(out) >= int(limit):
+                break
+        return out
+
     async def stats(self) -> dict:
         total = await self.col.count_documents({})
         paid = await self.col.count_documents({"quiz_type": "paid"})
