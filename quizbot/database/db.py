@@ -131,6 +131,12 @@ class Database:
         await db.scheduled_quizzes.create_index("job_id", unique=True)
         await db.scheduled_quizzes.create_index([("chat_id", 1), ("scheduled_time", 1)])
 
+        # Phase C gamification: XP ledger unique event identity + user_xp
+        # unique per user. Centralised here so every startup is idempotent;
+        # the spec lives in analytics.gamification.
+        from quizbot.analytics.gamification import ensure_gamification_indexes
+        await ensure_gamification_indexes(db)
+
     async def close(self) -> None:
         if self._client is not None:
             self._client.close()
