@@ -74,6 +74,12 @@ class Database:
         await db.quiz_attempts.create_index("attempt_id", unique=True)
         await db.quiz_attempts.create_index("user_id")
         await db.quiz_attempts.create_index("qid")
+        # Phase B: user-scoped history (completed first; in_progress is
+        # deliberately required in the key so open attempts never sort into
+        # completed history).
+        await db.quiz_attempts.create_index(
+            [("user_id", 1), ("status", 1), ("time_ended", -1)]
+        )
 
         await db.leaderboard.create_index([("qid", 1), ("user_id", 1)], unique=True)
         await db.leaderboard.create_index([("qid", 1), ("score", -1), ("time_taken", 1)])
@@ -84,6 +90,35 @@ class Database:
             [("user_id", 1), ("qid", 1), ("q_index", 1)], unique=True
         )
         await db.user_mistakes.create_index("user_id")
+        # Phase B non-destructive history: list/open vs resolved filtering.
+        await db.user_mistakes.create_index(
+            [("user_id", 1), ("status", 1), ("last_wrong_at", -1)]
+        )
+
+        # Phase B content-addressed question snapshots: question text is
+        # stored once per distinct content (sha256) instead of on every
+        # event/mistake row. Idempotent on every startup.
+        await db.question_snapshots.create_index("snapshot_id", unique=True)
+
+        # Phase B canonical question events. The unique composite is the
+        # idempotency key: (user, attempt, question) is written at most once.
+        await db.question_events.create_index(
+            [("user_id", 1), ("attempt_id", 1), ("question_index", 1)],
+            unique=True,
+            name="uniq_user_attempt_question",
+        )
+        await db.question_events.create_index(
+            [("user_id", 1), ("qid", 1), ("question_index", 1)],
+            name="user_quiz_question",
+        )
+        await db.question_events.create_index(
+            [("user_id", 1), ("created_at", -1)],
+            name="user_created",
+        )
+        await db.question_events.create_index(
+            [("user_id", 1), ("topic", 1), ("created_at", -1)],
+            name="user_topic_created",
+        )
 
         await db.creator_settings.create_index("user_id", unique=True)
         await db.chat_settings.create_index("chat_id", unique=True)

@@ -12,11 +12,14 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
+from quizbot.analytics.runtime import build_miniapp_results
+from quizbot.analytics.service import (
+    SOURCE_MINIAPP,
+    AnalyticsService,
+)
 from quizbot.database import (
     AttemptRepository,
     LeaderboardRepository,
-    MistakeRepository,
-    QuestionStatsRepository,
     QuizRepository,
     get_db,
 )
@@ -24,7 +27,7 @@ from quizbot.runner_bot.quiz_utils import (
     get_section_for_question,
     is_correct,
     section_marks,
-    shuffle_options_multi,
+    shuffle_options_multi_with_mapping,
 )
 
 Mode = Literal["practice", "exam"]
@@ -80,7 +83,10 @@ async def start_session(
     ov = overrides or SessionOverrides()
 
     attempt_repo = AttemptRepository(get_db())
-    attempt = await attempt_repo.start(user_id, qid, quiz["quiz_name"], len(quiz["questions"]))
+    attempt = await attempt_repo.start(
+        user_id, qid, quiz["quiz_name"], len(quiz["questions"]),
+        source=SOURCE_MINIAPP, quiz_persisted=True,
+    )
 
     # Effective per-attempt settings: player's choice if given, else the
     # quiz's own saved value. Stored on the session (not the quiz) so
@@ -109,9 +115,18 @@ async def start_session(
         options = list(q["options"])
         correct = q.get("correct_option_id")
         correct_ids = correct if isinstance(correct, list) else [correct]
+        display_order: Optional[list[int]] = None
         if do_shuffle_o:
-            options, correct_ids = shuffle_options_multi(options, correct_ids, 0)
-        per_question[q_idx] = {"options": options, "correct_ids": correct_ids}
+            options, correct_ids, display_order = shuffle_options_multi_with_mapping(
+                options, correct_ids, 0
+            )
+        per_question[q_idx] = {
+            "options": options,
+            "correct_ids": correct_ids,
+            # Phase B: display->canonical option permutation (None when
+            # options weren't shuffled) for canonical analytics records.
+            "display_order": display_order,
+        }
 
     _sessions[attempt["attempt_id"]] = {
         "user_id": user_id,
@@ -235,31 +250,38 @@ async def complete_session(attempt_id: str) -> Optional[dict]:
     correct_count = sum(1 for a in answers.values() if a["correct"])
     wrong_count = len(answers) - correct_count
 
-    attempt_repo = AttemptRepository(get_db())
-    await attempt_repo.update(
-        attempt_id,
-        current_question=len(session["order"]),
+    qid = session["qid"]
+    quiz = session["quiz"]
+
+    # Phase B: canonical, shuffle-safe per-question results built from the
+    # in-memory live session (the previous implementation discarded this
+    # answer map and persisted only aggregate counts).
+    question_results = build_miniapp_results(
+        session["order"], session["per_question"], answers
+    )
+
+    # Single canonical write path shared with the poll-based bots: attempt
+    # row (now WITH the answer map + question_results), question events,
+    # non-destructive mistakes, question stats, leaderboard completion and
+    # participant counter. Idempotent if the boundary is ever replayed.
+    analytics = AnalyticsService(get_db())
+    await analytics.record_completion(
+        user_id=session["user_id"],
+        attempt_id=attempt_id,
+        qid=qid,
+        quiz_name=quiz.get("quiz_name", qid),
+        question_results=question_results,
+        source=SOURCE_MINIAPP,
+        quiz_persisted=True,
+        questions=quiz.get("questions", []),
+        sections=quiz.get("sections", []),
         score=float(total_score),
         correct=int(correct_count),
         wrong=int(wrong_count),
         total_time=float(total_time),
+        current_question=len(session["order"]),
+        username=session.get("username"),
     )
-    await attempt_repo.complete(attempt_id, score=float(total_score), username=session["username"])
-
-    qid = session["qid"]
-    stats_repo = QuestionStatsRepository(get_db())
-    wrong_items = [
-        {"index": q_idx, "wrong": 0 if a["correct"] else 1, "total": 1}
-        for q_idx, a in answers.items()
-    ]
-    if wrong_items:
-        await stats_repo.bulk_update_wrong_stats(qid, wrong_items)
-
-    mistake_items = [{"qid": qid, "index": q_idx} for q_idx, a in answers.items() if not a["correct"]]
-    if mistake_items:
-        await MistakeRepository(get_db()).record(session["user_id"], mistake_items)
-
-    await QuizRepository(get_db()).increment_participants(qid)
 
     rank_info = await LeaderboardRepository(get_db()).user_rank(qid, session["user_id"])
 

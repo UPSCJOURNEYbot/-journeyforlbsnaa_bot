@@ -354,6 +354,11 @@ async def pdfquiz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
                 sess.get("shuffle_q", False), sess.get("shuffle_o", False),
                 shuffle_o_count=sess.get("shuffle_o_count", 0), chat_id=chat_id,
                 chat_type=chat_type, update=update, show_explanation=show_expl,
+                # PDF quizzes declare no topic (never fabricate one); the
+                # wizard-collected difficulty is genuine and is attached.
+                analytics_source="pdfquiz",
+                analytics_topic=None,
+                analytics_difficulty=sess.get("diff"),
             )
     except Exception as e:
         logger.error("pdfquiz_callback error: %s", e, exc_info=True)

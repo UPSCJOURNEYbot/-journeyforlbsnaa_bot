@@ -78,10 +78,14 @@ def shuffle_options(options: list[str], correct_id: int) -> tuple[list[str], int
     return list(shuffled), mapping[correct_id]
 
 
-def shuffle_options_multi(
+def shuffle_options_multi_with_mapping(
     options: list[str], correct_ids: list[int], count: Optional[int] = None
-) -> tuple[list[str], list[int]]:
-    """Shuffle options and remap a list of correct indices.
+) -> tuple[list[str], list[int], list[int]]:
+    """Like :func:`shuffle_options_multi`, but also returns ``display_order``
+    -- the permutation where ``display_order[display_position]`` is the
+    ORIGINAL (canonical) option index. The analytics layer uses it at the
+    result boundary to convert poll answers (always in display coordinates)
+    back to canonical coordinates.
 
     `count` controls how many of the leading option positions get shuffled
     among themselves -- the rest keep their original position:
@@ -93,18 +97,31 @@ def shuffle_options_multi(
     """
     n = len(options)
     if count is None or count <= 0 or count >= n:
-        paired = list(enumerate(options))
-        random.shuffle(paired)
-        indices, shuffled = zip(*paired)
-        mapping = {orig: new for new, orig in enumerate(indices)}
-        return list(shuffled), [mapping[c] for c in correct_ids]
-
-    head_indices = list(range(count))
+        head_indices = list(range(n))
+    else:
+        head_indices = list(range(count))
     random.shuffle(head_indices)
-    new_order = head_indices + list(range(count, n))
+    new_order = head_indices + list(range(len(head_indices), n))
     shuffled = [options[i] for i in new_order]
-    mapping = {orig: new for new, orig in enumerate(new_order)}
-    return shuffled, [mapping[c] for c in correct_ids]
+    forward = {orig: new for new, orig in enumerate(new_order)}
+    display_correct = sorted(forward[c] for c in correct_ids)
+    return list(shuffled), display_correct, list(new_order)
+
+
+def shuffle_options_multi(
+    options: list[str], correct_ids: list[int], count: Optional[int] = None
+) -> tuple[list[str], list[int]]:
+    """Shuffle options and remap a list of correct indices.
+
+    Backward-compatible wrapper around
+    :func:`shuffle_options_multi_with_mapping` (same shuffle distribution as
+    before); callers that need the inverse permutation for analytics use the
+    ``_with_mapping`` variant directly.
+    """
+    shuffled, display_correct, _ = shuffle_options_multi_with_mapping(
+        options, correct_ids, count
+    )
+    return shuffled, display_correct
 
 
 def is_correct(user_options: Any, correct: Any) -> bool:

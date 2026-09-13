@@ -11,7 +11,7 @@ import asyncio
 import logging
 import random
 import time
-from typing import Any
+from typing import Any, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -194,12 +194,25 @@ async def _launch_ai_quiz(
     timer: int, neg: float, cm: int, shuffle_q: bool = False, shuffle_o: bool = False,
     shuffle_o_count: int = 0, chat_id: int = None, chat_type: str = "private",
     update: Any = None, show_explanation: bool = False,
+    analytics_source: str = "aiquiz", analytics_topic: Optional[str] = None,
+    analytics_difficulty: Optional[str] = None,
 ) -> None:
     """Launch a live-generated quiz in the chat the command was issued from."""
+    from quizbot.analytics.metadata import attach_question_analytics
+
     from .quiz_play import run_group_quiz, start_private_quiz
 
     chat_id = chat_id or uid
     is_private = str(chat_type) in ("private", "ChatType.PRIVATE")
+
+    # Phase B: attach only metadata genuinely collected by the wizard (the
+    # declared topic and the chosen moderate/hard/extreme difficulty). PDF
+    # quizzes have no declared topic, so none is fabricated.
+    attach_question_analytics(
+        questions,
+        topic=analytics_topic,
+        difficulty=analytics_difficulty,
+    )
 
     quiz_obj = {
         "question_set_id": f"AI{int(time.time())}", "quiz_name": f"AI: {topic[:50]}",
@@ -207,6 +220,8 @@ async def _launch_ai_quiz(
         "shuffle": shuffle_q, "shuffle_options": shuffle_o, "shuffle_options_count": shuffle_o_count,
         "show_explanation": show_explanation, "sections": [], "promo_message": None,
         "quiz_type": "free", "creator_id": uid,
+        # Provenance for the analytics layer (no stored quiz row exists).
+        "analytics_source": analytics_source,
     }
 
     if session_mgr.get(chat_id):
@@ -217,13 +232,22 @@ async def _launch_ai_quiz(
         await start_private_quiz(chat_id, ctx, questions, quiz_obj, quiz_obj["question_set_id"])
         return
 
+    # Capture the question permutation for canonical analytics, mirroring the
+    # saved-quiz setup wizard. quiz_obj keeps the CANONICAL question order
+    # (used for snapshots/metadata at the boundary); only the play list is
+    # reordered, with question_order[display_pos] = canonical_index.
+    question_order = None
+    play_questions = questions
     if shuffle_q and not quiz_obj.get("sections"):
-        random.shuffle(questions)
+        question_order = list(range(len(questions)))
+        random.shuffle(question_order)
+        play_questions = [questions[i] for i in question_order]
 
     session_data = {
         "quiz_id": quiz_obj["question_set_id"], "quiz_data": quiz_obj, "current_index": 0,
         "paused": False, "polls": {}, "participants": {}, "is_private": False,
         "section_msgs": [], "modified_timer_offset": 0,
+        "question_order": question_order,
     }
     await session_mgr.create(chat_id, session_data)
 
@@ -238,7 +262,7 @@ async def _launch_ai_quiz(
             self._chat_id = cid
 
     tasks.spawn(
-        run_group_quiz(chat_id, ctx, questions, quiz_obj, False, _FakeUpdate(chat_id), 0),
+        run_group_quiz(chat_id, ctx, play_questions, quiz_obj, False, _FakeUpdate(chat_id), 0),
         name=f"quiz_{chat_id}_ai",
     )
 
@@ -495,6 +519,9 @@ async def aiquiz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 sess.get("shuffle_q", False), sess.get("shuffle_o", False),
                 shuffle_o_count=sess.get("shuffle_o_count", 0), chat_id=chat_id,
                 chat_type=chat_type, update=update, show_explanation=show_expl,
+                analytics_source="aiquiz",
+                analytics_topic=sess.get("topic"),
+                analytics_difficulty=sess.get("diff"),
             )
     except Exception as e:
         logger.error("aiquiz_callback error: %s", e, exc_info=True)
