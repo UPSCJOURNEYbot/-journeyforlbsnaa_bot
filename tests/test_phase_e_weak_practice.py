@@ -940,6 +940,34 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(q["question"] == "J broken" for q in built["questions"]))
         self.assertGreaterEqual(built["excluded"], 1)
 
+    async def test_strong_user_gets_no_weak_not_insufficient(self):
+        # 6/6 correct in a topic: full evidence window, nothing weak. The
+        # honest state is no_weak ("keep practising"), NOT "need more data".
+        qs = [question(f"G{i}", ["a", "b"], 0,
+                       subject="Polity", topic="Judiciary") for i in range(6)]
+        await seed(self.db, "qG", qs)
+        await seed_topic_performance(
+            self.db, 1, "qG", qs, correct_idx=list(range(6)), wrong_idx=[])
+        svc = wp.WeakPracticeService(self.db)
+        ov = await svc.overview(1)
+        self.assertEqual(ov["state"], "no_weak")
+        built = await svc.build_practice(1)
+        self.assertEqual(built["state"], "no_weak")
+        self.assertEqual(built["questions"], [])
+
+    async def test_small_scattered_samples_stay_insufficient(self):
+        # 5 topics with one answer each: no bucket reaches the evidence
+        # window -> still insufficient, never no_weak.
+        for i in range(5):
+            qs = [question(f"S{i}", ["a", "b"], 0,
+                           subject=f"Sub{i}", topic=f"T{i}")]
+            await seed(self.db, f"qS{i}", qs)
+            await seed_topic_performance(
+                self.db, 1, f"qS{i}", qs, correct_idx=[], wrong_idx=[0],
+                attempt_prefix=f"s{i}")
+        ov = await wp.WeakPracticeService(self.db).overview(1)
+        self.assertEqual(ov["state"], "insufficient")
+
     async def test_subject_only_fallback_selection(self):
         # Questions carry subject but NO topic (and no sections): they form
         # the labelled 'Polity . untagged' bucket and remain practicable.
@@ -1452,6 +1480,23 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         ctx = FakeCtx()
         await self.mod.weakquiz_command(FakeUpdate(1), ctx)
         self.assertIn("at least 5 answered and 2 incorrect", ctx.bot.sent[0][1])
+
+    async def test_strong_user_no_weak_message(self):
+        qs = [question(f"G{i}", ["a", "b"], 0,
+                       subject="Polity", topic="Judiciary")
+              for i in range(6)]
+        await seed(self.db, "qG", qs)
+        await seed_topic_performance(
+            self.db, 1, "qG", qs, correct_idx=list(range(6)), wrong_idx=[])
+        ctx = FakeCtx()
+        await self.mod.weakquiz_command(FakeUpdate(1), ctx)
+        self.assertIn("No weak topics yet", ctx.bot.sent[0][1])
+        # Auto button on the same state must not launch a quiz either.
+        upd = FakeUpdate(1, data=self.mod._cb("auto", 1))
+        ctx2 = FakeCtx()
+        await self.mod.weakquiz_callback(upd, ctx2)
+        self.assertNotIn("args", self.captured)
+        self.assertIn("No weak topics yet", ctx2.bot.sent[-1][1])
 
     async def test_ready_menu_lists_topics_with_real_values(self):
         await self._weak()

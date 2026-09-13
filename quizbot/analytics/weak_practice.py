@@ -417,10 +417,15 @@ class WeakPracticeService:
         eligible = data["eligible"]
         if data["answered"] == 0:
             state = "no_history"
-        elif not eligible:
-            state = "insufficient" if data["buckets"] else "no_history"
-        else:
+        elif eligible:
             state = "ready"
+        elif any(b["answered"] >= MIN_ANSWERED for b in data["buckets"]):
+            # At least one topic has a full evidence window but nothing
+            # crosses the weakness threshold: the honest answer is "no weak
+            # topics", not "I need more data".
+            state = "no_weak"
+        else:
+            state = "insufficient"
         data["state"] = state
         return data
 
@@ -436,8 +441,14 @@ class WeakPracticeService:
         if data["answered"] == 0:
             return {"state": "no_history", "questions": [], "size": 0}
         if not eligible:
-            return {"state": "no_weak" if data["buckets"] else "no_history",
-                    "answered": data["answered"], "questions": [], "size": 0}
+            if any(b["answered"] >= MIN_ANSWERED for b in data["buckets"]):
+                state = "no_weak"
+            elif data["buckets"]:
+                state = "insufficient"
+            else:
+                state = "no_history"
+            return {"state": state, "answered": data["answered"],
+                    "questions": [], "size": 0}
 
         if topic_index is None:
             wanted = eligible[:2]          # auto: best, +runner-up if needed

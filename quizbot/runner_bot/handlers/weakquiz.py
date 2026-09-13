@@ -165,6 +165,8 @@ async def _launch(
     state = built["state"]
     if state == "no_history":
         return _NO_HISTORY
+    if state == "insufficient":
+        return _INSUFFICIENT.format(closest="")
     if state in ("no_weak", "stale_topic"):
         if state == "stale_topic":
             return "\u2139\ufe0f That weak topic is no longer available. Please reopen /weakquiz."
@@ -250,6 +252,8 @@ async def weakquiz_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             text, kb = _NO_HISTORY, None
         elif overview["state"] == "insufficient":
             text, kb = _insufficient_text(overview), None
+        elif overview["state"] == "no_weak":
+            text, kb = _NO_WEAK, None
         else:
             text, kb = _menu_text(overview), _menu_keyboard(user.id)
         await safe_send_message(
@@ -304,6 +308,8 @@ async def weakquiz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 await _safe_edit(query, _NO_HISTORY, None)
             elif overview["state"] == "insufficient":
                 await _safe_edit(query, _insufficient_text(overview), None)
+            elif overview["state"] == "no_weak":
+                await _safe_edit(query, _NO_WEAK, None)
             else:
                 await _safe_edit(query, _menu_text(overview), _menu_keyboard(uid))
             return
@@ -311,7 +317,12 @@ async def weakquiz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         if action == "topics":
             await query.answer()
             if overview["state"] != "ready":
-                await _safe_edit(query, _NO_WEAK, None)
+                if overview["state"] == "no_history":
+                    await _safe_edit(query, _NO_HISTORY, None)
+                elif overview["state"] == "insufficient":
+                    await _safe_edit(query, _insufficient_text(overview), None)
+                else:
+                    await _safe_edit(query, _NO_WEAK, None)
                 return
             await _safe_edit(
                 query,
@@ -341,6 +352,9 @@ async def weakquiz_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             await query.answer()
             if overview["state"] == "no_history":
                 await safe_send_message(ctx, uid, _NO_HISTORY,
+                                        parse_mode=ParseMode.HTML)
+            elif overview["state"] == "no_weak":
+                await safe_send_message(ctx, uid, _NO_WEAK,
                                         parse_mode=ParseMode.HTML)
             else:
                 await safe_send_message(
