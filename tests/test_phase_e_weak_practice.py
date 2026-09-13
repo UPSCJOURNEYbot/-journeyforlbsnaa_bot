@@ -1481,6 +1481,20 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.mod.weakquiz_command(FakeUpdate(1), ctx)
         self.assertIn("at least 5 answered and 2 incorrect", ctx.bot.sent[0][1])
 
+    async def test_db_outage_failsoft(self):
+        async def boom(*a, **k):
+            raise RuntimeError("mongo down")
+        svc = self.mod.wp.WeakPracticeService(self.db)
+        svc.weak_buckets = boom
+        orig = self.mod.wp.WeakPracticeService
+        self.mod.wp.WeakPracticeService = lambda db: svc
+        try:
+            ctx = FakeCtx()
+            await self.mod.weakquiz_command(FakeUpdate(1), ctx)
+            self.assertIn("Something went wrong", ctx.bot.sent[0][1])
+        finally:
+            self.mod.wp.WeakPracticeService = orig
+
     async def test_strong_user_no_weak_message(self):
         qs = [question(f"G{i}", ["a", "b"], 0,
                        subject="Polity", topic="Judiciary")
