@@ -31,7 +31,10 @@ from quizbot.analytics.metadata import (
     build_snapshot,
     resolve_metadata,
 )
-from quizbot.analytics.repository import QuestionEventRepository
+from quizbot.analytics.repository import (
+    QuestionEventRepository,
+    QuestionSnapshotRepository,
+)
 from quizbot.database.repositories import (
     AttemptRepository,
     MistakeRepository,
@@ -60,6 +63,7 @@ class AnalyticsService:
             db = get_db()
         self.db = db
         self.events = QuestionEventRepository(db)
+        self.snapshots = QuestionSnapshotRepository(db)
         self.attempts = AttemptRepository(db)
         self.mistakes = MistakeRepository(db)
         self.question_stats = QuestionStatsRepository(db)
@@ -72,6 +76,32 @@ class AnalyticsService:
             raise ValueError("analytics methods require a stable integer user_id")
         return user_id
 
+    def _prepare_snapshots(
+        self, question_results: list[dict], questions: Optional[list[dict]]
+    ) -> tuple[dict[int, str], list[dict]]:
+        """Build + content-de-duplicate minimal snapshots for this
+        completion. Question text lives once in ``question_snapshots`` keyed
+        by content hash; events/mistakes only carry the small id, keeping
+        per-event rows bounded even when question text is long. Returns
+        ``(q_index -> snapshot_id, distinct snapshot contents)``.
+        """
+        from quizbot.analytics.metadata import snapshot_content_hash
+
+        ids_by_index: dict[int, str] = {}
+        by_hash: dict[str, dict] = {}
+        for qr in question_results or []:
+            try:
+                q_index = int(qr["q_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if isinstance(questions, list) and 0 <= q_index < len(questions):
+                snapshot = build_snapshot(questions[q_index])
+                sid = snapshot_content_hash(snapshot)
+                if sid:
+                    ids_by_index[q_index] = sid
+                    by_hash[sid] = snapshot
+        return ids_by_index, list(by_hash.values())
+
     def _enrich(
         self,
         *,
@@ -83,7 +113,9 @@ class AnalyticsService:
         questions: Optional[list[dict]],
         sections: Optional[list[dict]],
         at: str,
+        snapshot_ids: Optional[dict[int, str]] = None,
     ) -> list[dict]:
+        snapshot_ids = snapshot_ids or {}
         enriched: list[dict] = []
         for qr in question_results or []:
             q_index = int(qr["q_index"])
@@ -115,7 +147,8 @@ class AnalyticsService:
                 "subtopic": subtopic,
                 "difficulty": difficulty,
                 "topic_source": topic_source,
-                "question_snapshot": build_snapshot(question),
+                # Compact reference; content is deduped in question_snapshots.
+                "snapshot_id": snapshot_ids.get(q_index),
             })
         return enriched
 
@@ -203,10 +236,19 @@ class AnalyticsService:
                 persist_leaderboard=bool(quiz_persisted),
             )
 
+        # Content-addressed snapshots: one bounded bulk ensure per
+        # completion, deduped by question content hash (one DB round trip).
+        snapshot_ids, snapshot_contents = self._prepare_snapshots(
+            question_results, questions
+        )
+        if snapshot_contents:
+            await self.snapshots.ensure(snapshot_contents, at=at)
+
         enriched = self._enrich(
             qid=qid, quiz_name=quiz_name, source=source,
             quiz_persisted=quiz_persisted, question_results=question_results,
             questions=questions, sections=sections, at=at,
+            snapshot_ids=snapshot_ids,
         )
         events_inserted = await self.events.record_many(
             user_id, attempt_id, enriched, backfilled=backfilled
@@ -245,6 +287,20 @@ class AnalyticsService:
         }
 
     # ------------------------------------------------------------------- reads
+
+    async def _attach_snapshots(
+        self, rows: list[dict], *, id_key: str = "snapshot_id",
+        out_key: str = "question_snapshot",
+    ) -> list[dict]:
+        """Resolve compact snapshot references to their minimal content with
+        a single bounded ``$in`` query (page-sized callers only)."""
+        ids = [row.get(id_key) for row in rows if row.get(id_key)]
+        snap_map = await self.snapshots.get_many(ids) if ids else {}
+        for row in rows:
+            if out_key in row:
+                continue  # legacy embedded snapshot keeps precedence
+            row[out_key] = snap_map.get(row.get(id_key))
+        return rows
 
     async def get_user_overview(self, user_id: int) -> dict:
         """Combined canonical/legacy overview for one user.
@@ -347,13 +403,15 @@ class AnalyticsService:
             row["accuracy_pct"] = round(
                 aggregation.safe_ratio(row["correct"], answered) * 100, 2
             )
-        return rows
+        # One bounded $in resolution for the whole page.
+        return await self._attach_snapshots(rows)
 
     async def list_mistakes(
         self, user_id: int, status: Optional[str] = None, limit: int = 50
     ) -> list[dict]:
         user_id = self._require_user(user_id)
-        return await self.mistakes.list_for_user(user_id, limit=limit, status=status)
+        rows = await self.mistakes.list_for_user(user_id, limit=limit, status=status)
+        return await self._attach_snapshots(rows)
 
     async def get_mistake_totals(self, user_id: int) -> dict:
         user_id = self._require_user(user_id)

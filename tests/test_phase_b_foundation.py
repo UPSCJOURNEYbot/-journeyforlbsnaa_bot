@@ -826,7 +826,14 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by[1]["subject"], "Polity")
         self.assertEqual(by[1]["topic"], "FR & FD")
         self.assertEqual(by[1]["difficulty"], "hard")
-        self.assertIn("question_snapshot", by[1])
+        # Events carry only a compact content-hash reference; question text
+        # lives once in the content-addressed snapshot store.
+        self.assertNotIn("question_snapshot", by[1])
+        self.assertIsInstance(by[1]["snapshot_id"], str)
+        self.assertEqual(len(by[1]["snapshot_id"]), 64)
+        # ... and it resolves to the original minimal question content.
+        snaps = await self.svc.snapshots.get_many([by[1]["snapshot_id"]])
+        self.assertEqual(snaps[by[1]["snapshot_id"]]["question"], "Q1")
         # attempt answers canonical + question_results + provenance
         attempt = await AttemptRepository(self.db).get("att1")
         self.assertEqual(attempt["answers"], {"q0": [1], "q1": [0]})
@@ -851,7 +858,13 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         row = mistakes.docs[0]
         self.assertEqual(row["wrong_count"], 1)
         self.assertEqual(row["status"], "open")
-        self.assertEqual(row["question_snapshot"]["question"], "Q1")
+        # Mistake rows reference the content-addressed snapshot instead of
+        # embedding the text; service reads resolve it back.
+        self.assertNotIn("question_snapshot", row)
+        snaps = await self.svc.snapshots.get_many([row["snapshot_id"]])
+        self.assertEqual(snaps[row["snapshot_id"]]["question"], "Q1")
+        listed = await self.svc.list_mistakes(100)
+        self.assertEqual(listed[0]["question_snapshot"]["question"], "Q1")
         # replay same attempt -> no double count
         await self._complete(attempt_id="a1", results=[
             qr(1, OUTCOME_INCORRECT, selected=[1], correct=[0, 2])])
@@ -886,13 +899,25 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_24_snapshot_survives_later_quiz_edit(self):
         await self._complete(attempt_id="a1", results=[
             qr(0, OUTCOME_INCORRECT, selected=[0], correct=[1])])
+        first_snapshot_id = self.db.collection("user_mistakes").docs[0]["snapshot_id"]
         # simulate creator editing the quiz text in place
         self.quiz["questions"][0]["question"] = "EDITED QUESTION TEXT"
         await self._complete(attempt_id="a2", results=[
             qr(0, OUTCOME_INCORRECT, selected=[2], correct=[1])])
         row = self.db.collection("user_mistakes").docs[0]
-        self.assertEqual(row["question_snapshot"]["question"], "Q0")
+        # The mistake is frozen to the FIRST-wrong snapshot; an edit creates
+        # a new content hash and never repoints history.
+        self.assertEqual(row["snapshot_id"], first_snapshot_id)
+        snaps = await self.svc.snapshots.get_many([row["snapshot_id"]])
+        self.assertEqual(snaps[row["snapshot_id"]]["question"], "Q0")
         self.assertEqual(row["wrong_count"], 2)
+        # Both contents exist exactly once (edited content got its own row).
+        snap_col = self.db.collection("question_snapshots").docs
+        questions = sorted(s["question"] for s in snap_col)
+        self.assertIn("Q0", questions)
+        self.assertIn("EDITED QUESTION TEXT", questions)
+        resolved = await self.svc.list_mistakes(100)
+        self.assertEqual(resolved[0]["question_snapshot"]["question"], "Q0")
 
     async def test_25_adhoc_quiz_records_events_only(self):
         await self._complete(
@@ -976,7 +1001,14 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                              source="mix", questions=self.quiz["questions"],
                              results=[qr(0, OUTCOME_CORRECT, selected=[1], correct=[1])])
         ev = self.db.collection("question_events").docs
-        self.assertEqual(ev[0]["question_snapshot"]["question"], "Q0")
+        # Even when no quiz document is persisted, the snapshot is stored in
+        # the global content-addressed store and referenced by the event.
+        self.assertNotIn("question_snapshot", ev[0])
+        snaps = await self.svc.snapshots.get_many([ev[0]["snapshot_id"]])
+        self.assertEqual(snaps[ev[0]["snapshot_id"]]["question"], "Q0")
+        # ... and service-level reads resolve it transparently.
+        qs = await self.svc.get_question_performance(100)
+        self.assertEqual(qs[0]["question_snapshot"]["question"], "Q0")
 
     async def test_30_topic_and_question_performance(self):
         await self._complete(attempt_id="a1")
@@ -1039,6 +1071,208 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         trend = await self.svc.get_daily_trend(100, days=30)
         self.assertTrue(trend)
         self.assertTrue(all("day" in d for d in trend))
+
+    # -- MEDIUM-1: content-addressed, bounded snapshot storage -------------
+
+    async def test_40_snapshots_deduped_content_addressed_and_bounded(self):
+        # Same question content seen by two users across two qids must store
+        # each snapshot exactly once, globally.
+        await self._complete(user=100, attempt_id="a1")
+        await self._complete(user=200, attempt_id="a1")
+        await QuizRepository(self.db).create(
+            1, "Copy quiz", self.quiz["questions"],
+            sections=self.quiz["sections"], qid="q2",
+            shuffle_questions=False, shuffle_options=False,
+            negative_marks=0, correct_marks=1)
+        await self._complete(user=100, attempt_id="a2", qid="q2")
+
+        snap_docs = self.db.collection("question_snapshots").docs
+        # Exactly one doc per distinct question content (3 questions), even
+        # though 3 completions x 3 events = 9 events reference them.
+        self.assertEqual(len(snap_docs), 3)
+        ids = {s["snapshot_id"] for s in snap_docs}
+        self.assertTrue(all(len(i) == 64 for i in ids))
+        # Stored shape is the minimal reconstructable snapshot only.
+        for doc in snap_docs:
+            self.assertEqual(
+                set(doc), {"_id", "snapshot_id", "question", "options",
+                           "correct_option_id", "created_at"})
+        # Every event and every mistake row references a snapshot; none embeds.
+        for ev in self.db.collection("question_events").docs:
+            self.assertNotIn("question_snapshot", ev)
+            self.assertIn(ev["snapshot_id"], ids)
+        for row in self.db.collection("user_mistakes").docs:
+            self.assertNotIn("question_snapshot", row)
+            self.assertIn(row["snapshot_id"], ids)
+        # Analytics reads reconstruct text from the shared store.
+        qs = await self.svc.get_question_performance(100)
+        by_text = {q["question_snapshot"]["question"]: q for q in qs}
+        self.assertEqual(set(by_text), {"Q0", "Q1", "Q2"})
+        mistakes = await self.svc.list_mistakes(200)
+        self.assertEqual(mistakes[0]["question_snapshot"]["question"], "Q1")
+        # Re-running the same completion never duplicates snapshot docs.
+        await self._complete(user=100, attempt_id="a1")
+        self.assertEqual(len(self.db.collection("question_snapshots").docs), 3)
+
+    async def test_41_legacy_embedded_snapshots_still_resolve(self):
+        # Rows written before this schema carried the full embedded snapshot.
+        # Reads must keep honouring those without any migration.
+        events = self.db.collection("question_events")
+        legacy_snapshot = {"question": "Legacy Q", "options": ["a", "b"],
+                           "correct_option_id": 1}
+        await events.insert_one({
+            "user_id": 100, "qid": "oldq", "quiz_name": "old",
+            "attempt_id": "leg", "event_id": "leg1", "question_index": 0,
+            "outcome": OUTCOME_INCORRECT, "selected_option": [0],
+            "correct_option": [1], "time_taken": 4,
+            "answered_at": "2026-01-01 10:00:00", "created_at": "2026-01-01 10:00:00",
+            "subject": None, "topic": None, "subtopic": None,
+            "difficulty": None, "topic_source": None,
+            "snapshot_id": None, "question_snapshot": legacy_snapshot,
+            "source": "group", "quiz_persisted": True,
+        })
+        mistakes = self.db.collection("user_mistakes")
+        await mistakes.insert_one({
+            "user_id": 100, "qid": "oldq", "q_index": 0,
+            "wrong_count": 1, "correct_count": 0, "status": "open",
+            "wrong_attempt_ids": ["leg"], "correct_attempt_ids": [],
+            "revision_history": [], "first_wrong_at": "2026-01-01 10:00:00",
+            "last_wrong_at": "2026-01-01 10:00:00", "last_correct_at": None,
+            "created_at": "2026-01-01 10:00:00",
+            "snapshot_id": None, "question_snapshot": legacy_snapshot,
+        })
+        qs = await self.svc.get_question_performance(100)
+        self.assertEqual(qs[0]["question_snapshot"]["question"], "Legacy Q")
+        listed = await self.svc.list_mistakes(100)
+        self.assertEqual(listed[0]["question_snapshot"]["question"], "Legacy Q")
+        # No new snapshot rows are fabricated for legacy embedded rows.
+        self.assertEqual(self.db.collection("question_snapshots").docs, [])
+
+    # -- MEDIUM-2: identity-aware topic aggregation ------------------------
+
+    async def _topic_quiz(self, qid, questions, sections=None):
+        await QuizRepository(self.db).create(
+            1, qid, questions, sections=sections or [], qid=qid,
+            shuffle_questions=False, shuffle_options=False,
+            negative_marks=0, correct_marks=1)
+
+    async def test_42_topic_identity_cross_subject_and_quiz_scoping(self):
+        def meta_q(text, subject, topic):
+            return {"question": text, "options": ["a", "b"],
+                    "correct_option_id": 1,
+                    "analytics": {"subject": subject, "topic": topic}}
+
+        def section_q(text):
+            return {"question": text, "options": ["a", "b"],
+                    "correct_option_id": 1}
+
+        # Explicit metadata: same subject+topic pools ACROSS quizzes.
+        await self._topic_quiz("polA", [meta_q("p1", "Polity", "Common")])
+        await self._topic_quiz("polB", [meta_q("p2", "Polity", "Common")])
+        # Same raw topic label under a different subject must NOT pool.
+        await self._topic_quiz("hisA", [meta_q("h1", "History", "Common")])
+        # Section-derived generic labels are quiz-scoped and must NOT pool,
+        # even when the name is identical ("Basics").
+        await self._topic_quiz(
+            "secA", [section_q("s1")],
+            sections=[{"name": "Basics", "question_range": [1, 1]}])
+        await self._topic_quiz(
+            "secB", [section_q("s2")],
+            sections=[{"name": "Basics", "question_range": [1, 1]}])
+
+        wrong = [qr(0, OUTCOME_INCORRECT, selected=[0], correct=[1])]
+        for qid in ("polA", "polB", "hisA", "secA", "secB"):
+            quiz = await QuizRepository(self.db).get(qid)
+            await self._complete(
+                attempt_id=f"att-{qid}", qid=qid, results=wrong,
+                questions=quiz["questions"], sections=quiz.get("sections"))
+
+        rows = await self.svc.get_topic_performance(100)
+        explicit_polity = [r for r in rows if (r["subject"], r["topic"]) == ("Polity", "Common")]
+        explicit_history = [r for r in rows if (r["subject"], r["topic"]) == ("History", "Common")]
+        section_rows = [r for r in rows if r["topic_source"] == "section"]
+
+        self.assertEqual(len(explicit_polity), 1)  # pooled across two qids
+        self.assertEqual(explicit_polity[0]["answered"], 2)
+        self.assertIsNone(explicit_polity[0]["qid"])  # explicit buckets span qids
+        self.assertEqual(len(explicit_history), 1)  # distinct subject bucket
+        self.assertEqual(explicit_history[0]["answered"], 1)
+        self.assertEqual(len(section_rows), 2)  # identical names, distinct qids
+        self.assertEqual({r["qid"] for r in section_rows}, {"secA", "secB"})
+        self.assertTrue(all(r["subject"] is None for r in section_rows))
+        # Raw labels are preserved verbatim; no synonym renaming happened.
+        self.assertEqual({r["topic"] for r in rows}, {"Common", "Basics"})
+
+    # -- MEDIUM-3: bounded bulk mistake persistence ------------------------
+
+    async def test_43_bulk_mistakes_parity_lifecycle_and_isolation(self):
+        n = 1200  # > 2 bulk chunks (chunk size 500)
+        questions = [
+            {"question": f"Q{i}", "options": ["a", "b"],
+             "correct_option_id": 1} for i in range(n)]
+        await QuizRepository(self.db).create(
+            1, "Big", questions, qid="big", shuffle_questions=False,
+            shuffle_options=False, negative_marks=0, correct_marks=1)
+        all_wrong = [qr(i, OUTCOME_INCORRECT, selected=[0], correct=[1])
+                     for i in range(n)]
+        # An interleaved skipped result never creates a mistake row.
+        results_b1 = sorted(
+            all_wrong + [qr(n, OUTCOME_SKIPPED)],
+            key=lambda r: (r["q_index"], 0 if r["outcome"] == OUTCOME_SKIPPED else 1))
+
+        await self._complete(attempt_id="b1", qid="big", results=results_b1,
+                             questions=questions, sections=[])
+        rows = [d for d in self.db.collection("user_mistakes").docs
+                if d["user_id"] == 100]
+        self.assertEqual(len(rows), n)
+        self.assertTrue(all(r["wrong_count"] == 1 for r in rows))
+        self.assertTrue(all(len(r["revision_history"]) == 1 for r in rows))
+
+        # Second attempt: first 100 now correct, rest wrong again.
+        results_b2 = [
+            qr(i, OUTCOME_CORRECT, selected=[1], correct=[1])
+            for i in range(100)]
+        results_b2 += [
+            qr(i, OUTCOME_INCORRECT, selected=[0], correct=[1])
+            for i in range(100, n)]
+        await self._complete(attempt_id="b2", qid="big", results=results_b2,
+                             questions=questions, sections=[])
+        rows = {r["q_index"]: r for r in
+                (d for d in self.db.collection("user_mistakes").docs
+                 if d["user_id"] == 100)}
+        self.assertEqual(len(rows), n)  # correct answers never create rows
+        for i in range(100):
+            self.assertEqual(rows[i]["status"], "resolved")
+            self.assertEqual(rows[i]["wrong_count"], 1)
+            self.assertEqual(rows[i]["correct_count"], 1)
+            self.assertIsNotNone(rows[i]["last_correct_at"])
+            self.assertEqual(len(rows[i]["revision_history"]), 2)
+        for i in range(100, n):
+            self.assertEqual(rows[i]["status"], "open")
+            self.assertEqual(rows[i]["wrong_count"], 2)
+            self.assertEqual(rows[i]["wrong_attempt_ids"], ["b1", "b2"])
+
+        # A correct-only attempt for a fresh user never materialises rows.
+        await self._complete(user=300, attempt_id="c1", qid="big",
+                             results=[qr(0, OUTCOME_CORRECT, selected=[1],
+                                         correct=[1])],
+                             questions=questions, sections=[])
+        self.assertEqual(
+            await self.db.collection("user_mistakes").count_documents(
+                {"user_id": 300}), 0)
+
+        # User isolation: another user answering the same questions has its
+        # own rows, and user 100's counts are untouched.
+        await self._complete(user=200, attempt_id="u1", qid="big",
+                             results=all_wrong, questions=questions,
+                             sections=[])
+        rows200 = [d for d in self.db.collection("user_mistakes").docs
+                   if d["user_id"] == 200]
+        self.assertEqual(len(rows200), n)
+        self.assertTrue(all(r["wrong_count"] == 1 for r in rows200))
+        totals100 = await self.svc.get_mistake_totals(100)
+        self.assertEqual(totals100["total"], n)
+        self.assertEqual(totals100["open"], n - 100)
 
 
 class RepositoryShimTests(unittest.IsolatedAsyncioTestCase):
@@ -1146,6 +1380,90 @@ class BackfillTests(unittest.IsolatedAsyncioTestCase):
         # original completion fields untouched
         self.assertEqual(marker["status"], "completed")
         self.assertEqual(marker["score"], 1)
+        # Recovered events carry resolvable content-addressed snapshots
+        # (MEDIUM-1 holds for history, not only live completions).
+        for ev in events:
+            self.assertTrue(ev["snapshot_id"])
+            self.assertNotIn("question_snapshot", ev)
+        snap_ids = {s["snapshot_id"] for s in db.collection("question_snapshots").docs}
+        self.assertTrue(all(ev["snapshot_id"] in snap_ids for ev in events))
+
+    async def test_45_backfill_quiz_cache_is_bounded_lru(self):
+        from quizbot.database.backfill import (
+            _BoundedQuizCache, _QUIZ_PROJECTION, backfill_once)
+        db = FakeDB()
+        # Unit-level: the cache never exceeds maxsize no matter how many
+        # distinct quizzes are touched, evicts least-recently-used, and keeps
+        # negative lookups so a deleted quiz is only queried once.
+        await QuizRepository(db).create(
+            1, "Q0", make_quiz()["questions"], qid="q0",
+            shuffle_questions=False, shuffle_options=False)
+        # Spy on the quiz collection: the cache must project out everything
+        # but reconstruction fields (the fake itself ignores projections).
+        col = db.collection("quizzes")
+        original_find_one = col.find_one
+        projections_seen = []
+
+        async def spy_find_one(filt=None, **kwargs):
+            projections_seen.append(kwargs.get("projection"))
+            return await original_find_one(filt, **kwargs)
+
+        col.find_one = spy_find_one
+        cache = _BoundedQuizCache(db, maxsize=4)
+        self.assertEqual(cache.maxsize, 4)
+        for i in range(10):
+            await cache.get(f"missing-{i}")  # all cached as None
+        await cache.get("q0")
+        self.assertEqual(len(cache), 4)
+        self.assertLessEqual(len(cache), cache.maxsize)
+        self.assertEqual(cache.misses, 11)  # one query per distinct qid
+        self.assertTrue(all(p == _QUIZ_PROJECTION for p in projections_seen))
+        # Only reconstruction fields are ever requested.
+        self.assertEqual(
+            set(_QUIZ_PROJECTION),
+            {"_id", "questions", "sections",
+             "shuffle_questions", "shuffle_options"})
+        self.assertEqual((await cache.get("q0"))["qid"], "q0")
+        self.assertEqual(cache.misses, 11)  # served from cache, no extra query
+        # LRU: oldest lookups evicted, the fresh one retained and recency-updated.
+        self.assertNotIn("missing-0", cache._data)
+        self.assertIn("q0", cache._data)
+        self.assertEqual(next(reversed(cache._data)), "q0")
+        # Deleted quiz cached negatively: a second lookup does not hit Mongo.
+        self.assertIsNone(await cache.get("missing-0"))
+        # ...still 11 distinct queries (missing-0 was evicted -> refetch 12)
+        self.assertEqual(cache.misses, 12)
+        self.assertIsNone(await cache.get("missing-9"))
+        self.assertEqual(cache.misses, 12)  # missing-9 still cached negatively
+        with self.assertRaises(ValueError):
+            _BoundedQuizCache(db, maxsize=0)
+
+        # Integration-level: a library larger than the cache still backfills
+        # completely while the cache stays bounded for the whole pass.
+        db2 = FakeDB()
+        n_quizzes = 40
+        for i in range(n_quizzes):
+            await QuizRepository(db2).create(
+                1, f"Q{i}", make_quiz()["questions"], qid=f"lib{i}",
+                shuffle_questions=False, shuffle_options=False)
+        attempts = db2.collection("quiz_attempts")
+        for i in range(n_quizzes):
+            await attempts.insert_one({
+                "attempt_id": f"a{i}", "user_id": 100 + i, "qid": f"lib{i}",
+                "quiz_name": f"Q{i}", "answers": {"q0": [1], "q1": [1]},
+                "score": 1, "total_questions": 3, "correct": 1, "wrong": 1,
+                "total_time": 12, "time_started": "2026-02-01 09:00:00",
+                "time_ended": "2026-02-01 10:00:00", "status": "completed",
+            })
+        result = await backfill_once(dry_run=False, db=db2,
+                                     batch=10, quiz_cache_maxsize=4)
+        self.assertEqual(result["summary"].get("backfilled"), n_quizzes)
+        self.assertEqual(result["quiz_cache_size"] <= 4, True)
+        self.assertEqual(result["quiz_cache_maxsize"], 4)
+        # Every distinct quiz was fetched at least once but RAM stayed at 4.
+        self.assertEqual(result["quiz_cache_misses"], n_quizzes)
+        events = db2.collection("question_events").docs
+        self.assertEqual(len(events), n_quizzes * 2)
 
 
 class IndexBootstrapTests(unittest.IsolatedAsyncioTestCase):
@@ -1165,6 +1483,9 @@ class IndexBootstrapTests(unittest.IsolatedAsyncioTestCase):
         mistakes = d._db.collection("user_mistakes")  # type: ignore[union-attr]
         flat = [list(k) for (k, *_rest) in mistakes.indexes]
         self.assertIn([("user_id", 1), ("status", 1), ("last_wrong_at", -1)], flat)
+        snapshots = d._db.collection("question_snapshots")  # type: ignore[union-attr]
+        snap_unique = [k for (k, unique, *_r) in snapshots.indexes if unique]
+        self.assertIn("snapshot_id", snap_unique)
         attempts = d._db.collection("quiz_attempts")  # type: ignore[union-attr]
         flat_a = [list(k) for (k, *_rest) in attempts.indexes]
         self.assertIn([("user_id", 1), ("status", 1), ("time_ended", -1)], flat_a)

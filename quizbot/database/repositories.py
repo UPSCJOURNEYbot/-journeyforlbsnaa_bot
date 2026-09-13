@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from pymongo import ReturnDocument
+from pymongo import ReturnDocument, UpdateOne
 
 from quizbot.analytics.metadata import (
     OUTCOME_CORRECT,
@@ -890,9 +890,11 @@ class MistakeRepository:
                                 again after resolution re-opens the row
                                 ("repeated mistake") without losing history.
     * ``first_wrong_at`` / ``last_wrong_at`` / ``last_correct_at``.
-    * ``question_snapshot``  -- minimal identity snapshot captured at first
+    * ``snapshot_id``        -- content-hash reference into
+                                ``question_snapshots`` captured at first
                                 wrong so later quiz edits cannot repoint the
-                                mistake at a different question.
+                                mistake at a different question (the snapshot
+                                text itself is stored once, not per row).
     * ``wrong_attempt_ids`` / ``correct_attempt_ids`` -- idempotency guards:
                                 replaying the same attempt never double-counts.
     * ``revision_history``   -- bounded append-only timeline.
@@ -921,6 +923,25 @@ class MistakeRepository:
             entry["selected_option"] = list(selected)
         return entry
 
+    #: Bound each bulk request so a very large quiz ending cannot produce an
+    #: oversized Mongo command (1 CPU / 2 GB VPS); total round trips stay
+    #: O(ceil(questions / chunk)) rather than O(questions).
+    _BULK_CHUNK = 500
+
+    async def _bulk_write_chunked(self, ops: list) -> None:
+        for start in range(0, len(ops), self._BULK_CHUNK):
+            await self.col.bulk_write(ops[start:start + self._BULK_CHUNK], ordered=False)
+
+    async def _fetch_existing(
+        self, user_id: int, qid: str, q_indices: set[int]
+    ) -> dict[int, dict]:
+        if not q_indices:
+            return {}
+        cursor = self.col.find(
+            {"user_id": user_id, "qid": qid, "q_index": {"$in": list(q_indices)}}
+        )
+        return {int(row["q_index"]): row async for row in cursor}
+
     async def apply_attempt(
         self,
         user_id: int,
@@ -931,14 +952,20 @@ class MistakeRepository:
         at: Optional[str] = None,
     ) -> int:
         """Fold canonical question events for one completed attempt into the
-        user's mistake history.
+        user's mistake history using a fixed, bounded number of bulk round
+        trips (ensure rows -> re-fetch -> apply increments) instead of one
+        round trip per question.
 
-        Idempotent per ``attempt_id`` (the attempt-id arrays make a replayed
-        completion a no-op) and fully non-destructive (rows are never
-        deleted). Returns the number of mistake rows touched.
+        Semantics are unchanged from the sequential version: idempotent per
+        ``attempt_id`` (the attempt-id arrays make a replayed completion a
+        no-op), fully non-destructive (rows are never deleted), wrong answers
+        (re-)open a row, later correct answers resolve it, and a wrong after
+        resolution re-opens it. Returns the number of mistake rows touched.
         """
         at = at or _now_iso()
-        touched = 0
+        wrong_events: list[dict] = []
+        correct_events: list[dict] = []
+        q_indices: set[int] = set()
         for ev in events:
             outcome = ev.get("outcome")
             if outcome not in (OUTCOME_CORRECT, OUTCOME_INCORRECT):
@@ -947,90 +974,128 @@ class MistakeRepository:
                 q_index = int(ev["question_index"])
             except (KeyError, TypeError, ValueError):
                 continue
-            base_filter = {"user_id": user_id, "qid": qid, "q_index": q_index}
-            existing = await self.col.find_one(base_filter)
+            q_indices.add(q_index)
+            (wrong_events if outcome == OUTCOME_INCORRECT else correct_events).append(ev)
+        if not wrong_events and not correct_events:
+            return 0
 
-            metadata = {
+        def _metadata(ev: dict) -> dict:
+            return {
                 "subject": ev.get("subject"),
                 "topic": ev.get("topic"),
                 "subtopic": ev.get("subtopic"),
                 "difficulty": ev.get("difficulty"),
                 "topic_source": ev.get("topic_source"),
+                "snapshot_id": ev.get("snapshot_id"),
             }
 
-            if outcome == OUTCOME_INCORRECT:
-                entry = self._history_entry(
-                    attempt_id, OUTCOME_INCORRECT, at, ev.get("selected_option"))
-                if existing is None:
-                    doc = {
-                        "user_id": user_id,
-                        "qid": qid,
-                        "q_index": q_index,
-                        "wrong_count": 1,
-                        "correct_count": 0,
-                        "status": self.STATUS_OPEN,
-                        "first_wrong_at": at,
-                        "last_wrong_at": at,
-                        "last_correct_at": None,
-                        "resolved_at": None,
-                        "created_at": at,
-                        "updated_at": at,
-                        "first_seen_attempt_id": attempt_id,
-                        **metadata,
-                        "question_snapshot": ev.get("question_snapshot"),
-                        "wrong_attempt_ids": [attempt_id] if attempt_id else [],
-                        "correct_attempt_ids": [],
-                        "revision_history": [entry],
-                    }
-                    await self.col.insert_one(doc)
-                    touched += 1
-                    continue
+        # Phase 1 -- ensure a row exists for every freshly-wrong question
+        # (idempotent $setOnInsert upsert in one bulk call). Rows that already
+        # exist (e.g. a repeated mistake) are matched, not duplicated.
+        existing = await self._fetch_existing(user_id, qid, q_indices)
+        ensure_ops: list[UpdateOne] = []
+        for ev in wrong_events:
+            q_index = int(ev["question_index"])
+            if q_index in existing:
+                continue
+            # The wrong-count increment and the first revision-history entry
+            # are both applied by the uniform phase-3 update below.
+            ensure_ops.append(UpdateOne(
+                {"user_id": user_id, "qid": qid, "q_index": q_index},
+                {"$setOnInsert": {
+                    "user_id": user_id,
+                    "qid": qid,
+                    "q_index": q_index,
+                    # Counts/history are applied by the uniform phase-3
+                    # update below, including for the just-inserted row.
+                    "wrong_count": 0,
+                    "correct_count": 0,
+                    "status": self.STATUS_OPEN,
+                    "first_wrong_at": at,
+                    "last_wrong_at": None,
+                    "last_correct_at": None,
+                    "resolved_at": None,
+                    "created_at": at,
+                    "updated_at": at,
+                    "first_seen_attempt_id": attempt_id,
+                    **_metadata(ev),
+                    "wrong_attempt_ids": [],
+                    "correct_attempt_ids": [],
+                    "revision_history": [],
+                    # The phase-1 entry is pushed in phase 3, once.
+                }},
+                upsert=True,
+            ))
+        await self._bulk_write_chunked(ensure_ops)
 
-                if attempt_id and attempt_id in existing.get("wrong_attempt_ids", []):
-                    continue  # this attempt already counted -- replay no-op
-                update: dict[str, Any] = {
-                    "$inc": {"wrong_count": 1},
-                    # A fresh wrong answer (re-)opens the row, including a
-                    # previously resolved one ("repeated").
-                    "$set": {"status": self.STATUS_OPEN, "last_wrong_at": at,
-                             "updated_at": at},
-                    "$push": {"revision_history": {"$each": [entry],
-                                                   "$slice": -self.HISTORY_LIMIT}},
-                }
-                if attempt_id:
-                    update["$addToSet"] = {"wrong_attempt_ids": attempt_id}
-                # Backfill any metadata/snapshot that the first (possibly
-                # legacy) row didn't capture; never overwrite what exists.
-                for key, value in metadata.items():
-                    if value is not None and existing.get(key) is None:
-                        update["$set"][key] = value
-                if ev.get("question_snapshot") and not existing.get("question_snapshot"):
-                    update["$set"]["question_snapshot"] = ev["question_snapshot"]
-                await self.col.update_one({"_id": existing["_id"]}, update)
-                touched += 1
+        # Phase 2 -- re-fetch so freshly-created rows are visible; one query.
+        existing = await self._fetch_existing(user_id, qid, q_indices)
 
-            else:  # OUTCOME_CORRECT -- only updates an existing mistake row;
-                   # a never-wrong question creates no row.
-                if existing is None:
-                    continue
-                if attempt_id and attempt_id in existing.get("correct_attempt_ids", []):
-                    continue  # replay no-op
-                entry = self._history_entry(
-                    attempt_id, OUTCOME_CORRECT, at, ev.get("selected_option"))
-                await self.col.update_one(
-                    {"_id": existing["_id"]},
-                    {
-                        "$inc": {"correct_count": 1},
-                        "$set": {"status": self.STATUS_RESOLVED,
-                                 "last_correct_at": at, "updated_at": at},
-                        "$push": {"revision_history": {"$each": [entry],
-                                                       "$slice": -self.HISTORY_LIMIT}},
-                        **({"$addToSet": {"correct_attempt_ids": attempt_id}}
-                           if attempt_id else {}),
-                    },
-                )
-                touched += 1
-        return touched
+        # Phase 3 -- apply the per-attempt increment/history/guard updates.
+        ops: list[UpdateOne] = []
+        for ev in wrong_events:
+            q_index = int(ev["question_index"])
+            row = existing.get(q_index)
+            if row is None:
+                continue  # defensive: phase 1 should have created it
+            if attempt_id and attempt_id in row.get("wrong_attempt_ids", []):
+                continue  # this attempt already counted -- replay no-op
+            entry = self._history_entry(
+                attempt_id, OUTCOME_INCORRECT, at, ev.get("selected_option"))
+            sets: dict[str, Any] = {
+                # A fresh wrong answer (re-)opens the row, including a
+                # previously resolved one ("repeated").
+                "status": self.STATUS_OPEN,
+                "last_wrong_at": at,
+                "updated_at": at,
+            }
+            # Backfill metadata/snapshot a legacy first row didn't capture;
+            # never overwrite what already exists.
+            for key, value in _metadata(ev).items():
+                if value is not None and row.get(key) is None:
+                    sets[key] = value
+            update: dict[str, Any] = {
+                "$inc": {"wrong_count": 1},
+                "$set": sets,
+                "$push": {"revision_history": {"$each": [entry],
+                                               "$slice": -self.HISTORY_LIMIT}},
+            }
+            filt: dict[str, Any] = {"_id": row["_id"]}
+            if attempt_id:
+                # Server-side guard closes the check-then-act window: if a
+                # concurrent pass already counted this attempt, this update
+                # matches nothing.
+                filt["wrong_attempt_ids"] = {"$ne": attempt_id}
+                update["$addToSet"] = {"wrong_attempt_ids": attempt_id}
+            ops.append(UpdateOne(filt, update))
+
+        for ev in correct_events:
+            q_index = int(ev["question_index"])
+            row = existing.get(q_index)
+            if row is None:
+                continue  # a never-wrong question creates no mistake row
+            if attempt_id and attempt_id in row.get("correct_attempt_ids", []):
+                continue  # replay no-op
+            entry = self._history_entry(
+                attempt_id, OUTCOME_CORRECT, at, ev.get("selected_option"))
+            update = {
+                "$inc": {"correct_count": 1},
+                "$set": {"status": self.STATUS_RESOLVED,
+                         "last_correct_at": at, "updated_at": at},
+                "$push": {"revision_history": {"$each": [entry],
+                                               "$slice": -self.HISTORY_LIMIT}},
+            }
+            filt = {"_id": row["_id"]}
+            if attempt_id:
+                filt["correct_attempt_ids"] = {"$ne": attempt_id}
+                update["$addToSet"] = {"correct_attempt_ids": attempt_id}
+            ops.append(UpdateOne(filt, update))
+
+        await self._bulk_write_chunked(ops)
+        # Rows touched = rows receiving a phase-3 counting update. Every
+        # phase-1 ensured row is among them (its first wrong count), so this
+        # matches the sequential version's per-row "touched" accounting.
+        return len(ops)
 
     async def record(self, user_id: int, items: list[dict]) -> None:
         """Backward-compatible shim for the old ``record`` signature used by
@@ -1051,7 +1116,7 @@ class MistakeRepository:
                     "question_index": item["index"],
                     "outcome": OUTCOME_INCORRECT,
                     "selected_option": [],
-                    "question_snapshot": None,
+                    "snapshot_id": None,
                 }
                 for item in qitems
             ]

@@ -95,6 +95,11 @@ class Database:
             [("user_id", 1), ("status", 1), ("last_wrong_at", -1)]
         )
 
+        # Phase B content-addressed question snapshots: question text is
+        # stored once per distinct content (sha256) instead of on every
+        # event/mistake row. Idempotent on every startup.
+        await db.question_snapshots.create_index("snapshot_id", unique=True)
+
         # Phase B canonical question events. The unique composite is the
         # idempotency key: (user, attempt, question) is written at most once.
         await db.question_events.create_index(

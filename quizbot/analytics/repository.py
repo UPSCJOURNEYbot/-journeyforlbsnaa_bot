@@ -12,19 +12,103 @@ layer, not this repository.
 from __future__ import annotations
 
 import uuid
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Any, Iterable, Optional
 
 from pymongo import UpdateOne
 
-from .metadata import OUTCOME_CORRECT, OUTCOME_INCORRECT, OUTCOME_SKIPPED
+from .metadata import (
+    OUTCOME_CORRECT,
+    OUTCOME_INCORRECT,
+    OUTCOME_SKIPPED,
+    snapshot_content_hash,
+)
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 _EVENT_NAMESPACE = uuid.UUID("4f9f5b23-7c44-4b6a-8e9d-2f6c1a7d3011")  # fixed, arbitrary
 _FIELDS_ON_INSERT = (
     "qid", "quiz_name", "source", "quiz_persisted", "subject", "topic",
     "subtopic", "difficulty", "topic_source", "selected_option",
     "correct_option", "outcome", "time_taken", "answered_at",
-    "question_snapshot",
+    "snapshot_id",
 )
+
+
+class QuestionSnapshotRepository:
+    """Content-addressed minimal question snapshots.
+
+    Snapshot text is stored EXACTLY ONCE per distinct question content
+    (sha256 over question text + options + correct answer), instead of being
+    copied onto every question_event / user_mistakes row. Events and mistake
+    rows reference it by ``snapshot_id``. The collection is append-only and
+    never garbage-collected, so a snapshot stays resolvable after a quiz is
+    edited in place (the new content gets a new hash) or deleted entirely.
+    """
+
+    def __init__(self, db=None) -> None:
+        if db is None:
+            from quizbot.database.db import get_db
+            db = get_db()
+        self.db = db
+        self.col = db.collection("question_snapshots")
+
+    @staticmethod
+    def hash_for(snapshot: Optional[dict]) -> Optional[str]:
+        return snapshot_content_hash(snapshot)
+
+    async def ensure(self, snapshots: Iterable[dict], at: Optional[str] = None) -> dict[str, dict]:
+        """Idempotently store the given snapshot contents. Returns a
+        ``{snapshot_id: snapshot_doc}`` map for every distinct content."""
+        by_hash: dict[str, dict] = {}
+        for snapshot in snapshots or []:
+            sid = snapshot_content_hash(snapshot)
+            if sid and sid not in by_hash:
+                by_hash[sid] = {
+                    "snapshot_id": sid,
+                    "question": snapshot["question"],
+                    "options": list(snapshot["options"]),
+                    "correct_option_id": snapshot["correct_option_id"],
+                    "created_at": at or _iso_now(),
+                }
+        if by_hash:
+            ops = [
+                UpdateOne(
+                    {"snapshot_id": sid},
+                    {"$setOnInsert": doc},
+                    upsert=True,
+                )
+                for sid, doc in by_hash.items()
+            ]
+            # One bounded bulk round trip per completion; identical content
+            # within the batch was already de-duplicated above.
+            for start in range(0, len(ops), 500):
+                await self.col.bulk_write(ops[start:start + 500], ordered=False)
+        return {
+            sid: {
+                "question": doc["question"],
+                "options": doc["options"],
+                "correct_option_id": doc["correct_option_id"],
+            }
+            for sid, doc in by_hash.items()
+        }
+
+    async def get_many(self, snapshot_ids: Iterable[str]) -> dict[str, dict]:
+        """Resolve snapshot ids to their minimal content in ONE query."""
+        ids = [sid for sid in dict.fromkeys(snapshot_ids) if sid]
+        if not ids:
+            return {}
+        out: dict[str, dict] = {}
+        cursor = self.col.find({"snapshot_id": {"$in": ids}})
+        async for row in cursor:
+            out[row["snapshot_id"]] = {
+                "question": row.get("question", ""),
+                "options": row.get("options", []),
+                "correct_option_id": row.get("correct_option_id"),
+            }
+        return out
 
 
 def event_id_for(user_id: int, attempt_id: str, question_index: int) -> str:
@@ -160,8 +244,21 @@ class QuestionEventRepository:
         }
 
     async def get_topic_performance(self, user_id: int) -> list[dict]:
-        """Per exact (subject, topic, topic_source) rollup. Labels are never
-        synonym-merged."""
+        """Per-topic rollup with identity-aware grouping.
+
+        Labels are never synonym-merged. Identity rules (no taxonomy is
+        assumed; raw labels are preserved):
+
+        * explicit question metadata (``topic_source="question"``) aggregates
+          by exact ``(subject, topic)`` ACROSS quizzes -- same subject + same
+          topic is intentionally pooled, different subjects (including one
+          known and one unknown) stay in distinct buckets;
+        * section-derived topics (``topic_source="section"``) are free-text
+          names scoped to one quiz, so identical generic names like
+          "Section 1"/"Basics"/"Mixed" in different quizzes must not pool:
+          the group key additionally includes ``qid`` for those rows.
+        """
+        section_source = "section"
         pipeline = [
             {"$match": {"user_id": user_id, "topic": {"$ne": None}}},
             {"$group": {
@@ -169,6 +266,14 @@ class QuestionEventRepository:
                     "subject": "$subject",
                     "topic": "$topic",
                     "topic_source": "$topic_source",
+                    # Section names are only meaningful within their quiz;
+                    # explicit metadata topics span quizzes (scope qid=null).
+                    "scope_qid": {
+                        "$cond": [
+                            {"$eq": ["$topic_source", section_source]},
+                            "$qid", None,
+                        ]
+                    },
                 },
                 "correct": {"$sum": {"$cond": [{"$eq": ["$outcome", OUTCOME_CORRECT]}, 1, 0]}},
                 "incorrect": {"$sum": {"$cond": [{"$eq": ["$outcome", OUTCOME_INCORRECT]}, 1, 0]}},
@@ -189,6 +294,9 @@ class QuestionEventRepository:
                 "subject": key.get("subject"),
                 "topic": key.get("topic"),
                 "topic_source": key.get("topic_source"),
+                # Set only for quiz-scoped (section-derived) buckets; this is
+                # the scope discriminator, never used to merge labels.
+                "qid": key.get("scope_qid"),
                 "correct": row.get("correct", 0),
                 "incorrect": row.get("incorrect", 0),
                 "skipped": row.get("skipped", 0),
@@ -219,7 +327,11 @@ class QuestionEventRepository:
                 "topic": {"$last": "$topic"},
                 "subtopic": {"$last": "$subtopic"},
                 "difficulty": {"$last": "$difficulty"},
-                "snapshot": {"$last": "$question_snapshot"},
+                "snapshot_id": {"$last": "$snapshot_id"},
+                # Rows written before the content-addressed store existed
+                # carried an embedded snapshot; keep carrying it through so
+                # legacy history stays readable without a migration.
+                "legacy_snapshot": {"$last": "$question_snapshot"},
                 "last_answered_at": {"$max": "$answered_at"},
             }},
             {"$sort": {"incorrect": -1, "times_seen": -1}},
@@ -228,7 +340,7 @@ class QuestionEventRepository:
         out: list[dict] = []
         async for row in self.col.aggregate(pipeline):
             key = row.get("_id", {})
-            out.append({
+            item = {
                 "qid": key.get("qid"),
                 "question_index": key.get("question_index"),
                 "times_seen": row.get("times_seen", 0),
@@ -240,7 +352,12 @@ class QuestionEventRepository:
                 "topic": row.get("topic"),
                 "subtopic": row.get("subtopic"),
                 "difficulty": row.get("difficulty"),
-                "question_snapshot": row.get("snapshot"),
+                "snapshot_id": row.get("snapshot_id"),
                 "last_answered_at": row.get("last_answered_at"),
-            })
+            }
+            # Only surface the legacy embedded snapshot when it exists;
+            # referenced snapshots are resolved by the service layer.
+            if row.get("legacy_snapshot"):
+                item["question_snapshot"] = row["legacy_snapshot"]
+            out.append(item)
         return out

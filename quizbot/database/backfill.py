@@ -51,12 +51,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import re
+from collections import OrderedDict
 from typing import Any, Optional
 
 from quizbot.analytics.metadata import OUTCOME_CORRECT, OUTCOME_INCORRECT
 from quizbot.analytics.service import AnalyticsService
 from quizbot.database.db import close_db, get_db, init_db
-from quizbot.database.repositories import QuizRepository, _now_iso
+from quizbot.database.repositories import _now_iso
 from quizbot.runner_bot.quiz_utils import is_correct
 from quizbot.shared import config
 
@@ -71,6 +72,47 @@ STATUS_SHUFFLE = "unrecoverable_shuffle"
 STATUS_DM = "unrecoverable_dm"
 STATUS_EDITED = "unrecoverable_edited"
 UNRECOVERABLE = {STATUS_DELETED, STATUS_SHUFFLE, STATUS_DM, STATUS_EDITED}
+
+# Only the fields reconstruction needs -- never the whole quiz library.
+_QUIZ_PROJECTION = {
+    "_id": 0, "questions": 1, "sections": 1,
+    "shuffle_questions": 1, "shuffle_options": 1,
+}
+
+
+class _BoundedQuizCache:
+    """LRU cache of the (projected) quiz documents needed by one backfill
+    pass. Capacity is fixed, so total quiz-document memory stays bounded
+    regardless of the size of the quiz library; missing quizzes are cached
+    as ``None`` so a deleted quiz is looked up at most once per run.
+    """
+
+    def __init__(self, db: Any, maxsize: int = 32) -> None:
+        if maxsize < 1:
+            raise ValueError("cache maxsize must be >= 1")
+        self._col = db.collection("quizzes")
+        self._data: "OrderedDict[str, Optional[dict]]" = OrderedDict()
+        self._maxsize = maxsize
+        self.misses = 0
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    @property
+    def maxsize(self) -> int:
+        return self._maxsize
+
+    async def get(self, qid: str) -> Optional[dict]:
+        if qid in self._data:
+            self._data.move_to_end(qid)
+            return self._data[qid]
+        self.misses += 1
+        doc = await self._col.find_one({"qid": qid}, projection=_QUIZ_PROJECTION)
+        self._data[qid] = doc
+        self._data.move_to_end(qid)
+        while len(self._data) > self._maxsize:
+            self._data.popitem(last=False)  # evict least recently used
+        return doc
 
 
 def legacy_question_results(quiz: dict, attempt: dict) -> tuple[Optional[list[dict]], Optional[str]]:
@@ -113,10 +155,10 @@ def legacy_question_results(quiz: dict, attempt: dict) -> tuple[Optional[list[di
 
 
 async def backfill_once(*, dry_run: bool = False, limit: Optional[int] = None,
-                        batch: int = 200, db: Any = None) -> dict:
+                        batch: int = 200, db: Any = None,
+                        quiz_cache_maxsize: int = 32) -> dict:
     db = db or get_db()
     attempts_col = db.collection("quiz_attempts")
-    quiz_repo = QuizRepository(db)
     analytics = AnalyticsService(db)
 
     query = {"status": "completed", "analytics_backfill": {"$exists": False}}
@@ -125,7 +167,9 @@ async def backfill_once(*, dry_run: bool = False, limit: Optional[int] = None,
         cursor = cursor.limit(limit)
 
     summary: dict[str, int] = {}
-    quiz_cache: dict[str, Optional[dict]] = {}
+    # Bounded LRU of PROJECTED quiz documents only; a library with millions
+    # of quizzes cannot inflate this pass's memory on the 2 GB VPS.
+    quiz_cache = _BoundedQuizCache(db, maxsize=quiz_cache_maxsize)
 
     def tally(status: str) -> None:
         summary[status] = summary.get(status, 0) + 1
@@ -141,9 +185,7 @@ async def backfill_once(*, dry_run: bool = False, limit: Optional[int] = None,
         if isinstance(attempt.get("question_results"), list):
             status, reason, events_n = STATUS_CANONICAL, None, 0
         else:
-            if qid not in quiz_cache:
-                quiz_cache[qid] = await quiz_repo.get(qid)
-            quiz = quiz_cache[qid]
+            quiz = await quiz_cache.get(qid)
             if quiz is None:
                 status, reason, events_n = STATUS_DELETED, "quiz document missing", 0
             elif not (attempt.get("answers") or {}):
@@ -198,7 +240,14 @@ async def backfill_once(*, dry_run: bool = False, limit: Optional[int] = None,
             # Cooperative pause; safe to interrupt and resume later.
             await asyncio.sleep(0)
 
-    return {"processed": processed, "summary": summary, "dry_run": dry_run}
+    return {
+        "processed": processed,
+        "summary": summary,
+        "dry_run": dry_run,
+        "quiz_cache_misses": quiz_cache.misses,
+        "quiz_cache_size": len(quiz_cache),
+        "quiz_cache_maxsize": quiz_cache.maxsize,
+    }
 
 
 async def _main(dry_run: bool, limit: Optional[int], batch: int) -> None:
@@ -216,6 +265,13 @@ async def _main(dry_run: bool, limit: Optional[int], batch: int) -> None:
         n for s, n in result["summary"].items() if s in UNRECOVERABLE
     )
     print(f"unrecoverable total: {unrecoverable}")
+    # Bounded-memory proof for operators: resident cache size can never
+    # exceed maxsize, no matter how large the quiz library.
+    print(
+        "quiz cache: "
+        f"{result['quiz_cache_size']}/{result['quiz_cache_maxsize']} resident, "
+        f"{result['quiz_cache_misses']} distinct quizzes fetched"
+    )
     if result["dry_run"]:
         print("Dry run only -- no documents were changed. Re-run without --dry-run to apply.")
 

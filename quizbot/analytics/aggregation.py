@@ -73,23 +73,32 @@ def avg_question_time(events: Iterable[dict]) -> Optional[float]:
 
 
 def topic_rollups(events: Iterable[dict]) -> list[dict]:
-    """Aggregate events by exact ``(subject, topic, topic_source)`` tuple.
+    """Aggregate events with identity-aware topic keys.
 
     Labels are NEVER synonym-merged: only identical normalised labels
-    combine (matching the storage rules in :mod:`metadata`). ``topic_source``
-    participates in the key so an explicit "Polity/Fundamental Rights"
-    cannot be silently pooled with a section of the same display name.
+    combine (matching the storage rules in :mod:`metadata`). Identity is:
+
+    * explicit question metadata -> exact ``(subject, topic, source)`` and
+      pooled ACROSS quizzes (same subject+topic may aggregate; different
+      subjects, including unknown vs known, stay apart);
+    * section-derived names (``topic_source == "section"``) -> the qid is
+      added to the key, because "Section 1"/"Basics" in two unrelated
+      quizzes must not pool. ``topic_source`` also keeps an explicit topic
+      separate from a section of the same display label.
     """
     buckets: dict[tuple, dict] = {}
     for ev in events or []:
         topic = ev.get("topic")
         if not topic:
             continue
-        key = (ev.get("subject"), topic, ev.get("topic_source"))
+        source = ev.get("topic_source")
+        scope_qid = ev.get("qid") if source == "section" else None
+        key = (ev.get("subject"), topic, source, scope_qid)
         bucket = buckets.setdefault(key, {
             "subject": ev.get("subject"),
             "topic": topic,
-            "topic_source": ev.get("topic_source"),
+            "topic_source": source,
+            "qid": scope_qid,
             OUTCOME_CORRECT: 0, OUTCOME_INCORRECT: 0, OUTCOME_SKIPPED: 0,
             "time_total": 0.0, "timed_questions": 0, "attempts": set(),
         })
@@ -110,6 +119,7 @@ def topic_rollups(events: Iterable[dict]) -> list[dict]:
             "subject": bucket["subject"],
             "topic": bucket["topic"],
             "topic_source": bucket["topic_source"],
+            "qid": bucket["qid"],
             "correct": bucket[OUTCOME_CORRECT],
             "incorrect": bucket[OUTCOME_INCORRECT],
             "skipped": bucket[OUTCOME_SKIPPED],

@@ -17,7 +17,9 @@ Design rules (see Phase B brief):
 
 from __future__ import annotations
 
+import hashlib
 import html as _html
+import json
 import re
 from typing import Any, Optional
 
@@ -277,3 +279,20 @@ def build_snapshot(question: Optional[dict]) -> Optional[dict]:
         "options": options,
         "correct_option_id": correct_ids if len(correct_ids) != 1 else correct_ids[0],
     }
+
+
+def snapshot_content_hash(snapshot: Optional[dict]) -> Optional[str]:
+    """Stable content hash (sha256 hex) of a minimal snapshot.
+
+    The identity of a historical question is its exact wording, option list
+    and correct answer: editing any of those (or deleting the quiz) yields a
+    different hash and therefore a different, never-repointed snapshot,
+    while every replay/attempt of the *same* question content shares one
+    snapshot row instead of duplicating the text on every event.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    canonical = json.dumps(
+        snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
