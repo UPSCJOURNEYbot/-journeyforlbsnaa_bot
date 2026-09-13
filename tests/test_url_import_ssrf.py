@@ -16,6 +16,10 @@ from quizbot.creator_bot.handlers.file_import import (
     _PUBLIC_URL_MAX_BYTES,
     _assert_public_http_url,
 )
+from quizbot.shared.utils.netguard import (
+    assert_public_http_url,
+    is_safe_resource_url,
+)
 
 
 class SsrfGuardTests(unittest.TestCase):
@@ -60,6 +64,33 @@ class SsrfGuardTests(unittest.TestCase):
         # Bounded so an oversized/chunked response cannot exhaust memory.
         self.assertLessEqual(_PUBLIC_URL_MAX_BYTES, 25 * 1024 * 1024)
         self.assertGreater(_PUBLIC_URL_MAX_BYTES, 1024)
+
+    def test_shared_guard_is_the_same_validator(self):
+        # The importer must use the shared netguard, not a private copy.
+        self.assertIs(_assert_public_http_url, assert_public_http_url)
+
+
+class ResourceUrlValidatorTests(unittest.TestCase):
+    """Offline (no-DNS) validator used by the WeasyPrint PDF renderer."""
+
+    def test_public_domain_and_ip_allowed_without_dns(self):
+        self.assertTrue(is_safe_resource_url("https://img.example.com/x.png"))
+        self.assertTrue(is_safe_resource_url("http://1.1.1.1/a"))
+
+    def test_literal_internal_targets_denied(self):
+        for url in ("http://127.0.0.1/x", "http://localhost/x",
+                    "http://169.254.169.254/meta", "http://10.0.0.1/x",
+                    "http://192.168.1.2/x", "http://[::1]/x",
+                    "http://host.internal/x", "//cdn.example.com/x",
+                    "/relative/x"):
+            self.assertFalse(is_safe_resource_url(url), url)
+
+    def test_scheme_restriction(self):
+        self.assertFalse(is_safe_resource_url("file:///etc/passwd"))
+        self.assertFalse(is_safe_resource_url("javascript:alert(1)"))
+        self.assertTrue(
+            is_safe_resource_url("data:image/png;base64,AAAA",
+                                 schemes=("http", "https", "data")))
 
 
 if __name__ == "__main__":

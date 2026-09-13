@@ -12,9 +12,13 @@ import logging
 import re
 from typing import Optional
 
+from quizbot.shared.utils.netguard import assert_public_http_url
 from ..parsing import filter_words, parse_question_block, strip_source_noise
 
 logger = logging.getLogger(__name__)
+
+# Backwards-compatible alias for callers/tests importing it from this module.
+_assert_public_http_url = assert_public_http_url
 
 
 def _process_txt(content: str, remove_words: list[str], out_questions: list[dict]) -> int:
@@ -378,47 +382,6 @@ def _extract_html_text(html: str) -> str:
 # Cap on a single imported web page / document (also defends memory against a
 # huge or endless response during the SSRF-protected fetch below).
 _PUBLIC_URL_MAX_BYTES = 25 * 1024 * 1024
-
-
-def _assert_public_http_url(url: str) -> None:
-    """SSRF guard. Raise ValueError unless ``url`` is an http(s) URL whose
-    host resolves ONLY to public, routable IP addresses.
-
-    Blocks loopback (127/8, ::1), RFC1918 private ranges, link-local
-    (169.254/16 -- including the 169.254.169.254 cloud-metadata endpoint),
-    unique-local IPv6, multicast and unspecified addresses. The check is run
-    for the original URL and again for every redirect hop.
-    """
-    import ipaddress
-    import socket
-    from urllib.parse import urlparse
-
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("please send a valid public http/https link.")
-    host = (parsed.hostname or "").strip().lower()
-    if not host:
-        raise ValueError("the link has no valid hostname.")
-    # Block obvious internal hostnames outright.
-    if host in {"localhost", "metadata.google.internal"} or host.endswith(
-            (".local", ".internal", ".localhost")):
-        raise ValueError("links to internal/private hosts are not allowed.")
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except OSError as exc:
-        raise ValueError(f"the link's host could not be resolved ({host}).") from exc
-    for info in infos:
-        try:
-            ip = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            continue
-        if (ip.is_loopback or ip.is_private or ip.is_link_local
-                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
-            raise ValueError(
-                "links to private, loopback or internal-network addresses "
-                "are not allowed.")
-    if not infos:
-        raise ValueError("the link's host did not resolve to any address.")
 
 
 async def process_public_url(
