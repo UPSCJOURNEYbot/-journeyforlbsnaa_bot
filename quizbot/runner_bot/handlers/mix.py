@@ -139,6 +139,10 @@ async def mix_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "questions": mixed, "timer": 30, "negative_marking": 0,
             "shuffle": False, "shuffle_options": False, "sections": [],
             "creator_id": user_id, "quiz_type": "free", "promo_message": "",
+            # Phase B provenance marker for the analytics layer (no stored
+            # quiz row exists for a mix; its source questions keep their own
+            # metadata/snapshots, but nothing new is inferred).
+            "analytics_source": "mix",
         }
 
         cmd_thread_id = getattr(update.message, "message_thread_id", None)

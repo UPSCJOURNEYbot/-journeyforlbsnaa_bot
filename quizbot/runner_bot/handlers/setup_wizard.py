@@ -561,9 +561,19 @@ async def _launch_quiz_from_settings(chat_id: int, ctx: ContextTypes.DEFAULT_TYP
             await start_private_quiz(chat_id, ctx, quiz["questions"], quiz, qset_id, skip)
             return
 
+        # Preserve the historic in-place shuffle of the live questions list,
+        # but capture the permutation so the analytics boundary can map
+        # display positions back to canonical stored question indices.
+        # ``question_order[display_position] = canonical_index``. Only flat
+        # (non-sectioned) group quizzes shuffle questions.
         questions = quiz["questions"]
+        question_order = None
         if quiz.get("shuffle") and not quiz.get("sections"):
-            random.shuffle(questions)
+            permutation = list(range(len(questions)))
+            random.shuffle(permutation)
+            shuffled = [questions[i] for i in permutation]
+            questions[:] = shuffled  # mutate the same object, as the old code did
+            question_order = permutation
 
         thread_id = None
         try:
@@ -578,6 +588,9 @@ async def _launch_quiz_from_settings(chat_id: int, ctx: ContextTypes.DEFAULT_TYP
             "participants": {}, "is_private": False, "section_msgs": [],
             "modified_timer_offset": 0, "message_thread_id": thread_id,
             "quiz_data": quiz, "anti_cheat": ps.get("anti_cheat", False),
+            # Phase B: display->canonical question permutation (None unless
+            # question shuffle is active).
+            "question_order": question_order,
         }
         await session_mgr.create(chat_id, session_data)
         tasks.spawn(run_group_quiz(chat_id, ctx, questions, quiz, protect, update, skip), name=f"quiz_{chat_id}_main")

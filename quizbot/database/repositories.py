@@ -7,12 +7,19 @@ The codebase has been reviewed and verified with the assistance of Claude AI.
 
 from __future__ import annotations
 
+import secrets
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from pymongo import ReturnDocument
+
+from quizbot.analytics.metadata import (
+    OUTCOME_CORRECT,
+    OUTCOME_INCORRECT,
+    normalize_question,
+)
 
 from .db import Database
 
@@ -166,6 +173,12 @@ class QuizRepository:
         return uuid.uuid4().hex[:10]
 
     async def create(self, creator_id: int, quiz_name: str, questions: list[dict], **kwargs) -> dict:
+        # Phase B: persist the OPTIONAL per-question analytics block
+        # (subject/topic/subtopic/difficulty) when present. This only
+        # sanitises and stores metadata the creator/importer already
+        # supplied; wording, options and answers are untouched and nothing
+        # is ever fabricated for questions without metadata.
+        questions = [normalize_question(q) for q in questions]
         qid = kwargs.get("qid") or self._new_qid()
         doc = {
             "qid": qid,
@@ -511,7 +524,9 @@ class AttemptRepository:
         self.db = db
         self.col = db.collection("quiz_attempts")
 
-    async def start(self, user_id: int, qid: str, quiz_name: str, total_questions: int) -> dict:
+    async def start(self, user_id: int, qid: str, quiz_name: str, total_questions: int,
+                    source: Optional[str] = None,
+                    quiz_persisted: Optional[bool] = None) -> dict:
         attempt_id = uuid.uuid4().hex
         doc = {
             "attempt_id": attempt_id,
@@ -529,15 +544,63 @@ class AttemptRepository:
             "pause_time": None,
             "total_pause_duration": 0,
         }
+        # Phase B provenance -- additive only, omitted when unknown so the
+        # legacy document shape is unchanged for callers that don't pass it.
+        if source is not None:
+            doc["source"] = str(source)
+        if quiz_persisted is not None:
+            doc["quiz_persisted"] = bool(quiz_persisted)
         await self.col.insert_one(doc)
         return await self.get(attempt_id)
+
+    async def ensure_started(
+        self, attempt_id: str, user_id: int, qid: str, quiz_name: str,
+        total_questions: int, source: Optional[str] = None,
+        quiz_persisted: Optional[bool] = None,
+    ) -> None:
+        """Create the in-progress attempt row if it does not exist yet.
+
+        ``$setOnInsert`` + upsert makes this idempotent: the live runner
+        normally creates the row via :meth:`start` slightly earlier, and in
+        that case this is a no-op; it also makes the analytics completion
+        path self-contained if it is ever reached without a prior start.
+        """
+        now = _now_iso()
+        doc = {
+            "attempt_id": attempt_id,
+            "user_id": user_id,
+            "qid": qid,
+            "quiz_name": quiz_name,
+            "current_question": 0,
+            "answers": {},
+            "score": 0,
+            "total_questions": total_questions,
+            "time_started": now,
+            "time_ended": None,
+            "status": "in_progress",
+            "paused": False,
+            "pause_time": None,
+            "total_pause_duration": 0,
+        }
+        if source is not None:
+            doc["source"] = str(source)
+        if quiz_persisted is not None:
+            doc["quiz_persisted"] = bool(quiz_persisted)
+        await self.col.update_one(
+            {"attempt_id": attempt_id}, {"$setOnInsert": doc}, upsert=True
+        )
 
     async def get(self, attempt_id: str) -> Optional[dict]:
         row = await self.col.find_one({"attempt_id": attempt_id})
         return _clean(row)
 
     async def update(self, attempt_id: str, **fields) -> None:
-        allowed = {"current_question", "answers", "score", "correct", "wrong", "total_time", "paused"}
+        allowed = {
+            "current_question", "answers", "score", "correct", "wrong",
+            "total_time", "paused",
+            # Phase B canonical per-question results + provenance.
+            "question_results", "skipped", "source", "quiz_persisted",
+        }
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
             return
@@ -567,7 +630,8 @@ class AttemptRepository:
                     {"$set": {"paused": False, "pause_time": None}},
                 )
 
-    async def complete(self, attempt_id: str, score: float, username: str) -> Optional[dict]:
+    async def complete(self, attempt_id: str, score: float, username: str,
+                       persist_leaderboard: bool = True) -> Optional[dict]:
         attempt = await self.get(attempt_id)
         if attempt is None:
             return None
@@ -575,6 +639,14 @@ class AttemptRepository:
             {"attempt_id": attempt_id},
             {"$set": {"status": "completed", "score": score, "time_ended": _now_iso()}},
         )
+        # The leaderboard belongs to saved quizzes only. Ad-hoc AI/mix/PDF
+        # quizzes (synthetic qids, quiz_persisted=False) must never appear on
+        # a saved quiz's leaderboard even though their attempts are now
+        # recorded for analytics.
+        if persist_leaderboard and attempt.get("quiz_persisted") is False:
+            persist_leaderboard = False
+        if not persist_leaderboard:
+            return await self.get(attempt_id)
         started = datetime.strptime(attempt["time_started"], "%Y-%m-%d %H:%M:%S")
         elapsed = int(
             (datetime.now(timezone.utc).replace(tzinfo=None) - started).total_seconds()
@@ -615,6 +687,99 @@ class AttemptRepository:
             "time_ended", -1
         )
         return [_clean(r) async for r in cursor]
+
+    # ------------------------------------------------------------------
+    # Phase B user-scoped analytics reads (aggregation in MongoDB).
+    # Every method requires an explicit user_id; there is no global read.
+    # ------------------------------------------------------------------
+
+    async def list_completed_for_user(
+        self, user_id: int, limit: int = 20, offset: int = 0
+    ) -> list[dict]:
+        cursor = (
+            self.col.find({"user_id": user_id, "status": "completed"})
+            .sort("time_ended", -1)
+            .skip(offset)
+            .limit(limit)
+        )
+        return [_clean(r) async for r in cursor]
+
+    async def count_in_progress(self, user_id: int) -> int:
+        return await self.col.count_documents(
+            {"user_id": user_id, "status": "in_progress"}
+        )
+
+    async def user_completed_overview(self, user_id: int) -> dict:
+        """Aggregate completed attempts for one user in MongoDB.
+
+        Legacy documents without the Phase B fields are handled explicitly:
+        missing ``quiz_persisted`` defaults to True (ad-hoc quizzes were not
+        recorded at all before Phase B), and missing ``question_results``
+        marks an attempt as pre-canonical ("legacy") so accuracy can fall
+        back to the attempt-level correct/wrong counters with provenance.
+        """
+        pipeline = [
+            {"$match": {"user_id": user_id, "status": "completed"}},
+            {"$group": {
+                "_id": None,
+                "attempts": {"$sum": 1},
+                "adhoc": {"$sum": {"$cond": [{"$eq": ["$quiz_persisted", False]}, 1, 0]}},
+                "canonical": {"$sum": {"$cond": [
+                    {"$eq": [{"$type": "$question_results"}, "array"]}, 1, 0]}},
+                "correct_sum": {"$sum": {"$ifNull": ["$correct", 0]}},
+                "wrong_sum": {"$sum": {"$ifNull": ["$wrong", 0]}},
+                "time_sum": {"$sum": {"$ifNull": ["$total_time", 0]}},
+                "quiz_ids": {"$addToSet": "$qid"},
+                "days": {"$addToSet": {"$substrCP": [
+                    {"$ifNull": ["$time_ended", ""]}, 0, 10]}},
+                "first_at": {"$min": "$time_ended"},
+                "last_at": {"$max": "$time_ended"},
+            }},
+        ]
+        rows = [r async for r in self.col.aggregate(pipeline)]
+        if not rows:
+            return {
+                "attempts": 0, "adhoc": 0, "canonical": 0, "legacy": 0,
+                "correct_sum": 0, "wrong_sum": 0, "time_sum": 0,
+                "quiz_count": 0, "activity_days": [],
+                "first_at": None, "last_at": None,
+            }
+        row = rows[0]
+        attempts = row.get("attempts", 0)
+        canonical = row.get("canonical", 0)
+        days = [d for d in row.get("days", []) if d]
+        return {
+            "attempts": attempts,
+            "adhoc": row.get("adhoc", 0),
+            "canonical": canonical,
+            "legacy": attempts - canonical,
+            "correct_sum": row.get("correct_sum", 0),
+            "wrong_sum": row.get("wrong_sum", 0),
+            "time_sum": row.get("time_sum", 0),
+            "quiz_count": len([q for q in row.get("quiz_ids", []) if q is not None]),
+            "activity_days": sorted(days),
+            "first_at": row.get("first_at"),
+            "last_at": row.get("last_at"),
+        }
+
+    async def daily_completed(self, user_id: int, days: int = 30) -> list[dict]:
+        """Completed attempts grouped by UTC day (activity = a completed
+        attempt, per the Phase C prep definition)."""
+        pipeline = [
+            {"$match": {"user_id": user_id, "status": "completed",
+                        "time_ended": {"$gte": " "}}},
+            {"$group": {
+                "_id": {"$substrCP": ["$time_ended", 0, 10]},
+                "attempts": {"$sum": 1},
+            }},
+            {"$sort": {"_id": 1}},
+        ]
+        out = []
+        async for row in self.col.aggregate(pipeline):
+            day = row.get("_id")
+            if day:
+                out.append({"day": day, "attempts": row.get("attempts", 0)})
+        return out[-days:] if days else out
 
 
 class LeaderboardRepository:
@@ -713,39 +878,223 @@ class QuestionStatsRepository:
 
 
 class MistakeRepository:
+    """Non-destructive per-user mistake history (Phase B foundation).
+
+    A mistake is an identity row keyed ``(user_id, qid, q_index)`` that is
+    NEVER deleted:
+
+    * ``wrong_count``        -- total times the question was answered wrong
+                                (every wrong attempt adds one).
+    * ``correct_count``      -- times it was answered correctly afterwards.
+    * ``status``             -- ``open`` / ``resolved``; answering wrong
+                                again after resolution re-opens the row
+                                ("repeated mistake") without losing history.
+    * ``first_wrong_at`` / ``last_wrong_at`` / ``last_correct_at``.
+    * ``question_snapshot``  -- minimal identity snapshot captured at first
+                                wrong so later quiz edits cannot repoint the
+                                mistake at a different question.
+    * ``wrong_attempt_ids`` / ``correct_attempt_ids`` -- idempotency guards:
+                                replaying the same attempt never double-counts.
+    * ``revision_history``   -- bounded append-only timeline.
+
+    Legacy rows written before Phase B (only ``wrong_count`` /
+    ``last_wrong_at``) keep working: they are treated as ``open`` because
+    their missing ``status`` is not ``"resolved"``.
+    """
+
+    STATUS_OPEN = "open"
+    STATUS_RESOLVED = "resolved"
+    HISTORY_LIMIT = 200
+
     def __init__(self, db: Database):
         self.db = db
         self.col = db.collection("user_mistakes")
 
-    async def record(self, user_id: int, items: list[dict]) -> None:
-        for item in items:
-            existing = await self.col.find_one(
-                {"user_id": user_id, "qid": item["qid"], "q_index": item["index"]}
-            )
-            if existing:
+    # ------------------------------------------------------------------ writes
+
+    def _history_entry(self, attempt_id: Optional[str], outcome: str, at: str,
+                       selected: Optional[list] = None) -> dict:
+        entry = {"at": at, "outcome": outcome}
+        if attempt_id:
+            entry["attempt_id"] = attempt_id
+        if selected:
+            entry["selected_option"] = list(selected)
+        return entry
+
+    async def apply_attempt(
+        self,
+        user_id: int,
+        qid: str,
+        attempt_id: Optional[str],
+        events: list[dict],
+        *,
+        at: Optional[str] = None,
+    ) -> int:
+        """Fold canonical question events for one completed attempt into the
+        user's mistake history.
+
+        Idempotent per ``attempt_id`` (the attempt-id arrays make a replayed
+        completion a no-op) and fully non-destructive (rows are never
+        deleted). Returns the number of mistake rows touched.
+        """
+        at = at or _now_iso()
+        touched = 0
+        for ev in events:
+            outcome = ev.get("outcome")
+            if outcome not in (OUTCOME_CORRECT, OUTCOME_INCORRECT):
+                continue  # skipped questions never become mistakes
+            try:
+                q_index = int(ev["question_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            base_filter = {"user_id": user_id, "qid": qid, "q_index": q_index}
+            existing = await self.col.find_one(base_filter)
+
+            metadata = {
+                "subject": ev.get("subject"),
+                "topic": ev.get("topic"),
+                "subtopic": ev.get("subtopic"),
+                "difficulty": ev.get("difficulty"),
+                "topic_source": ev.get("topic_source"),
+            }
+
+            if outcome == OUTCOME_INCORRECT:
+                entry = self._history_entry(
+                    attempt_id, OUTCOME_INCORRECT, at, ev.get("selected_option"))
+                if existing is None:
+                    doc = {
+                        "user_id": user_id,
+                        "qid": qid,
+                        "q_index": q_index,
+                        "wrong_count": 1,
+                        "correct_count": 0,
+                        "status": self.STATUS_OPEN,
+                        "first_wrong_at": at,
+                        "last_wrong_at": at,
+                        "last_correct_at": None,
+                        "resolved_at": None,
+                        "created_at": at,
+                        "updated_at": at,
+                        "first_seen_attempt_id": attempt_id,
+                        **metadata,
+                        "question_snapshot": ev.get("question_snapshot"),
+                        "wrong_attempt_ids": [attempt_id] if attempt_id else [],
+                        "correct_attempt_ids": [],
+                        "revision_history": [entry],
+                    }
+                    await self.col.insert_one(doc)
+                    touched += 1
+                    continue
+
+                if attempt_id and attempt_id in existing.get("wrong_attempt_ids", []):
+                    continue  # this attempt already counted -- replay no-op
+                update: dict[str, Any] = {
+                    "$inc": {"wrong_count": 1},
+                    # A fresh wrong answer (re-)opens the row, including a
+                    # previously resolved one ("repeated").
+                    "$set": {"status": self.STATUS_OPEN, "last_wrong_at": at,
+                             "updated_at": at},
+                    "$push": {"revision_history": {"$each": [entry],
+                                                   "$slice": -self.HISTORY_LIMIT}},
+                }
+                if attempt_id:
+                    update["$addToSet"] = {"wrong_attempt_ids": attempt_id}
+                # Backfill any metadata/snapshot that the first (possibly
+                # legacy) row didn't capture; never overwrite what exists.
+                for key, value in metadata.items():
+                    if value is not None and existing.get(key) is None:
+                        update["$set"][key] = value
+                if ev.get("question_snapshot") and not existing.get("question_snapshot"):
+                    update["$set"]["question_snapshot"] = ev["question_snapshot"]
+                await self.col.update_one({"_id": existing["_id"]}, update)
+                touched += 1
+
+            else:  # OUTCOME_CORRECT -- only updates an existing mistake row;
+                   # a never-wrong question creates no row.
+                if existing is None:
+                    continue
+                if attempt_id and attempt_id in existing.get("correct_attempt_ids", []):
+                    continue  # replay no-op
+                entry = self._history_entry(
+                    attempt_id, OUTCOME_CORRECT, at, ev.get("selected_option"))
                 await self.col.update_one(
                     {"_id": existing["_id"]},
-                    {"$inc": {"wrong_count": 1}, "$set": {"last_wrong_at": _now_iso()}},
-                )
-            else:
-                await self.col.insert_one(
                     {
-                        "user_id": user_id,
-                        "qid": item["qid"],
-                        "q_index": item["index"],
-                        "wrong_count": 1,
-                        "last_wrong_at": _now_iso(),
-                    }
+                        "$inc": {"correct_count": 1},
+                        "$set": {"status": self.STATUS_RESOLVED,
+                                 "last_correct_at": at, "updated_at": at},
+                        "$push": {"revision_history": {"$each": [entry],
+                                                       "$slice": -self.HISTORY_LIMIT}},
+                        **({"$addToSet": {"correct_attempt_ids": attempt_id}}
+                           if attempt_id else {}),
+                    },
                 )
+                touched += 1
+        return touched
 
-    async def list_for_user(self, user_id: int, limit: int = 20) -> list[dict]:
+    async def record(self, user_id: int, items: list[dict]) -> None:
+        """Backward-compatible shim for the old ``record`` signature used by
+        earlier call sites. Keeps one-wrong-per-item semantics, never
+        deletes, and assigns a unique one-shot attempt token so repeated
+        calls keep incrementing as they did before.
+        """
+        if not items:
+            return
+        by_qid: dict[str, list[dict]] = {}
+        for item in items:
+            by_qid.setdefault(item["qid"], []).append(item)
+        at = _now_iso()
+        token = f"legacy-{int(time.time() * 1000)}-{secrets.token_hex(3)}"
+        for qid, qitems in by_qid.items():
+            events = [
+                {
+                    "question_index": item["index"],
+                    "outcome": OUTCOME_INCORRECT,
+                    "selected_option": [],
+                    "question_snapshot": None,
+                }
+                for item in qitems
+            ]
+            await self.apply_attempt(user_id, qid, token, events, at=at)
+
+    # ------------------------------------------------------------------- reads
+
+    async def get(self, user_id: int, qid: str, q_index: int) -> Optional[dict]:
+        return _clean(await self.col.find_one(
+            {"user_id": user_id, "qid": qid, "q_index": q_index}
+        ))
+
+    async def list_for_user(
+        self, user_id: int, limit: int = 20, status: Optional[str] = None
+    ) -> list[dict]:
+        filt: dict[str, Any] = {"user_id": user_id}
+        if status == self.STATUS_RESOLVED:
+            filt["status"] = self.STATUS_RESOLVED
+        elif status == self.STATUS_OPEN:
+            # Legacy rows have no status field but are open.
+            filt["status"] = {"$ne": self.STATUS_RESOLVED}
         cursor = (
-            self.col.find({"user_id": user_id}).sort("last_wrong_at", -1).limit(limit)
+            self.col.find(filt).sort([("status", 1), ("last_wrong_at", -1)]).limit(limit)
         )
         return [_clean(r) async for r in cursor]
 
+    async def list_open(self, user_id: int, limit: int = 50) -> list[dict]:
+        return await self.list_for_user(user_id, limit=limit, status=self.STATUS_OPEN)
+
+    async def totals(self, user_id: int) -> dict:
+        total = await self.col.count_documents({"user_id": user_id})
+        resolved = await self.col.count_documents(
+            {"user_id": user_id, "status": self.STATUS_RESOLVED}
+        )
+        return {"total": total, "resolved": resolved, "open": total - resolved}
+
     async def resolve(self, user_id: int, qid: str, q_index: int) -> None:
-        await self.col.delete_one({"user_id": user_id, "qid": qid, "q_index": q_index})
+        """Mark a mistake resolved WITHOUT deleting its history."""
+        await self.col.update_one(
+            {"user_id": user_id, "qid": qid, "q_index": q_index},
+            {"$set": {"status": self.STATUS_RESOLVED,
+                      "resolved_at": _now_iso(), "updated_at": _now_iso()}},
+        )
 
 
 class CreatorSettingsRepository:

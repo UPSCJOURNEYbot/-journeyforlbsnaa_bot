@@ -22,8 +22,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes, PollAnswerHa
 from quizbot.database import (
     AttemptRepository,
     LeaderboardRepository,
-    MistakeRepository,
-    QuestionStatsRepository,
     QuizRepository,
     get_db,
 )
@@ -41,6 +39,9 @@ from quizbot.shared.rich_quiz import (
 from quizbot.shared.utils import is_premium_user
 
 from ..pdf_reports import render_quiz_pdf
+from quizbot.analytics.runtime import build_question_results
+from quizbot.analytics.service import AnalyticsService
+
 from ..quiz_utils import (
     MIN_EFFECTIVE_TIMER,
     effective_poll_timer,
@@ -49,7 +50,7 @@ from ..quiz_utils import (
     parse_timer_arg,
     resolve_quiz_access,
     section_marks,
-    shuffle_options_multi,
+    shuffle_options_multi_with_mapping,
 )
 from ..state import channel_poll_tasks, rate_limiter, session_mgr, tasks, translation_mgr
 from ..telegram_utils import (
@@ -274,8 +275,11 @@ async def send_private_question(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, id
         do_shuffle = s["quiz_data"].get("shuffle_options", False)
         shuffle_o_count = s["quiz_data"].get("shuffle_options_count", 0)
 
+        display_order: Optional[list[int]] = None
         if do_shuffle:
-            options, correct_ids = shuffle_options_multi(options, correct_ids, shuffle_o_count)
+            options, correct_ids, display_order = shuffle_options_multi_with_mapping(
+                options, correct_ids, shuffle_o_count
+            )
 
         if target_lang and target_lang != "en":
             await safe_send_message(
@@ -359,6 +363,9 @@ async def send_private_question(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, id
             s["current_index"] = idx
             s["polls"][poll_msg.poll.id] = {
                 "correct_option": correct_ids, "sent_time": time.time(), "question_index": idx,
+                # Phase B: option permutation so the analytics boundary can
+                # map display-coordinate answers back to canonical option ids.
+                "display_order": display_order,
             }
             await session_mgr.update(chat_id, s)
             tasks.spawn(_private_timeout(chat_id, poll_msg.poll.id, timer), name=f"quiz_{chat_id}_pvt_timeout")
@@ -500,7 +507,9 @@ async def end_private_quiz(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None
             ctx, chat_id, quiz_data, [{
                 "user_id": chat_id, "name": "You", "correct": correct, "wrong": wrong,
                 "score": score, "total_time": total_time, "answers": udata.get("answers", {}),
-            }], chat_title="Direct Message", protect_type=False, thread_id=None, session_polls=s.get("polls", {}),
+                "raw_answers": udata.get("answers", {}),
+            }], chat_title="Direct Message", protect_type=False, thread_id=None,
+            session_polls=s.get("polls", {}), source="dm",
         )
     except Exception as e:
         logger.error("end_private_quiz error: %s", e, exc_info=True)
@@ -720,9 +729,12 @@ async def _send_group_question(chat_id, ctx, questions, idx, total, base_timer, 
         file_id = q.get("file_id")
         reply_text = q.get("reply_text")
 
+        display_order: Optional[list[int]] = None
         if do_shuffle:
             shuffle_o_count = (session.get("quiz_data") or {}).get("shuffle_options_count", 0)
-            options, correct_ids = shuffle_options_multi(options, correct_ids, shuffle_o_count)
+            options, correct_ids, display_order = shuffle_options_multi_with_mapping(
+                options, correct_ids, shuffle_o_count
+            )
 
         if target_lang and target_lang != "en":
             await safe_send_message(
@@ -802,6 +814,9 @@ async def _send_group_question(chat_id, ctx, questions, idx, total, base_timer, 
             session["polls"][poll_msg.poll.id] = {
                 "correct_option": correct_ids, "sent_time": time.time(),
                 "question_index": idx, "message_id": poll_msg.message_id,
+                # Phase B: canonical-coordinate mappings for analytics.
+                "display_order": display_order,
+                "question_order": session.get("question_order"),
             }
             session["current_index"] = idx + 1
             await session_mgr.update(chat_id, session)
@@ -1086,6 +1101,10 @@ async def end_quiz(update: Any, ctx: ContextTypes.DEFAULT_TYPE, quiz_id: str, pr
                 "user_id": uid, "name": udata["name"], "correct": correct, "wrong": wrong,
                 "score": round(score, 4), "total_time": total_time, "answers": user_answers,
                 "section_scores": section_scores,
+                # Phase B: raw, poll-id-keyed live answers (display coords +
+                # timings) used to build canonical, shuffle-safe question
+                # results at the persistence boundary.
+                "raw_answers": udata.get("answers", {}),
             })
 
         if not leaderboard:
@@ -1124,64 +1143,82 @@ async def end_quiz(update: Any, ctx: ContextTypes.DEFAULT_TYPE, quiz_id: str, pr
 
 async def _record_attempt_and_report(
     ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz_data: dict, leaderboard: list[dict],
-    *, chat_title: str, protect_type: bool, thread_id: Optional[int], session_polls: Optional[dict] = None,
+    *, chat_title: str, protect_type: bool, thread_id: Optional[int],
+    session_polls: Optional[dict] = None, source: str = "group",
 ) -> None:
     """Persist attempts/leaderboard rows to the DB and send HTML/PDF reports
     if enabled for this chat. Replaces the old local quiz_results/*.json
-    file-storage approach entirely -- everything lands in SQLite."""
+    file-storage approach entirely -- everything lands in MongoDB.
+
+    Phase B: persistence goes through AnalyticsService, which writes the
+    canonical per-question event stream (shuffle-safe, live-scorer truth),
+    non-destructive mistake history and question stats. Saved quizzes touch
+    the leaderboard/stats/participants; ad-hoc AI/PDF/mix quizzes record an
+    attempt + events only (they have no stored quiz to reference).
+    """
     from quizbot.database import ChatSettingsRepository
 
     qid = quiz_data.get("question_set_id", "")
-    total = len(quiz_data.get("questions", []))
     db = get_db()
 
-    # Persist a completed attempt + leaderboard row per participant (if the
-    # quiz exists in the DB -- ad-hoc AI/PDF/mix quizzes are not persisted
-    # since they have no qid row to reference).
+    # Resolve the canonical stored question set when the quiz is saved; ad-hoc
+    # quizzes fall back to their in-memory questions (and are marked
+    # quiz_persisted=False, so they never touch leaderboard/stats).
     quiz_repo = QuizRepository(db)
-    quiz_exists = bool(await quiz_repo.get(qid)) if qid else False
-    if quiz_exists:
-        attempt_repo = AttemptRepository(db)
-        mistake_repo = MistakeRepository(db)
-        stats_repo = QuestionStatsRepository(db)
-        wrong_by_q: dict[int, int] = {}
-        total_by_q: dict[int, int] = {}
+    quiz_doc = await quiz_repo.get(qid) if qid else None
+    quiz_persisted = bool(quiz_doc)
+    if quiz_persisted:
+        canonical_questions = quiz_doc.get("questions", [])
+        canonical_sections = quiz_doc.get("sections", [])
+    else:
+        canonical_questions = quiz_data.get("questions", [])
+        canonical_sections = quiz_data.get("sections", [])
+    total = len(canonical_questions)
+    effective_source = quiz_data.get("analytics_source") or source
 
-        for entry in leaderboard:
-            user_id = entry["user_id"]
-            if not isinstance(user_id, int):
-                continue
-            attempt = await attempt_repo.start(user_id, qid, quiz_data.get("quiz_name", ""), total)
-            await attempt_repo.update(
-                attempt["attempt_id"],
-                answers=entry.get("answers", {}),
+    # Only polls that were actually delivered participate in analytics;
+    # delivered-but-unanswered questions come through as "skipped".
+    real_polls = session_polls or {}
+    analytics = None
+    attempt_repo = None
+    for entry in leaderboard:
+        user_id = entry.get("user_id")
+        if not isinstance(user_id, int) or isinstance(user_id, bool):
+            continue
+        try:
+            # Lazily constructed so an unavailable DB (or an empty result
+            # set) never blocks report delivery below.
+            if analytics is None:
+                analytics = AnalyticsService(db)
+                attempt_repo = AttemptRepository(db)
+            question_results = build_question_results(
+                real_polls, entry.get("raw_answers") or {}
+            )
+            attempt = await attempt_repo.start(
+                user_id, qid, quiz_data.get("quiz_name", ""), total,
+                source=effective_source, quiz_persisted=quiz_persisted,
+            )
+            await analytics.record_completion(
+                user_id=user_id,
+                attempt_id=attempt["attempt_id"],
+                qid=qid,
+                quiz_name=quiz_data.get("quiz_name", ""),
+                question_results=question_results,
+                source=effective_source,
+                quiz_persisted=quiz_persisted,
+                questions=canonical_questions,
+                sections=canonical_sections,
                 score=float(entry["score"]),
                 correct=int(entry.get("correct", 0)),
                 wrong=int(entry.get("wrong", 0)),
                 total_time=float(entry.get("total_time", 0.0)),
+                username=str(entry.get("name", "")),
             )
-            await attempt_repo.complete(attempt["attempt_id"], float(entry["score"]), str(entry["name"]))
-
-            mistakes = []
-            for q_key, ans in entry.get("answers", {}).items():
-                try:
-                    q_idx = int(q_key.lstrip("q"))
-                except ValueError:
-                    continue
-                total_by_q[q_idx] = total_by_q.get(q_idx, 0) + 1
-                q = quiz_data["questions"][q_idx] if q_idx < len(quiz_data["questions"]) else None
-                if q and not is_correct(ans, q.get("correct_option_id")):
-                    wrong_by_q[q_idx] = wrong_by_q.get(q_idx, 0) + 1
-                    mistakes.append({"qid": qid, "index": q_idx})
-            if mistakes:
-                await mistake_repo.record(user_id, mistakes)
-
-        if total_by_q:
-            await stats_repo.bulk_update_wrong_stats(
-                qid, [{"index": i, "wrong": wrong_by_q.get(i, 0), "total": n} for i, n in total_by_q.items()]
+        except Exception:
+            # Analytics must never prevent result/report delivery.
+            logger.exception(
+                "record_completion failed for user=%s qid=%s", user_id, qid
             )
-        for _ in leaderboard:
-            await quiz_repo.increment_participants(qid)
 
     chat_settings_repo = ChatSettingsRepository(db)
     chat_settings = await chat_settings_repo.get(chat_id)

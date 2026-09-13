@@ -282,6 +282,9 @@ class ScheduledQuizManager:
             #     every scheduled run of a creator-configured quiz;
             #   * protect is ON everywhere except the creator's own private
             #     chat, and a scheduled quiz always runs in a group.
+            # Phase B provenance (in-memory only; the stored quiz document
+            # is never modified).
+            quiz["analytics_source"] = "scheduled"
             ps = {
                 "quiz": quiz, "skip": 0,
                 "protect": chat_id != quiz.get("creator_id"),
