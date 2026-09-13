@@ -289,8 +289,9 @@ class WeasyPrintGuardTests(unittest.TestCase):
             return real_import(name, *a, **k)
 
         with mock.patch.object(builtins, "__import__", side_effect=boom):
-            for mod in [m for m in list(sys.modules) if m.startswith("weasyprint")]:
-                sys.modules.pop(m, None)
+            for name in [n for n in list(sys.modules)
+                         if n == "weasyprint" or n.startswith("weasyprint.")]:
+                sys.modules.pop(name, None)
             self.assertFalse(self._render())
 
     def test_missing_package_returns_false(self):
@@ -303,8 +304,9 @@ class WeasyPrintGuardTests(unittest.TestCase):
             return real_import(name, *a, **k)
 
         with mock.patch.object(builtins, "__import__", side_effect=missing):
-            for mod in [m for m in list(sys.modules) if m.startswith("weasyprint")]:
-                sys.modules.pop(m, None)
+            for name in [n for n in list(sys.modules)
+                         if n == "weasyprint" or n.startswith("weasyprint.")]:
+                sys.modules.pop(name, None)
             self.assertFalse(self._render())
 
 

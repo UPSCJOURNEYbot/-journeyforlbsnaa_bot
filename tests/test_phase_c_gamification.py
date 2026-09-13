@@ -66,6 +66,30 @@ AT3 = f"{DAY3} 12:00:00"
 AT5 = f"{DAY5} 12:00:00"
 
 
+# The day constants above are anchored to "today == DAY1": the same-day
+# reconciliation tests (e.g. reserved streak orphans committed by a later
+# same-day completion) only have meaning on that IST calendar day. The
+# production service deliberately reads the live clock through two seams
+# (local_day_key() with no argument, and _utc_now_iso); freeze just those
+# HERE. Pure timestamp conversion (local_day_key(value)) is left untouched so
+# the offset-conversion tests still exercise the real code. Without this
+# freeze the suite is a date-bomb that goes red once the real calendar moves
+# to DAY2.
+import pytest  # noqa: E402
+
+_REAL_LOCAL_DAY_KEY = g.local_day_key
+
+
+@pytest.fixture(autouse=True)
+def _freeze_ist_day1(monkeypatch):
+    def _frozen_local_day_key(value=None):
+        return DAY1 if value is None else _REAL_LOCAL_DAY_KEY(value)
+
+    monkeypatch.setattr(g, "local_day_key", _frozen_local_day_key)
+    monkeypatch.setattr(g, "_utc_now_iso", lambda: "2026-09-13 07:00:00")
+    yield
+
+
 def qr(q_index, outcome, *, time_taken=None, difficulty=None):
     row = {"q_index": q_index, "selected": [], "correct_option": [],
            "outcome": outcome, "time_taken": time_taken}

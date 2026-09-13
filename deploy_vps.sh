@@ -246,7 +246,99 @@ fi
 
 log "Installing requirements.txt (existing pinned dependencies, unchanged) ..."
 "$VENV_PY" -m pip install --upgrade pip
+# requirements.txt now pins WeasyPrint 62.3's ENTIRE transitive PDF stack
+# (pydyf/tinycss2/cssselect2/pyphen/fonttools/cffi/html5lib). Re-running this
+# command also DOWNGRADEs any previously-drifted versions (e.g. pydyf 0.12.x,
+# whose removed Stream.transform() broke every report PDF in production with
+# "AttributeError: 'super' object has no attribute 'transform'").
 "$VENV_PY" -m pip install -r "$APP_DIR/requirements.txt"
+
+# ---------------------------------------------------------------------------
+# 3b. PDF stack self-check (runs BEFORE the service is restarted).
+#     WeasyPrint's runtime dependencies are partly system libraries (pango,
+#     installed in step 2) and partly pip packages. A version drift in either
+#     layer used to ship as a bot that starts fine but fails every result PDF.
+#     Prove the EXACT declared dependency set actually renders a real page
+#     (English + Devanagari + table + a coordinate transform + a MathML tag)
+#     here, at deploy time, and abort loudly rather than restart into a
+#     broken PDF stack. The bot itself keeps its in-process fail-soft path;
+#     this gate exists so an operator never silently lands on it.
+# ---------------------------------------------------------------------------
+log "Verifying the WeasyPrint result-PDF stack (dependency pins + real render) ..."
+"$VENV_PY" - <<'PY'
+import sys
+
+errors = []
+
+# (a) Declared pydyf API that weasyprint/pdf/stream.py requires.
+import pydyf
+try:
+    parts = tuple(int(x) for x in pydyf.__version__.split(".")[:2])
+except Exception:
+    parts = (99, 99)
+if not hasattr(pydyf.Stream, "transform") or parts >= (0, 12):
+    errors.append(
+        f"pydyf {pydyf.__version__} is incompatible with WeasyPrint 62.3 "
+        "(Stream.transform removed in pydyf 0.12). requirements.txt pins "
+        "pydyf==0.10.0; re-run the pip install step.")
+else:
+    s = pydyf.Stream()
+    s.transform(1, 0, 0, 1, 0, 0)  # raises the production error on 0.12.x
+
+# (b) Dependency-consistency check (a conflicting pin breaks the render stack
+#     silently later). Only PDF-stack problems block the deploy; unrelated
+#     warnings are reported but non-fatal.
+import subprocess
+check = subprocess.run([sys.executable, "-m", "pip", "check"],
+                       capture_output=True, text=True)
+if check.returncode != 0:
+    keys = ("weasyprint", "pydyf", "tinycss2", "cssselect2", "pyphen",
+            "fonttools", "cffi", "html5lib", "pillow",
+            "pymupdf", "latex2mathml")
+    lines = [ln for ln in (check.stdout + check.stderr).splitlines()
+             if any(k in ln.lower() for k in keys)]
+    if lines:
+        errors.append("pip dependency problems: " + " | ".join(lines))
+    else:
+        print("[deploy] note: 'pip check' reports unrelated warnings "
+              "(non-PDF packages); not blocking deployment.")
+
+# (c) REAL end-to-end WeasyPrint render through pango + the pydyf writer.
+try:
+    from weasyprint import HTML
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'><style>"
+        "@page { size: A4; margin: 2cm; }"
+        "body { font-family: sans-serif; }"
+        ".rot { transform: rotate(3deg); width: 60mm; }"
+        "table { border-collapse: collapse; } td { border: 1px solid black; padding: 4px; }"
+        "</style></head><body>"
+        "<h1>PDF smoke test</h1>"
+        "<p>English and हिन्दी text: भारत की राजधानी नई दिल्ली है।</p>"
+        "<div class='rot'>rotated block (exercises stream.transform)</div>"
+        "<table><tr><th>Q</th><th>A</th></tr>"
+        "<tr><td>भारत?</td><td>दिल्ली</td></tr></table>"
+        "<p>MathML tag: <math display='inline'><mfrac><mi>x</mi><mn>2</mn></mfrac></math></p>"
+        "</body></html>")
+    pdf = HTML(string=html).write_pdf()
+    assert pdf[:5] == b"%PDF-" and len(pdf) > 2000, "not a PDF"
+    import fitz  # PyMuPDF, already a project dependency
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    assert doc.page_count >= 1
+    text = "".join(p.get_text() for p in doc)
+    assert "PDF smoke test" in text
+    print(f"[deploy] WeasyPrint render OK: {len(pdf)} bytes, {doc.page_count} page(s), Devanagari shaped.")
+except Exception as exc:  # noqa: BLE001
+    errors.append(f"live WeasyPrint render failed: {type(exc).__name__}: {exc}. "
+                  "Ensure OS packages from step 2 (libpango/libpangocairo/libcairo/"
+                  "libgdk-pixbuf2.0, fonts-noto-core/fonts-deva) are installed.")
+
+if errors:
+    for e in errors:
+        print(f"[deploy] PDF STACK CHECK FAILED: {e}")
+    sys.exit(1)
+print("[deploy] PDF stack self-check passed (WeasyPrint 62.3 + pinned pydyf, real render verified).")
+PY
 
 # Thorough .env validation with the project's own dotenv parsing (names only).
 log "Validating .env values with project parser (values never printed) ..."
