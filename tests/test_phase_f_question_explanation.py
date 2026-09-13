@@ -1070,6 +1070,7 @@ class ArchitectureTests(unittest.TestCase):
             "quizbot/creator_bot/handlers/file_import.py",
             "tests/test_phase_f_question_explanation.py",
             "tests/test_phase_b_foundation.py",
+            "tests/test_phase_c_gamification.py",
             # ... plus the pre-deployment audit hardening change set
             # (PDF default config, (A) parser, XSS/SSRF hardening, runner
             # PDF robustness, Hindi fonts/swap provisioning, BotFather menu):
@@ -1092,6 +1093,7 @@ class ArchitectureTests(unittest.TestCase):
             "tests/test_runner_pdf_report.py",
             "tests/test_url_import_ssrf.py",
             "tests/test_mini_app_batch_safety.py",
+            "tests/test_weasyprint_runtime_compat.py",
         }
         for path in changed:
             self.assertIn(path, allowed, f"unexpected change: {path}")

@@ -16,7 +16,24 @@ beautifulsoup4==4.12.3
 unidecode==1.3.8
 
 # ---- PDF generation  ----
+# WeasyPrint 62.3 (2024-06-21) declares only LOWER bounds on its pure-Python
+# PDF stack (pydyf>=0.10.0, tinycss2>=1.3.0 ...) with NO upper bound, so a
+# fresh `pip install -r requirements.txt` after 2025-12-02 silently pulls
+# pydyf 0.12.x, whose Stream class removed transform(). WeasyPrint 62.3
+# weasyprint/pdf/stream.py calls super().transform() for every coordinate
+# transform and then crashes at page serialisation with:
+#   AttributeError: 'super' object has no attribute 'transform'
+# (seen in production on quizbot.service, Ubuntu 24.04 / Python 3.12).
+# Pin the exact dependency set WeasyPrint 62.3 shipped with; every pin below
+# has cp312 manylinux / py3-none-any wheels for Ubuntu 24.04 / Python 3.12.
 weasyprint==62.3
+pydyf==0.10.0
+tinycss2==1.3.0
+cssselect2==0.7.0
+pyphen==0.15.0
+fonttools[woff]==4.53.1
+cffi==1.16.0
+html5lib==1.1
 PyMuPDF==1.24.11
 Pillow==11.0.0
 pytesseract==0.3.13
