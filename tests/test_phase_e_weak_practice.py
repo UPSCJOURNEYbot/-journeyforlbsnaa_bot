@@ -385,7 +385,13 @@ def _run_pipeline(rows, pipeline):
                 for k, v in spec.items():
                     if v == 0:
                         continue
-                    if isinstance(v, str) and v.startswith("$"):
+                    if v == 1:
+                        # Mongo inclusion form: copy the existing (possibly
+                        # dotted) field, not the literal integer 1.
+                        vals = _path_values(r, k.split("."))
+                        if vals:
+                            nr[k] = vals[0]
+                    elif isinstance(v, str) and v.startswith("$"):
                         nr[k] = _get_path(r, v[1:])
                     elif isinstance(v, dict):
                         val = _eval(v, r)
@@ -934,6 +940,33 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(q["question"] == "J broken" for q in built["questions"]))
         self.assertGreaterEqual(built["excluded"], 1)
 
+    async def test_subject_only_fallback_selection(self):
+        # Questions carry subject but NO topic (and no sections): they form
+        # the labelled 'Polity . untagged' bucket and remain practicable.
+        qs = [question(f"U{i}", ["a", "b"], 0, subject="Polity")
+              for i in range(6)]
+        await seed(self.db, "qU", qs)
+        await seed_topic_performance(
+            self.db, 1, "qU", qs, correct_idx=[], wrong_idx=list(range(6)))
+        svc = wp.WeakPracticeService(self.db)
+        ov = await svc.overview(1)
+        self.assertEqual(len(ov["eligible"]), 1)
+        self.assertTrue(ov["eligible"][0]["subject_only"])
+        built = await svc.build_practice(1)
+        self.assertEqual(built["state"], "ready")
+        self.assertTrue(all(q["question"].startswith("U")
+                            for q in built["questions"]))
+
+    async def test_other_topics_in_played_quiz_never_leak(self):
+        qs = polity_quiz("qA", n_wrong_topic=6)  # + Parliament + untagged
+        await seed(self.db, "qA", qs)
+        await seed_topic_performance(
+            self.db, 1, "qA", qs, correct_idx=[6], wrong_idx=list(range(6)))
+        built = await wp.WeakPracticeService(self.db).build_practice(1)
+        texts = [q["question"] for q in built["questions"]]
+        self.assertTrue(all("Judiciary" in t for t in texts))
+        self.assertFalse(any("Parliament" in t or "No meta" in t for t in texts))
+
     async def test_t1_repeated_cap_prevents_domination(self):
         # 6 repeated (T1) questions + 4 fresh topic questions; session must
         # contain at most 4 repeated and must fill with others.
@@ -1083,6 +1116,29 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         ai_q = next(q for q in built["questions"] if q["question"].startswith("AI"))
         self.assertNotIn("_revision_origins", ai_q)
 
+        # End-to-end at the canonical boundary: answer the practice (an
+        # ad-hoc question WRONG). Events/XP flow; NO mistake row may open
+        # for the synthetic ad-hoc qid, and nothing is persisted as stored.
+        results = []
+        for i, q in enumerate(built["questions"]):
+            if q["question"].startswith("AI"):
+                results.append(qr(i, OUTCOME_INCORRECT, [9]))
+            else:
+                cid = q["correct_option_id"]
+                sel = cid if isinstance(cid, list) else [cid]
+                results.append(qr(i, OUTCOME_CORRECT, sel))
+        out = await complete(self.db, user=1, attempt="WKadhoc", qid="WKadhoc",
+                             results=results, questions=built["questions"],
+                             source="dm", persisted=False)
+        self.assertIsNotNone(out["gamification"])
+        mistake_docs = self.db.collection("user_mistakes").docs
+        self.assertFalse(any(r["qid"] in ("AIabc", "WKadhoc")
+                             for r in mistake_docs))
+        new_events = [e for e in self.db.collection("question_events").docs
+                      if e["attempt_id"] == "WKadhoc"]
+        self.assertEqual(len(new_events), built["size"])
+        self.assertTrue(all(e["quiz_persisted"] is False for e in new_events))
+
     async def test_27_bounded_db_operations(self):
         qs = await self._polity_history(user=1, n=8)
         # 60+ played quizzes beyond the cap to prove bounded reads.
@@ -1139,9 +1195,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.db.collection("user_xp").docs[0]["total_xp"], xp_after)
 
-    async def test_non_mistake_weak_question_answer_feeds_events_not_fold(self):
-        # Fresh bank questions in a weak topic (never missed before) get
-        # answered in the practice: events/XP flow, but no fold to mistakes.
+    async def test_fresh_stored_question_feedback_and_adhoc_no_origin(self):
+        # Fresh bank questions in a weak topic (never missed before) carry
+        # the stored-quiz origin: a CORRECT answer must create no mistake
+        # row, while events/XP flow; a WRONG answer later opens the origin.
         qs = []
         for i in range(6):
             qs.append(question(f"J{i}", ["a", "b"], 0,
@@ -1149,21 +1206,43 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await seed(self.db, "q1", qs)
         await seed_topic_performance(
             self.db, 1, "q1", qs, correct_idx=[], wrong_idx=list(range(6)))
-        # Add 4 unseen same-topic questions in a quiz the user OWNS.
+        # 4 unseen same-topic questions in a quiz the user OWNS.
         owned = [question(f"Fresh{i}", ["a", "b"], 0,
                           subject="Polity", topic="Judiciary") for i in range(4)]
         await seed(self.db, "own1", owned, creator=1)
-        built = await wp.WeakPracticeService(self.db).build_practice(1)
+        svc = wp.WeakPracticeService(self.db)
+        built = await svc.build_practice(1)
         fresh = [q for q in built["questions"]
                  if q["question"].startswith("Fresh")]
         self.assertTrue(fresh)
-        self.assertTrue(all("_revision_origins" not in q for q in fresh))
+        # Stored-bank provenance is present (single origin each).
+        for q in fresh:
+            self.assertEqual(len(q["_revision_origins"]), 1)
+            self.assertEqual(q["_revision_origins"][0]["qid"], "own1")
+        # Answer everything correctly: fresh origins must NOT create rows.
         results = [qr(i, OUTCOME_CORRECT, [0])
                    for i in range(len(built["questions"]))]
         out = await complete(self.db, user=1, attempt="WKf", qid="WKx",
                              results=results, questions=built["questions"],
                              source="dm", persisted=False)
         self.assertIsNotNone(out["gamification"])
+        own_rows = [r for r in self.db.collection("user_mistakes").docs
+                    if r["qid"] == "own1"]
+        self.assertEqual(own_rows, [])
+
+        # A later session: answer a FRESH question WRONG -> origin opens.
+        built2 = await svc.build_practice(1)
+        q0 = next(q for q in built2["questions"]
+                  if q["question"].startswith("Fresh"))
+        idx = built2["questions"].index(q0)
+        await complete(self.db, user=1, attempt="WKw", qid="WKx",
+                       results=[qr(idx, OUTCOME_INCORRECT, [9])],
+                       questions=built2["questions"],
+                       source="dm", persisted=False)
+        rows = [r for r in self.db.collection("user_mistakes").docs
+                if r["qid"] == "own1"]
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["status"], "open")
 
 
     async def test_shuffle_safe_fold_with_multi_correct(self):
@@ -1442,6 +1521,25 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         _cid, _c, questions, _q, _id = self.captured["args"]
         topics = {q.get("analytics", {}).get("topic") for q in questions}
         self.assertEqual(topics, {"Local Gov"})
+
+    async def test_limited_pool_honest_wording(self):
+        # 2 playable weak-topic questions, repeated across 3 attempts so the
+        # topic is eligible (>=5 answered, >=2 wrong) but content is scarce.
+        qs = polity_quiz("qL", n_wrong_topic=2)
+        await seed(self.db, "qL", qs)
+        for k, pref in enumerate(("l1", "l2", "l3")):
+            await seed_topic_performance(
+                self.db, 1, "qL", qs, correct_idx=[], wrong_idx=[0, 1],
+                attempt_prefix=pref, at_days_ago=k + 1)
+        upd = FakeUpdate(1, data=self.mod._cb("auto", 1))
+        ctx = FakeCtx()
+        await self.mod.weakquiz_callback(upd, ctx)
+        _cid, _c, questions, _q, _id = self.captured["args"]
+        self.assertEqual(len(questions), 2)
+        text = ctx.bot.sent[-1][1]
+        self.assertIn("could only find", text)
+        self.assertIn("2", text)
+        self.assertIn("playable", text)
 
     async def test_topics_view_then_back(self):
         await self._weak()

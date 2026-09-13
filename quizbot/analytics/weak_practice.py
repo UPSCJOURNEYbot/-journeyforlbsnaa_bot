@@ -314,14 +314,18 @@ def assemble_session(
                     break
 
     # Open mistakes, poor-seen and fresh questions jump ahead of excess
-    # repeated items, which then fill any slots left over.
+    # repeated items, which still outrank merely-mastered fillers and take
+    # any slots left before the mastered tail.
     _t1_overflow_pass = False
     take_tier(TIER_REPEATED)
-    for tier in (TIER_OPEN, TIER_POOR_SEEN, TIER_FRESH, TIER_MASTERED):
+    for tier in (TIER_OPEN, TIER_POOR_SEEN, TIER_FRESH):
         take_tier(tier)
     if len(selected) < size:
         _t1_overflow_pass = True
         take_tier(TIER_REPEATED)
+    if len(selected) < size:
+        _t1_overflow_pass = False
+        take_tier(TIER_MASTERED)
     return selected[:size]
 
 
@@ -499,9 +503,17 @@ class WeakPracticeService:
                 ckey = bucket_key(analytics.get("subject"), None)
             if ckey not in wanted_set:
                 continue
+            # The question comes from a real STORED quiz in the user's pool,
+            # so its origin is legitimate fold provenance: a wrong practice
+            # answer opens the non-destructive mistake row for that origin
+            # (idempotent under the practice attempt id); a correct answer on
+            # a never-missed question is a no-op there, exactly as designed.
+            origin_sid = key[1] if key[0] == "snap" else None
             candidates[key] = {
                 "key": key, "question": q, "bucket": ckey,
-                "origins": [], "mistake_group": None,
+                "origins": [{"qid": qid, "q_index": idx,
+                             "snapshot_id": origin_sid}],
+                "mistake_group": None,
                 "history": perf_map.get((qid, idx)),
                 "difficulty": analytics.get("difficulty"),
             }
@@ -521,10 +533,18 @@ class WeakPracticeService:
                         existing = candidates[probe]
                         break
             if existing is not None:
-                existing["origins"] = [
-                    {"qid": o["qid"], "q_index": o["q_index"],
-                     "snapshot_id": o.get("snapshot_id") or sid}
-                    for o in g["origins"] if o.get("qid")]
+                # Union: identical content may live in several stored
+                # quizzes, all of which the practice answer applies to.
+                merged = list(existing.get("origins") or [])
+                for o in g["origins"]:
+                    if not o.get("qid"):
+                        continue
+                    entry = {"qid": o["qid"], "q_index": o["q_index"],
+                             "snapshot_id": o.get("snapshot_id") or sid}
+                    if (entry["qid"], entry["q_index"]) not in [
+                            (e["qid"], e["q_index"]) for e in merged]:
+                        merged.append(entry)
+                existing["origins"] = merged
                 existing["mistake_group"] = g
                 continue
             built = await self.revision._build_question(g, quiz_cache, snap_map)
