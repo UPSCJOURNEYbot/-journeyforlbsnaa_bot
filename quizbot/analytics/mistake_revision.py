@@ -502,7 +502,8 @@ class MistakeRevisionService:
             "correct_option_id": live.get("correct_option_id"),
         }
         # Rich fields only exist on the live (stored) question.
-        for optional in ("explanation", "file_id", "reply_text"):
+        for optional in ("explanation", "explanation_detail",
+                         "file_id", "reply_text"):
             if live.get(optional):
                 q[optional] = live[optional]
         meta = self._metadata(group)
@@ -523,6 +524,16 @@ class MistakeRevisionService:
             "options": list(snap.get("options") or []),
             "correct_option_id": snap.get("correct_option_id"),
         }
+        # Phase F: carry the explanation companions the snapshot captured
+        # (present only on snapshots written after Phase F; legacy docs lack
+        # the keys and stay explanation-free, exactly as before). Identity
+        # fields above are never altered.
+        explanation = snap.get("explanation")
+        if isinstance(explanation, str) and explanation.strip():
+            q["explanation"] = explanation
+        detail = snap.get("explanation_detail")
+        if isinstance(detail, dict) and detail:
+            q["explanation_detail"] = detail
         meta = self._metadata(group)
         if meta:
             q["analytics"] = meta

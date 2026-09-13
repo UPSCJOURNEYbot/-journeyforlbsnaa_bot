@@ -155,13 +155,29 @@ def _process_json(raw: dict, remove_words: list[str], out_questions: list[dict])
             if reply_text:
                 reply_text = strip_source_noise(reply_text)
 
-            out_questions.append(
-                {
-                    "question": question_text, "options": options,
-                    "correct_option_id": correct_index, "explanation": explanation,
-                    "reply_text": reply_text, "file_id": q.get("file_id"),
-                }
-            )
+            item = {
+                "question": question_text, "options": options,
+                "correct_option_id": correct_index, "explanation": explanation,
+                "reply_text": reply_text, "file_id": q.get("file_id"),
+            }
+            # Phase F: optional structured explanation companions. Option
+            # notes are bound to POSITIONAL option indices; if any source
+            # option was dropped/malformed/empty those indices shift (the
+            # answer key remaps via id_to_index, notes cannot), so to never
+            # misattribute a note to a different option the companion is
+            # carried ONLY when the option list survived 1:1. The plain
+            # explanation is unaffected and always retained.
+            detail = q.get("explanation_detail")
+            if (isinstance(detail, dict)
+                    and len(options) == len(options_data)
+                    and isinstance(detail.get("options"), (list, dict))):
+                item["explanation_detail"] = detail
+            elif isinstance(detail, dict) and not isinstance(
+                    detail.get("options"), (list, dict)):
+                # Prose-only companion (why/concept/takeaway) is index-free
+                # and therefore safe even after option filtering.
+                item["explanation_detail"] = detail
+            out_questions.append(item)
             processed += 1
         except Exception:
             logger.debug("Skipped malformed question in JSON import", exc_info=True)

@@ -112,15 +112,39 @@ def _build_testseries_payload(quizzes: list[dict], mode: str, title: str, *,
     questions_payload = []
     for quiz in quizzes:
         for q in quiz.get("questions", []):
-            options = [str(o) for o in q.get("options", []) if o]
+            raw_options = q.get("options", [])
+            # Remember each surviving option's canonical index so Phase F
+            # option notes are re-lettered onto exactly the options the
+            # service prints (dropping an empty option would otherwise let
+            # a note silently point at a neighbour).
+            survivors = [
+                (i, str(o)) for i, o in enumerate(raw_options) if o]
+            options = [text for _, text in survivors]
             if not options:
                 continue
+            survivor_order = (
+                [i for i, _ in survivors]
+                if len(survivors) != len(raw_options) else None)
+            # Phase F: structured companions compose into the contract's
+            # single explanation string and are bounded to the service's
+            # own sanitiser limit on a line boundary (never a hard mid-word
+            # slice). Legacy strings pass through verbatim.
+            from quizbot.shared.explanations import (
+                PDF_SERVICE_EXPLANATION_MAX,
+                render_plain_text,
+            )
+            explanation = render_plain_text(
+                q, max_len=PDF_SERVICE_EXPLANATION_MAX,
+                display_order=survivor_order)
+            if not explanation:
+                explanation = str(q.get("explanation") or "").strip()[
+                    :PDF_SERVICE_EXPLANATION_MAX]
             questions_payload.append(
                 {
                     "question": str(q.get("question", "")).strip(),
                     "options": options,
                     "correct_option_id": q.get("correct_option_id", q.get("correct_option", 0)),
-                    "explanation": str(q.get("explanation") or "").strip(),
+                    "explanation": explanation,
                 }
             )
     if not questions_payload:

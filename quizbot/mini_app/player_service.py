@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
+from quizbot.shared.explanations import render_plain_text
 from quizbot.analytics.runtime import build_miniapp_results
 from quizbot.analytics.service import (
     SOURCE_MINIAPP,
@@ -227,10 +228,14 @@ def submit_answer(session: dict, position: int, selected: list[int]) -> Optional
         "time_taken": time_taken,
     }
 
+    # Phase F: compose structured companions into the same single
+    # client-facing string (legacy explanations remain byte-identical).
+    explanation = render_plain_text(
+        q, display_order=pq.get("display_order")) or None
     return {
         "correct": correct,
         "correct_options": correct_ids,
-        "explanation": q.get("explanation"),
+        "explanation": explanation,
         "score_delta": round(score_delta, 4),
     }
 
@@ -299,7 +304,8 @@ async def complete_session(attempt_id: str) -> Optional[dict]:
                 "correct_options": pq["correct_ids"],
                 "selected": ans["selected"] if ans else [],
                 "correct": ans["correct"] if ans else False,
-                "explanation": q.get("explanation"),
+                "explanation": render_plain_text(
+                    q, display_order=pq.get("display_order")) or None,
             })
 
     return {

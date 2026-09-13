@@ -219,6 +219,12 @@ class QuizRepository:
         }
         if field not in allowed:
             raise ValueError(f"Field '{field}' is not updatable")
+        if field == "questions" and isinstance(value, list):
+            # Same storage chokepoint as create(): creator edits can remove
+            # or reorder options, so Phase F option notes must be revalidated
+            # against the final option count (out-of-range notes dropped,
+            # never re-pointed). Legacy questions come through unchanged.
+            value = [normalize_question(q) for q in value]
         await self.col.update_one(
             {"qid": qid}, {"$set": {field: value, "updated_at": _now_iso()}}
         )

@@ -1132,21 +1132,32 @@ async def render_quiz_html(quiz: dict, *, mode: str = "exam") -> tuple[bytes, st
     # fresh on every render (kept intentionally -- see docstring above).
     q_js_items = []
     for i, q in enumerate(questions):
-        opts = list(q.get("options") or [])
+        src_opts = list(q.get("options") or [])
         correct_idx = int(q.get("correct_option_id", 0) or 0)
-        correct_opt = opts[correct_idx] if 0 <= correct_idx < len(opts) else (opts[0] if opts else "")
-        random.shuffle(opts)
-        try:
-            new_correct_index = opts.index(correct_opt)
-        except ValueError:
+        # Permute an index list so the SAME permutation can remap Phase F
+        # option-note letters; the resulting shuffled options distribution
+        # is identical to the previous in-place random.shuffle.
+        order = list(range(len(src_opts)))
+        random.shuffle(order)
+        opts = [src_opts[k] for k in order]
+        if 0 <= correct_idx < len(src_opts):
+            new_correct_index = order.index(correct_idx)
+        else:
             new_correct_index = 0
         opts_json = json.dumps(opts, ensure_ascii=False)
+        # Phase F: structured explanations compose into the same plain
+        # exp field (rendered pre-wrapped by the page's renderer); legacy
+        # single explanations pass through verbatim. Option-note letters
+        # follow this report's freshly shuffled display order.
+        from quizbot.shared.explanations import render_plain_text
+        composed_exp = (render_plain_text(q, display_order=order)
+                        or "No explanation")
         q_js_items.append(
             f'{{id:{i},txt:"{_je(q.get("question", ""))}",'
             f'ref:"{_je(q.get("reply_text", ""))}",'
             f'opts:{opts_json},'
             f'ci:{new_correct_index},'
-            f'exp:"{_je(q.get("explanation", "No explanation"))}"}}'
+            f'exp:"{_je(composed_exp)}"}}'
         )
     questions_js = ",".join(q_js_items)
 
