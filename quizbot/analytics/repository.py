@@ -21,6 +21,7 @@ from .metadata import (
     OUTCOME_CORRECT,
     OUTCOME_INCORRECT,
     OUTCOME_SKIPPED,
+    TOPIC_SOURCE_QUESTION,
     snapshot_content_hash,
 )
 
@@ -307,11 +308,18 @@ class QuestionEventRepository:
         return out
 
     async def get_question_performance(
-        self, user_id: int, qid: Optional[str] = None, limit: int = 200
+        self, user_id: int, qid: Optional[str] = None, limit: int = 200,
+        qids: Optional[list[str]] = None,
     ) -> list[dict]:
-        """Per (quiz, question) rollup with the latest identity snapshot."""
+        """Per (quiz, question) rollup with the latest identity snapshot.
+
+        ``qids`` (Phase E) restricts the read to a BOUNDED list of stored
+        quiz ids (the user's played/owned practice pool); it is used instead
+        of the single ``qid`` filter when supplied."""
         match: dict[str, Any] = {"user_id": user_id}
-        if qid is not None:
+        if qids:
+            match["qid"] = {"$in": list(qids)}
+        elif qid is not None:
             match["qid"] = qid
         pipeline = [
             {"$match": match},
@@ -360,4 +368,196 @@ class QuestionEventRepository:
             if row.get("legacy_snapshot"):
                 item["question_snapshot"] = row["legacy_snapshot"]
             out.append(item)
+        return out
+
+    # ------------------------------------------------------------------
+    # Phase E: bounded, user-scoped reads powering /weakquiz. Every read
+    # is user-prefixed (index-backed) and capped; weak selection never
+    # scans the whole events collection or the question bank.
+    # ------------------------------------------------------------------
+
+    async def distinct_played_qids(
+        self, user_id: int, limit: int = 50
+    ) -> list[str]:
+        """Bounded set of STORED quiz ids this user has answered questions
+        in, most recently answered first. Ad-hoc synthetic qids (AI/PDF/
+        revision/weak sessions, ``quiz_persisted`` false) are excluded --
+        they have no stored quiz document and would never match the bank."""
+        pipeline = [
+            {"$match": {
+                "user_id": user_id,
+                "quiz_persisted": True,
+                "qid": {"$ne": None},
+            }},
+            {"$group": {
+                "_id": "$qid",
+                "last_answered": {"$max": "$answered_at"},
+                "last_created": {"$max": "$created_at"},
+            }},
+            {"$sort": {"last_answered": -1, "last_created": -1, "_id": 1}},
+            {"$limit": int(limit)},
+        ]
+        return [r["_id"] async for r in self.col.aggregate(pipeline)
+                if r.get("_id")]
+
+    async def get_practice_rollups(
+        self, user_id: int, recent_cutoff: str, limit: int = 100
+    ) -> dict:
+        """One bounded ``$facet`` returning everything /weakquiz needs to
+        rank the user's OWN topics:
+
+        * ``topics``       -- explicit-metadata buckets keyed (subject,
+          topic), pooled across quizzes (section-derived names are
+          deliberately excluded -- they are quiz-scoped free text);
+        * ``subject_only`` -- questions carrying a subject but no topic,
+          the clearly-labelled 'Subject \u00b7 untagged' fallback;
+        * ``answered``     -- total answered questions, for empty/
+          insufficient-state messaging.
+
+        Each bucket carries correct/incorrect/skipped counts, the number of
+        distinct attempts, last answered time and recent incorrect answers
+        (on/after ``recent_cutoff``, a lexicographically-comparable
+        ``%Y-%m-%d %H:%M:%S`` UTC string)."""
+        def _group(id_expr):
+            return [
+                {"$group": {
+                    "_id": id_expr,
+                    "correct": {"$sum": {"$cond": [
+                        {"$eq": ["$outcome", OUTCOME_CORRECT]}, 1, 0]}},
+                    "incorrect": {"$sum": {"$cond": [
+                        {"$eq": ["$outcome", OUTCOME_INCORRECT]}, 1, 0]}},
+                    "skipped": {"$sum": {"$cond": [
+                        {"$eq": ["$outcome", OUTCOME_SKIPPED]}, 1, 0]}},
+                    "attempt_ids": {"$addToSet": "$attempt_id"},
+                    "last_answered_at": {"$max": "$answered_at"},
+                    "recent_incorrect": {"$sum": {"$cond": [
+                        {"$and": [
+                            {"$eq": ["$outcome", OUTCOME_INCORRECT]},
+                            {"$gte": ["$answered_at", recent_cutoff]},
+                        ]},
+                        1, 0]}},
+                }},
+                {"$limit": int(limit)},
+            ]
+
+        pipeline = [
+            {"$match": {"user_id": user_id}},
+            {"$facet": {
+                "topics": (
+                    [{"$match": {
+                        "topic": {"$ne": None},
+                        "topic_source": TOPIC_SOURCE_QUESTION,
+                    }}]
+                    + _group({"subject": "$subject", "topic": "$topic"})
+                ),
+                "subject_only": (
+                    [{"$match": {
+                        "subject": {"$ne": None},
+                        "$or": [
+                            {"topic": None},
+                            {"topic": {"$exists": False}},
+                        ],
+                    }}]
+                    + _group({"subject": "$subject"})
+                ),
+                "answered": [
+                    {"$match": {"outcome": {
+                        "$in": [OUTCOME_CORRECT, OUTCOME_INCORRECT]}}},
+                    {"$group": {"_id": None, "n": {"$sum": 1}}},
+                ],
+            }},
+        ]
+        rows = [r async for r in self.col.aggregate(pipeline)]
+        if not rows:
+            return {"topics": [], "subject_only": [], "answered": 0}
+        row = rows[0]
+
+        def _normalize(rows_out, *, subject_only):
+            out = []
+            for r in rows_out or []:
+                key = r.get("_id") or {}
+                subject = key.get("subject")
+                out.append({
+                    "subject": subject,
+                    "topic": None if subject_only else key.get("topic"),
+                    "subject_only": subject_only,
+                    "correct": r.get("correct", 0),
+                    "incorrect": r.get("incorrect", 0),
+                    "skipped": r.get("skipped", 0),
+                    "attempt_count": len(
+                        [a for a in r.get("attempt_ids", []) if a]),
+                    "recent_incorrect": r.get("recent_incorrect", 0),
+                    "last_answered_at": r.get("last_answered_at"),
+                })
+            return out
+
+        answered_rows = row.get("answered") or []
+        answered = answered_rows[0]["n"] if answered_rows else 0
+        return {
+            "topics": _normalize(row.get("topics"), subject_only=False),
+            "subject_only": _normalize(
+                row.get("subject_only"), subject_only=True),
+            "answered": answered,
+        }
+
+    async def get_seen_ad_hoc(
+        self, user_id: int, buckets: list[tuple], recent_cutoff: str,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Questions the user answered in quizzes WITHOUT a stored quiz
+        document (AI/PDF/mix/ad-hoc), recoverable only via their content
+        snapshot. ``buckets`` is a list of ``(subject, topic)`` keys (topic
+        None = subject-only). Returns one row per distinct ``snapshot_id``
+        with personal history; content is resolved by the service via one
+        bounded ``question_snapshots`` $in."""
+        if not buckets:
+            return []
+        ors = []
+        for subject, topic in buckets:
+            cond: dict[str, Any] = {}
+            if topic is None:
+                cond["$or"] = [
+                    {"topic": None}, {"topic": {"$exists": False}}]
+            else:
+                cond["topic"] = topic
+            if subject:
+                cond["subject"] = subject
+            ors.append(cond)
+        pipeline = [
+            {"$match": {
+                "user_id": user_id,
+                "quiz_persisted": False,
+                "snapshot_id": {"$ne": None},
+                "outcome": {"$in": [OUTCOME_CORRECT, OUTCOME_INCORRECT]},
+                "$or": ors,
+            }},
+            {"$sort": {"answered_at": -1}},
+            {"$group": {
+                "_id": "$snapshot_id",
+                "subject": {"$last": "$subject"},
+                "topic": {"$last": "$topic"},
+                "difficulty": {"$last": "$difficulty"},
+                "correct": {"$sum": {"$cond": [
+                    {"$eq": ["$outcome", OUTCOME_CORRECT]}, 1, 0]}},
+                "incorrect": {"$sum": {"$cond": [
+                    {"$eq": ["$outcome", OUTCOME_INCORRECT]}, 1, 0]}},
+                "last_outcome": {"$last": "$outcome"},
+                "last_answered_at": {"$max": "$answered_at"},
+                "times_seen": {"$sum": 1},
+            }},
+            {"$limit": int(limit)},
+        ]
+        out = []
+        async for r in self.col.aggregate(pipeline):
+            out.append({
+                "snapshot_id": r.get("_id"),
+                "subject": r.get("subject"),
+                "topic": r.get("topic"),
+                "difficulty": r.get("difficulty"),
+                "correct": r.get("correct", 0),
+                "incorrect": r.get("incorrect", 0),
+                "last_outcome": r.get("last_outcome"),
+                "last_answered_at": r.get("last_answered_at"),
+                "times_seen": r.get("times_seen", 0),
+            })
         return out
