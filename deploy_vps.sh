@@ -421,34 +421,27 @@ $SUDO systemctl restart "$SERVICE_NAME"
 log "Service enabled (starts on boot) and restarted."
 
 # ---------------------------------------------------------------------------
-# 6. Verify: service active + EXACTLY ONE bot process (duplicate-polling guard)
-#    + recent logs. Any failure here exits non-zero with guidance.
+# 6. Verify the service is ACTIVE AND STABLE (no false "DEPLOY OK").
+#    A single is-active probe a few seconds after restart is unsafe for a
+#    Type=simple unit with Restart=always: a process that crashes AFTER the
+#    probe (or is mid crash-loop between attempts) still reports active.
+#    deploy_health_gate.sh requires active(running) continuously across a
+#    stability window, with an unchanged live main PID, no NRestarts growth,
+#    and exactly one matching run.py process — re-checked one final time
+#    after the window. It dumps status+journal and exits non-zero otherwise.
 # ---------------------------------------------------------------------------
-sleep 6
-if ! $SUDO systemctl is-active --quiet "$SERVICE_NAME"; then
-  $SUDO systemctl status "$SERVICE_NAME" --no-pager || true
-  $SUDO journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true
-  fail "Service $SERVICE_NAME is not active. See logs above (often: wrong .env values, MongoDB/Telegram unreachable)."
-fi
-log "Service state: active."
-
-# Duplicate-polling guard: exactly one 'run.py' for this app directory.
-MATCHING_PROCS="$(pgrep -af "[r]un.py" | grep -F "$APP_DIR" || true)"
-COUNT="$(printf '%s\n' "$MATCHING_PROCS" | grep -c . || true)"
-if [ "$COUNT" -eq 1 ]; then
-  log "Polling guard: exactly ONE bot process for $APP_DIR — OK"
-elif [ "$COUNT" -eq 0 ]; then
-  $SUDO journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true
-  fail "Polling guard: no bot process found for $APP_DIR although the service is active. See logs above."
-else
-  printf '%s\n' "$MATCHING_PROCS" >&2
-  fail "Polling guard: $COUNT bot processes match $APP_DIR — duplicate polling would cause Telegram getUpdates conflicts. Stop the extra one(s) (e.g. an old 'python run.py' shell session, start_single_bot.sh, or a duplicate container: 'docker ps' / 'docker stop <name>'), then re-run this script."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/deploy_health_gate.sh" ] || fail "Missing $SCRIPT_DIR/deploy_health_gate.sh (checkout incomplete?)."
+if ! SUDO="$SUDO" HEALTH_START_GRACE="${HEALTH_START_GRACE:-60}" \
+     HEALTH_STABLE_SECS="${HEALTH_STABLE_SECS:-30}" HEALTH_INTERVAL="${HEALTH_INTERVAL:-2}" \
+     "$SCRIPT_DIR/deploy_health_gate.sh" "$SERVICE_NAME" "$APP_DIR"; then
+  fail "Service did not pass the stability health gate — DEPLOY FAILED. $SERVICE_NAME was not proven healthy; inspect the journal output above, fix the startup error, and re-run this script (it is idempotent and did not change .env or data)."
 fi
 
 log "Recent logs:"
 $SUDO journalctl -u "$SERVICE_NAME" -n 20 --no-pager || true
 
-log "DEPLOY OK — $SERVICE_NAME is active, single process, restarts on crash/reboot."
+log "DEPLOY OK — $SERVICE_NAME passed the stability gate (single process, active through the health window), restarts on crash/reboot."
 log "Useful commands:"
 log "  sudo systemctl status $SERVICE_NAME --no-pager"
 log "  sudo journalctl -u $SERVICE_NAME -f"

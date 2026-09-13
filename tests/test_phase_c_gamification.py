@@ -366,6 +366,11 @@ class FakeDB:
             self._cols[name] = FakeCollection(name, self)
         return self._cols[name]
 
+    def __getitem__(self, name):
+        # Motor mapping API parity: production code must be able to use
+        # db["coll"] exactly like a raw MotorDatabase.
+        return self.collection(name)
+
     async def ensure_gamification(self):
         await ensure_gamification_indexes(self)
 

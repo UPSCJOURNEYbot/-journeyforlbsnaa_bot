@@ -351,9 +351,18 @@ def completion_eligible(
 
 
 async def ensure_gamification_indexes(db: Any) -> None:
-    """Idempotent unique/supporting indexes. Safe to run on every startup."""
-    ledger = db.collection("xp_ledger")
-    users = db.collection("user_xp")
+    """Idempotent unique/supporting indexes. Safe to run on every startup.
+
+    Collections use Motor's mapping API (``db[name]``), not the app
+    wrapper's ``.collection()`` method: startup hands this function the RAW
+    MotorDatabase (Database._ensure_indexes), on which ``db.collection("x")``
+    resolves to the collection literally named "collection" and raises
+    'MotorCollection object is not callable' (the production startup crash).
+    Mapping access works on raw Motor, the app Database wrapper, and the
+    in-memory test doubles.
+    """
+    ledger = db["xp_ledger"]
+    users = db["user_xp"]
 
     # Unique event identity: an (user, event) is awarded at most once.
     await ledger.create_index(
@@ -398,8 +407,10 @@ class GamificationService:
             from quizbot.database.db import get_db
             db = get_db()
         self.db = db
-        self.ledger = db.collection("xp_ledger")
-        self.users = db.collection("user_xp")
+        # Mapping API — works for the app Database wrapper AND a raw
+        # MotorDatabase (see ensure_gamification_indexes docstring).
+        self.ledger = db["xp_ledger"]
+        self.users = db["user_xp"]
 
     # -- helpers -----------------------------------------------------------
 

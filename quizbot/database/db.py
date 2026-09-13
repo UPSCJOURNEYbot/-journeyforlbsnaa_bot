@@ -153,6 +153,20 @@ class Database:
     def collection(self, name: str) -> AsyncIOMotorCollection:
         return self.db[name]
 
+    def __getitem__(self, name: str) -> AsyncIOMotorCollection:
+        """Motor/PyMongo mapping accessor (``db['coll']``). The wrapper now
+        exposes the SAME collection-resolution API as a raw MotorDatabase so
+        startup code that hands a raw Motor handle to helpers (e.g.
+        ``ensure_gamification_indexes``) works regardless of which handle it
+        receives. On a raw MotorDatabase ``db.collection`` is ITSELF a
+        MotorCollection (named "collection") and is not callable, so calling
+        ``db.collection("x")`` raises 'MotorCollection object is not
+        callable' — helpers must use mapping access, not that spelling."""
+        return self.db[name]
+
+    def get_collection(self, name: str, *args: object, **kwargs: object) -> AsyncIOMotorCollection:
+        return self.db.get_collection(name, *args, **kwargs)
+
 
 _db_instance: Optional[Database] = None
 
