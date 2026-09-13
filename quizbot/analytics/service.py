@@ -24,6 +24,7 @@ import logging
 from typing import Optional
 
 from quizbot.analytics import aggregation
+from quizbot.analytics.gamification import GamificationService
 from quizbot.analytics.metadata import (
     OUTCOME_CORRECT,
     OUTCOME_INCORRECT,
@@ -68,6 +69,9 @@ class AnalyticsService:
         self.mistakes = MistakeRepository(db)
         self.question_stats = QuestionStatsRepository(db)
         self.quizzes = QuizRepository(db)
+        # Phase C: XP / levels / streaks. Hooks into this same canonical
+        # completion path; it never opens a second analytics pipeline.
+        self.gamification = GamificationService(db)
 
     # ------------------------------------------------------------------ writes
 
@@ -276,6 +280,29 @@ class AnalyticsService:
                 await self.quizzes.increment_participants(qid)
                 participant_incremented = True
 
+        # Phase C: XP / levels / daily IST streaks. This MUST be fail-soft: a
+        # gamification failure can never block quiz completion, result/HTML/PDF
+        # report generation, Mini App completion or scheduled completion.
+        gamification_result = None
+        try:
+            gamification_result = await self.gamification.on_completion(
+                user_id=user_id,
+                attempt_id=attempt_id,
+                source=source,
+                question_results=question_results,
+                questions=questions,
+                sections=sections,
+                finalize=finalize,
+                backfilled=backfilled,
+                at=at,
+                enriched_events=enriched,
+            )
+        except Exception:
+            logger.exception(
+                "gamification failed (fail-soft) for user=%s attempt=%s",
+                user_id, attempt_id,
+            )
+
         return {
             "attempt_id": attempt_id,
             "events_total": len(enriched),
@@ -284,6 +311,7 @@ class AnalyticsService:
             "question_stats_items": stats_items,
             "participant_incremented": participant_incremented,
             "skipped": skipped,
+            "gamification": gamification_result,
         }
 
     # ------------------------------------------------------------------- reads
