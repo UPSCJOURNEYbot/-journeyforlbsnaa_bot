@@ -189,6 +189,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. Swap on small VMs (target box is 2 GB/1 vCPU). WeasyPrint report renders
+#     and ffmpeg /podcast encoding can spike RSS; without swap the OOM killer
+#     can terminate the bot (systemd restarts it, but an in-flight job is
+#     lost). Idempotent and NON-fatal: skip if swap already exists, if not
+#     root, on non-Debian hosts, or when SKIP_SWAP=1.
+# ---------------------------------------------------------------------------
+SWAP_SIZE_MB="${SWAP_SIZE_MB:-2048}"
+if [ "${SKIP_SWAP:-0}" -eq 0 ] && [ -z "$(swapon --show 2>/dev/null)" ] && [ ! -f /swapfile ]; then
+  if [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
+    log "No swap detected and this is a small VPS -- creating a ${SWAP_SIZE_MB}MB /swapfile (non-fatal) ..."
+    if $SUDO dd if=/dev/zero of=/swapfile bs=1M count="$SWAP_SIZE_MB" status=none 2>/dev/null \
+       && $SUDO chmod 600 /swapfile \
+       && $SUDO mkswap /swapfile >/dev/null 2>&1 \
+       && $SUDO swapon /swapfile >/dev/null 2>&1; then
+      if ! grep -q '^/swapfile ' /etc/fstab 2>/dev/null; then
+        echo '/swapfile none swap sw 0 0' | $SUDO tee -a /etc/fstab >/dev/null 2>&1 || true
+      fi
+      $SUDO sysctl -q vm.swappiness=10 2>/dev/null || true
+      log "Swap enabled (${SWAP_SIZE_MB}MB)."
+    else
+      $SUDO rm -f /swapfile 2>/dev/null || true
+      log "Swap setup failed/unsupported here (continuing; the service auto-restarts if the OOM killer ever fires)."
+    fi
+  fi
+else
+  log "Swap already configured (or SKIP_SWAP=1) -- leaving as-is."
+fi
+
+# ---------------------------------------------------------------------------
 # 3. Python venv (3.11–3.13) + requirements.txt. Venv is rebuilt ONLY when its
 #    interpreter is outside the supported range — otherwise reused as-is.
 # ---------------------------------------------------------------------------
