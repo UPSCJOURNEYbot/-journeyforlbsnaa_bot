@@ -13,7 +13,6 @@ repositories).
 
 from __future__ import annotations
 
-import asyncio
 import unittest
 
 # ---------------------------------------------------------------------------
@@ -1000,6 +999,25 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.svc.record_completion(
                 user_id=True, attempt_id="x", qid="q", quiz_name="q",
                 question_results=[], source="group", quiz_persisted=False)
+
+    async def test_35_deleted_quiz_still_readable_via_snapshots(self):
+        await self._complete(attempt_id="d1", results=[
+            qr(0, OUTCOME_INCORRECT, selected=[0], correct=[1])])
+        # quiz document is later deleted (qid row gone)
+        await self.db.collection("quizzes").delete_many({})
+        # events, mistakes, overviews and history must remain intact
+        qs = await self.svc.get_question_performance(100)
+        self.assertEqual(len(qs), 1)
+        self.assertEqual(qs[0]["question_snapshot"]["question"], "Q0")
+        mistakes = await self.svc.list_mistakes(100)
+        self.assertEqual(mistakes[0]["question_snapshot"]["question"], "Q0")
+        attempts = await self.svc.list_attempts(100)
+        self.assertEqual(attempts[0]["status"], "completed")
+        ov = await self.svc.get_user_overview(100)
+        self.assertEqual(ov["questions"]["answered"], 1)
+        self.assertEqual(ov["quizzes_played"], 1)  # counted from event qids
+        days = await self.svc.get_activity_days(100)
+        self.assertEqual(len(days), 1)
 
     async def test_36_canonical_answers_under_option_shuffle(self):
         # Full path: group boundary maps a shuffled live session through the

@@ -21,7 +21,7 @@ will build on. Rules enforced here:
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Optional
 
 from quizbot.analytics import aggregation
 from quizbot.analytics.metadata import (
