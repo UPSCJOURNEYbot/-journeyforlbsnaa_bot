@@ -119,6 +119,158 @@ class MarkdownConverterTests(unittest.TestCase):
         self.assertIn("<code>", html)
 
 
+class QuestionAssemblyTests(unittest.TestCase):
+    """The real production path that feeds WeasyPrint (no rendering needed):
+    _build_questions_html covers Q->options->answer->explanation, the shuffle
+    remap, math and escaping."""
+
+    def _polls(self, n):
+        return {f"p{i}": {"question_index": i, "correct_option": [],
+                          "sent_time": 0} for i in range(n)}
+
+    def test_math_hindi_and_long_text(self):
+        questions = [{
+            "question": "ऊर्जा का सूत्र? Energy $E=mc^2$ with a very long " +
+                        "stem " * 40,
+            "options": ["$a^2$", "दूसरा", "तीसरा", "चौथा"],
+            "correct_option_id": 0,
+            "explanation": "Because $$E=mc^2$$ — समानता।",
+        }]
+        html = pdf_reports._build_questions_html(
+            questions, self._polls(1), None, False, "classic")
+        self.assertIn("<math", html)           # inline + block math -> MathML
+        self.assertIn("ऊर्जा", html)           # Devanagari preserved
+        self.assertIn("समानता", html)
+        self.assertIn("opt-correct", html)
+
+    def test_everything_is_escaped(self):
+        xss = "<img src=x onerror=alert(1)>"
+        questions = [{
+            "question": xss,
+            "options": [xss, "b", "c", "d"],
+            "correct_option_id": 1,
+            "explanation": xss,
+            "reply_text": xss,
+        }]
+        html = pdf_reports._build_questions_html(
+            questions, self._polls(1), None, False, "classic")
+        # No live tag/attribute: brackets are entity-escaped everywhere.
+        self.assertNotIn("<img", html)
+        self.assertNotIn("<script", html)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", html)
+
+    def test_shuffle_keeps_exactly_one_correct_mapping(self):
+        import random
+        questions = [{
+            "question": "q", "options": ["alpha", "beta", "gamma", "delta"],
+            "correct_option_id": 2, "explanation": "gamma is right",
+        }]
+        orig_shuffle = random.shuffle
+        try:
+            for _ in range(20):
+                html = pdf_reports._build_questions_html(
+                    questions, self._polls(1), None, True, "classic")
+                self.assertEqual(html.count("opt-correct"), 1)
+        finally:
+            random.shuffle = orig_shuffle
+
+    def test_forced_shuffle_moves_correct_option(self):
+        import random
+        questions = [{
+            "question": "q", "options": ["alpha", "beta", "gamma", "delta"],
+            "correct_option_id": 0,
+            "explanation_why": "",
+            "option_notes": {0: "note-on-alpha"},
+            "explanation": "see note",
+        }]
+        orig = random.shuffle
+
+        def reverse_order(x):
+            x[:] = list(reversed(x))
+
+        random.shuffle = reverse_order
+        try:
+            html = pdf_reports._build_questions_html(
+                questions, self._polls(1), None, True, "classic")
+        finally:
+            random.shuffle = orig
+        # With reversed order canonical index 0 ("alpha") is printed last (D);
+        # the opt-correct class must be on that row, not the first.
+        first_correct = html.index("opt-correct")
+        first_normal = html.index("opt-normal")
+        self.assertGreater(first_correct, first_normal)
+        self.assertIn("alpha", html)
+
+    def test_section_banner_escaped(self):
+        questions = [{"question": "q", "options": ["a", "b"],
+                      "correct_option_id": 0}]
+        sections = [{"name": "<script>x</script>", "start": 0, "end": 0}]
+        html = pdf_reports._build_questions_html(
+            questions, self._polls(1), sections, False, "classic")
+        self.assertNotIn("<script>x</script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+
+class FullDocumentAssemblyTests(unittest.TestCase):
+    """Drive render_quiz_pdf with a stubbed WeasyPrint (pango is absent in CI)
+    so the complete HTML document is validated end to end."""
+
+    def _stub_weasy(self, captured):
+        import sys
+        import types
+
+        class _Doc:
+            def __init__(self, *, string=None, base_url=None):
+                captured["html"] = string
+
+            def write_pdf(self, path):
+                # write a tiny valid PDF so the "success" path runs
+                with open(path, "wb") as fh:
+                    fh.write(b"%PDF-1.4\nstub\n")
+
+        mod = types.ModuleType("weasyprint")
+        mod.HTML = _Doc
+        return mod
+
+    def test_full_report_assembles_and_escapes(self):
+        import os
+        import sys
+        import types
+        from unittest import mock
+
+        captured = {}
+        fake = self._stub_weasy(captured)
+        questions = [
+            {"question": "Q1 संविधान?", "options": ["a", "b <x>", "c", "d"],
+             "correct_option_id": 1, "explanation": "because $x=1$"},
+        ]
+        leaderboard = [
+            {"name": "<b>evil</b>", "correct": 1, "wrong": 0, "score": 1.0,
+             "total_time": 12},
+        ]
+        polls = {"p0": {"question_index": 0, "correct_option": [1],
+                        "sent_time": 0}}
+        out = "/tmp/_audit_full_report.pdf"
+        with mock.patch.dict(sys.modules, {"weasyprint": fake}):
+            ok = pdf_reports.render_quiz_pdf(
+                "<b>Eval</b>", "<chat>", questions, leaderboard, polls,
+                0.25, 1.0, out, shuffle_options=False, style="classic")
+        self.assertTrue(ok)
+        self.assertTrue(os.path.exists(out))
+        os.remove(out)
+        doc = captured["html"]
+        # titles/leaderboard names escaped, no live injected tag
+        self.assertNotIn("<b>Eval</b>", doc)
+        self.assertIn("&lt;b&gt;Eval&lt;/b&gt;", doc)
+        self.assertNotIn("<b>evil</b>", doc)
+        self.assertIn("&lt;b&gt;evil&lt;/b&gt;", doc)
+        # question + MathML + correct row present
+        self.assertIn("संविधान", doc)
+        self.assertIn("<math", doc)
+        self.assertIn("opt-correct", doc)
+        self.assertIn("Questions &amp; Answers", doc)
+
+
 class WeasyPrintGuardTests(unittest.TestCase):
     def _render(self):
         return pdf_reports.render_quiz_pdf(
