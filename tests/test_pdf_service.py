@@ -41,6 +41,9 @@ POLL_DEADLINE = 300
 _HINDI_BITS = [
     "भारत की राजधानी", "प्रश्न संख्या", "ज्ञानी व्यक्ति", "क्षेत्रीय भाषा",
     "त्रिशूल धारण", "श्रृंखला टूटना", "उत्तर प्रदेश", "लब्धप्रतिष्ठ",
+    # Split HarfBuzz clusters: pre-base short-i matra (दि/कि/स्थि) made
+    # fpdf2 2.8.8 emit unmapped raw-CID glyphs inside these words.
+    "नई दिल्ली", "स्थिति रिपोर्ट", "किताब की पंक्ति",
 ]
 
 
@@ -206,10 +209,22 @@ class PdfContentCases(_LiveServer):
             for i in range(1, n + 1):
                 if questions[i - 1]["explanation"]:
                     self.assertIn(f"Q{i}-EXPL-MARKER", full)
-            # 6. Hindi/Unicode preserved incl. conjuncts
+            # 6. Hindi/Unicode preserved incl. conjuncts and split HarfBuzz
+            # clusters (pre-base i-matra, reph, nukta) -- these words must
+            # round-trip verbatim through the ToUnicode text layer. The last
+            # two _HINDI_BITS only occur in documents with >= 11 questions.
             for snippet in ("प्रश्न संख्या", "ज्ञानी", "क्षेत्र", "उत्तर",
-                            "व्याख्या", "श्रृंखला"):
+                            "व्याख्या", "श्रृंखला",
+                            "नई दिल्ली", "स्थिति"):
                 self.assertIn(snippet, full, snippet)
+            if n >= 11:
+                for snippet in ("किताब", "पंक्ति"):
+                    self.assertIn(snippet, full, snippet)
+            # 6b. Raw-CID / control-char corruption signature: fpdf2 unmapped
+            # split-cluster glyphs surface as control bytes or "(cid:n)".
+            c0 = [c for c in full if ord(c) < 0x20 and c not in "\n\r\t"]
+            self.assertEqual(c0, [], f"raw-CID/control chars: {c0!r}")
+            self.assertNotIn("(cid:", full)
             # 7. layout sanity: no blank pages, no U+FFFD, sane word volume
             for idx, text in enumerate(pages_text):
                 self.assertTrue(text.strip(), f"page {idx} is blank")

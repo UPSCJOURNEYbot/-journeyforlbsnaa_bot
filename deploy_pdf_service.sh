@@ -137,7 +137,24 @@ else:
 with urllib.request.urlopen(base + job["download_url"], timeout=30) as r:
     pdf = r.read()
 assert pdf[:4] == b"%PDF" and len(pdf) > 5000, f"bad pdf: {len(pdf)} bytes"
-print(f"[pdf-deploy] end-to-end smoke OK ({len(pdf)} bytes, valid %PDF)")
+
+# Content + searchable-text-layer checks. A PDF that only *looks* right is
+# not enough: fpdf2 2.8.8 used to omit ToUnicode for the extra glyphs of a
+# split Devanagari cluster (pre-base i-matra: दि/कि/स्थि), so copy/search
+# extracted raw subset codes inside words ("दिGल्ली"). Verify real words
+# round-trip verbatim with PyMuPDF (a project dependency).
+import fitz
+doc = fitz.open(stream=pdf, filetype="pdf")
+assert doc.page_count >= 1
+full = "\n".join(p.get_text() for p in doc)
+for must in ("Deploy Smoke Test", "दिल्ली", "नई दिल्ली", "2 + 2",
+             "Select primes", "Answer Key"):
+    assert must in full, f"smoke PDF missing/damaged text: {must!r} -> {full[:400]!r}"
+controls = [c for c in full if ord(c) < 0x20 and c not in "\n\r\t"]
+assert not controls, f"raw-CID/control chars in PDF text layer: {controls!r}"
+assert "(cid:" not in full and "\ufffd" not in full, "unmapped glyphs in text layer"
+doc.close()
+print(f"[pdf-deploy] end-to-end smoke OK ({len(pdf)} bytes, valid %PDF, Hindi text layer intact)")
 PY
 }
 
