@@ -209,7 +209,7 @@ if [ "$SKIP_APT" -eq 0 ] && command -v apt-get >/dev/null 2>&1; then
     ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin \
     libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libcairo2 \
     libffi-dev shared-mime-info fonts-liberation \
-    fonts-noto-core fonts-deva
+    fonts-noto-core fonts-deva fonts-noto-color-emoji
 else
   log "Skipping apt-get (flag or non-Debian system). Ensuring ffmpeg/python exist ..."
   command -v python3 >/dev/null 2>&1 || fail "python3 not found."
@@ -360,6 +360,56 @@ except Exception as exc:  # noqa: BLE001
     errors.append(f"live WeasyPrint render failed: {type(exc).__name__}: {exc}. "
                   "Ensure OS packages from step 2 (libpango/libpangocairo/libcairo/"
                   "libgdk-pixbuf2.0, fonts-noto-core/fonts-deva) are installed.")
+
+# (d) REAL Quiz Result PDF end-to-end: exercises the production template
+#     (bundled Hind @font-face, leaderboard table geometry, content-aware
+#     page breaks) and proves Hindi survives both visually and in the
+#     ToUnicode text layer; also that Q&A begins on page 2, not page 1.
+try:
+    import tempfile
+    from quizbot.runner_bot import pdf_reports
+    from quizbot.runner_bot import wp_indic_tounicode as wpi
+    questions = [
+        {"question": "भारत की राजधानी क्या है?",
+         "options": ["मुंबई", "नई दिल्ली", "कोलकाता", "चेन्नई"],
+         "correct_option_id": 1,
+         "explanation": "नई दिल्ली भारत की राजधानी है।"},
+        {"question": "Q1. Stored badge must not duplicate on paper?",
+         "options": ["a", "b", "c", "d"], "correct_option_id": 0,
+         "explanation": "The renderer strips the stored badge."},
+    ]
+    leaderboard = [
+        {"name": "राहुल", "correct": 1, "wrong": 0, "score": 1.0,
+         "total_time": 9},
+        {"name": "Amit", "correct": 0, "wrong": 1, "score": -0.25,
+         "total_time": 21},
+    ]
+    polls = {f"p{i}": {"question_index": i, "correct_option": [
+        questions[i]["correct_option_id"]], "sent_time": i}
+        for i in range(len(questions))}
+    with tempfile.TemporaryDirectory() as tmp:
+        out = f"{tmp}/deploy_gate_report.pdf"
+        ok = pdf_reports.render_quiz_pdf(
+            "Deploy Gate क्विज़", "Gate चैट", questions, leaderboard, polls,
+            0.25, 1.0, out, shuffle_options=False, style="classic")
+        assert ok, "render_quiz_pdf returned False"
+        pdf = open(out, "rb").read()
+    audit = wpi.audit_report_pdf(
+        pdf,
+        expected_terms=["भारत की राजधानी", "नई दिल्ली",
+                        "नई दिल्ली भारत की राजधानी", "Deploy Gate"],
+        must_contain=["Answer:", "Explanation:", "Questions",
+                      "Leaderboard", "2 Questions"])
+    assert audit["ok"], f"result PDF audit failed: {audit}"
+    pages = wpi.page_texts(pdf)
+    assert len(pages) >= 2, "Q&A must start on page 2"
+    assert "Answer:" not in pages[0], "answer leaked onto page 1"
+    assert "Answer:" in "".join(pages[1:])
+    print("[deploy] Quiz Result PDF render OK: Hindi roundtrip verified in "
+          "the text layer, Q&A starts on page 2.")
+except Exception as exc:  # noqa: BLE001
+    errors.append(
+        f"live Quiz Result PDF render failed: {type(exc).__name__}: {exc}.")
 
 if errors:
     for e in errors:
