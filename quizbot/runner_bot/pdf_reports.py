@@ -107,6 +107,67 @@ def _safe_md_url(url: str, *, image: bool = False) -> Optional[str]:
     return None
 
 
+_LEADING_Q_BADGE_RE = re.compile(r"^\s*Q\.?\s*0*\d{1,3}\s*[.):\-\u2013\u2014]?\s+", re.I)
+
+
+def _strip_rendered_badge(text: str) -> str:
+    """Remove a leading ``Q1.`` / ``Q1)`` / ``Q1 -`` badge from question
+    text so the printed card does not show a duplicated ``Q1  Q1. ...``
+    (the card already prints its own badge). Bare numeric starts
+    (``1. ...``) are left untouched -- those can be statement content.
+    """
+    if not text:
+        return text
+    cleaned = _LEADING_Q_BADGE_RE.sub("", text, count=1)
+    return cleaned or text
+
+
+def _bundled_font_face_css() -> str:
+    """@font-face rules for the repo-bundled Hind fonts (Latin + full
+    Devanagari). Keeps report rendering deterministic and fully offline:
+    WeasyPrint never depends on the Google Fonts <link> at render time,
+    and Hindi text is shaped by a real Indic font both visually and in
+    the PDF's ToUnicode stream."""
+    from pathlib import Path
+
+    fonts_dir = Path(__file__).resolve().parents[2] / "pdf_service" / "fonts"
+    regular = fonts_dir / "Hind-Regular.ttf"
+    bold = fonts_dir / "Hind-Bold.ttf"
+    if not regular.is_file():
+        return ""
+
+    def _uri(path: Path) -> str:
+        return path.as_uri()
+
+    # Color emoji (checks, medals, trophy, books, ...): a tiny CBDT bitmap
+    # subset covering every emoji glyph used by the result report. Registering
+    # it by its canonical family name makes fontconfig/Pango pick it for those
+    # codepoints even when the host OS has no color-emoji font installed, so
+    # the header/leaderboard icons are never rendered as zero-width blanks.
+    emoji = fonts_dir / "NotoColorEmoji.subset.ttf"
+    emoji_block = (
+        f"@font-face {{ font-family: 'Noto Color Emoji'; "
+        f"font-style: normal; src: url('{_uri(emoji)}'); }}\n"
+        if emoji.is_file() else "")
+
+    blocks = [
+        f"@font-face {{ font-family: 'Noto Sans'; font-weight: 400; "
+        f"font-style: normal; src: url('{_uri(regular)}'); }}",
+        f"@font-face {{ font-family: 'Noto Sans Devanagari'; font-weight: 400; "
+        f"font-style: normal; src: url('{_uri(regular)}'); }}",
+    ]
+    if bold.is_file():
+        blocks.append(
+            f"@font-face {{ font-family: 'Noto Sans'; font-weight: 700; "
+            f"font-style: normal; src: url('{_uri(bold)}'); }}")
+        blocks.append(
+            f"@font-face {{ font-family: 'Noto Sans Devanagari'; font-weight: 700; "
+            f"font-style: normal; src: url('{_uri(bold)}'); }}")
+    if emoji_block:
+        blocks.append(emoji_block.rstrip("\n"))
+    return "\n".join(blocks) + "\n"
+
+
 def render_markdown_to_html(text: str) -> str:
     """Convert a GitHub-flavored-markdown subset (tables, lists, blockquotes,
     inline code/code blocks, bold/italic/strikethrough, headings, math,
@@ -505,6 +566,21 @@ def _build_questions_html(
             cls = "opt-correct" if is_correct else "opt-normal"
             opts_html += f'<div class="{cls}"><span class="opt-letter">{letters[j]})</span> {_safe_html(str(opt))}</div>'
 
+        # Explicit Answer line printed BETWEEN the options and the
+        # explanation (audit requirement: question -> Answer -> Explanation,
+        # in that order, with the letter matching the printed/shuffled order).
+        answer_parts = []
+        for cid in correct_ids_final:
+            if 0 <= cid < len(shuffled_options):
+                answer_parts.append(
+                    f"<strong>{letters[cid]})</strong> "
+                    f"{_safe_html(str(shuffled_options[cid]))}")
+        answer_html = (
+            '<div class="answer-box"><strong>\u2705 Answer: </strong>'
+            + " &nbsp;|&nbsp; ".join(answer_parts) + "</div>"
+            if answer_parts else ""
+        )
+
         # Phase F: structured explanations compose into the same box;
         # legacy single explanations are escaped/rendered exactly as before
         # via the module's math-aware escaper. Option notes are re-based onto
@@ -522,12 +598,21 @@ def _build_questions_html(
             f'<div class="reference-box"><strong>\U0001F4DD Reference:</strong> {_safe_html(str(reply_raw))}</div>'
             if reply_raw else ""
         )
-        safe_q = _safe_html(str(q.get("question", "")))
+        safe_q = _safe_html(_strip_rendered_badge(str(q.get("question", ""))))
+
+        # A card taller than a column would be clipped inside the
+        # two-column flow; span all columns for content-heavy questions so
+        # long explanations can flow across pages instead of being cut.
+        expl_len = len(expl_inner or "")
+        card_len = (len(str(q.get("question", "")))
+                    + sum(len(str(o)) for o in shuffled_options) + expl_len)
+        card_cls = "question-card question-card--wide" if card_len > 700 \
+            else "question-card"
 
         questions_html += (
-            f'<div class="question-card"><div class="q-header">'
+            f'<div class="{card_cls}"><div class="q-header">'
             f'<span class="q-badge">Q{i + 1}</span><span class="q-text">{safe_q}</span></div>'
-            f'<div class="options-container">{opts_html}</div>{reply_html}{expl_html}</div>'
+            f'<div class="options-container">{opts_html}</div>{answer_html}{expl_html}{reply_html}</div>'
         )
 
     return questions_html
@@ -549,7 +634,7 @@ table.leaderboard td { padding: 6px; text-align: center; border-bottom: 1px soli
 .rank-col { width: 35px; font-weight: bold; }
 .name-col { text-align: left !important; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .even-row { background-color: #f8fafc; } .odd-row { background-color: #ffffff; }
-.questions-container { column-count: 2; column-gap: 20px; column-rule: 1px solid #e2e8f0; }
+.questions-container { column-count: 2; column-gap: 20px; column-rule: 1px solid #e2e8f0; column-fill: auto; }
 .question-card { border: 1px solid #cbd5e1; border-left: 3px solid #1e3a8a; border-radius: 4px; padding: 8px; margin-bottom: 12px; page-break-inside: avoid; break-inside: avoid; background-color: #fff; }
 .q-header { display: flex; align-items: baseline; margin-bottom: 6px; }
 .q-badge { background-color: #1e3a8a; color: white; font-weight: bold; padding: 1px 6px; border-radius: 3px; font-size: 8pt; margin-right: 8px; min-width: 25px; text-align: center; flex-shrink: 0; }
@@ -581,7 +666,7 @@ table.leaderboard td { padding: 7px; text-align: center; border-bottom: 1px soli
 .name-col { text-align: left !important; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .even-row { background-color: #f5f3ff; } .odd-row { background-color: #ffffff; }
 .badge-correct { color: #10B981; font-weight: 700; } .badge-wrong { color: #EF4444; font-weight: 700; } .badge-acc { color: #667eea; font-weight: 700; }
-.questions-container { column-count: 2; column-gap: 22px; column-rule: 1px solid #e9d5ff; }
+.questions-container { column-count: 2; column-gap: 22px; column-rule: 1px solid #e9d5ff; column-fill: auto; }
 .question-card { border: 1px solid #ddd6fe; border-left: 4px solid #764ba2; border-radius: 6px; padding: 9px; margin-bottom: 14px; page-break-inside: avoid; break-inside: avoid; background: #fdfcff; }
 .q-header { display: flex; align-items: baseline; margin-bottom: 7px; }
 .q-badge { background: linear-gradient(135deg, #667eea, #764ba2); color: white; font-weight: bold; padding: 2px 7px; border-radius: 4px; font-size: 8pt; margin-right: 8px; min-width: 25px; text-align: center; flex-shrink: 0; }
@@ -597,6 +682,47 @@ math { font-size: 9.5pt; } math[display="block"] { display: block; margin: 6px a
 .section-banner { column-span: all; color: white; padding: 8px 14px; font-weight: bold; font-size: 10.5pt; margin: 18px 0 10px 0; border-radius: 6px; letter-spacing: 0.5px; page-break-after: avoid; }
 """
 
+
+_AUDIT_CSS = """
+/* Phase 1 Quiz Result PDF audit overrides */
+@page { }
+/* Page 1 keeps the header + leaderboard; Q&A always starts page 2+. */
+.questions-section { page-break-before: always; break-before: page; }
+.qa-title { page-break-after: avoid; break-after: avoid-page; }
+/* Fixed leaderboard geometry: header columns == body columns, no phantom
+   index column, no overflow; long names wrap instead of clipping. */
+table.leaderboard { table-layout: fixed; width: 100%; word-break: break-word; }
+table.leaderboard th, table.leaderboard td { overflow-wrap: anywhere; }
+table.leaderboard .name-col { white-space: normal; text-align: left !important;
+    overflow: visible; text-overflow: clip; }
+/* Content-aware breaks: a normal card never splits between columns; its
+   header/options/answer never split from each other. */
+.question-card { break-inside: avoid; page-break-inside: avoid;
+    orphans: 2; widows: 2; }
+.q-header, .options-container, .answer-box {
+    break-inside: avoid; page-break-inside: avoid; }
+/* A card header or its options must never be stranded at the bottom of a
+   page/column without the answer that belongs to them. */
+.q-header { break-after: avoid; page-break-after: avoid; }
+.options-container { break-after: avoid; page-break-after: avoid; }
+.answer-box { break-after: avoid; page-break-after: avoid; }
+.question-card--wide { column-span: all; break-inside: auto;
+    page-break-inside: auto; }
+.question-card--wide .explanation-box { break-inside: auto; }
+.section-banner { break-after: avoid; page-break-after: avoid;
+    break-inside: avoid; }
+/* Explicit answer line (between options and explanation). */
+.answer-box { margin-top: 6px; padding: 4px 6px; background: #ecfdf5;
+    border-left: 2px solid #16a34a; font-size: 8.5pt; color: #14532d;
+    border-radius: 0 3px 3px 0; line-height: 1.35; break-inside: avoid;
+    page-break-inside: avoid; }
+/* Devanagari + long unbroken strings must wrap, never overflow/clip. */
+.q-text, .opt-normal, .opt-correct, .explanation-box, .reference-box,
+.answer-box, table.leaderboard td {
+    overflow-wrap: anywhere; word-break: break-word; }
+.md-table { table-layout: fixed; width: 100%; }
+.md-table td, .md-table th { overflow-wrap: anywhere; word-break: break-word; }
+"""
 
 def render_quiz_pdf(
     quiz_name: str,
@@ -618,6 +744,15 @@ def render_quiz_pdf(
     isn't installed or rendering failed.
     """
     try:
+        # Runtime Indic text-layer fix (pre-base matra ToUnicode bug).
+        # Importing applies a guarded, idempotent /ActualText patch to
+        # WeasyPrint's draw layer; failure is non-fatal and only affects
+        # copy/search fidelity, never the visible render.
+        from quizbot.runner_bot import wp_indic_compat
+        # Re-apply on every render: the guard is idempotent, and earlier
+        # fail-soft tests / hosts may have imported WeasyPrint while the
+        # native stack (or a stub) made the first application a no-op.
+        wp_indic_compat.apply_weasyprint_indic_actualtext_fix()
         from weasyprint import HTML
     except ImportError:
         logger.error("WeasyPrint not installed. Run: pip install weasyprint")
@@ -652,6 +787,7 @@ def render_quiz_pdf(
     css = (_MODERN_CSS if style == "modern" else _CLASSIC_CSS).replace(
         "{title_short}", _escape_html(quiz_name[:30])
     )
+    css = _bundled_font_face_css() + css + _AUDIT_CSS
 
     section_banner_bg = (
         "linear-gradient(135deg, #667eea, #764ba2)" if style == "modern" else "linear-gradient(90deg, #1e3a8a, #2563eb)"
@@ -661,7 +797,10 @@ def render_quiz_pdf(
     watermark_div = '<div class="watermark-circle"></div>' if bg_image_b64 else ""
     leaderboard_title = '<div class="section-title">\U0001F3C6 Leaderboard</div>' if leaderboard else ""
     leaderboard_table = (
-        f"""<table class="leaderboard"><thead><tr>
+        f"""<table class="leaderboard"><colgroup>
+            <col style="width:7%"/><col style="width:30%"/><col style="width:9%"/>
+            <col style="width:9%"/><col style="width:13%"/><col style="width:12%"/>
+            <col style="width:20%"/></colgroup><thead><tr>
             <th>Rank</th><th style="text-align:left">Participant</th><th>\u2705</th><th>\u274c</th>
             <th>Score</th><th>Acc%</th><th>Time</th></tr></thead>
             <tbody>{lb_rows_html}</tbody></table>"""
@@ -671,7 +810,6 @@ def render_quiz_pdf(
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;600;700&family=Noto+Sans+Devanagari:wght@400;600;700&family=Merriweather:wght@700&display=swap" rel="stylesheet">
 <style>{css}{bg_css}</style></head>
 <body>
 {watermark_div}
@@ -686,8 +824,10 @@ def render_quiz_pdf(
 </div>
 {leaderboard_title}
 {leaderboard_table}
-<div class="section-title">\U0001F4CB Questions &amp; Answers</div>
+<section class="questions-section">
+<div class="section-title qa-title">\U0001F4CB Questions &amp; Answers</div>
 <div class="questions-container">{questions_html}</div>
+</section>
 <div class="footer-info">Generated by Quiz Bot &bull; {footer_label}</div>
 </body></html>"""
 

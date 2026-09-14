@@ -3,9 +3,12 @@ FROM python:3.11-slim
 # System deps required by weasyprint (PDF generation) and PyMuPDF.
 # fonts-noto-core/fonts-deva provide Noto Sans Devanagari so Hindi renders
 # in the WeasyPrint result PDF even without internet font fetching.
+# fonts-noto-color-emoji provides color emoji (check/mark/trophy/medals) used
+# in the report header and leaderboard; a subset is also @font-face bundled.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libcairo2 \
     libffi-dev shared-mime-info fonts-liberation fonts-noto-core fonts-deva \
+    fonts-noto-color-emoji \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
