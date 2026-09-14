@@ -55,6 +55,24 @@ SKIP_APT=0
 log()  { printf '%s\n' "[deploy] $*"; }
 fail() { printf '%s\n' "[deploy] ERROR: $*" >&2; exit 1; }
 
+# Path + content hash of THIS script as it was when the shell started it.
+# The fast-forward pull below can replace the script on disk, but a running
+# bash keeps reading the bytes it started with, so post-pull steps (pip
+# gates, health check, DEPLOY OK string) can silently execute from the OLD
+# version. If the pull changed us, we re-exec the new file once.
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+SELF_HASH_BEFORE="$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')"
+
+self_reexec_if_updated() {
+  [ -z "${DEPLOY_SELF_REEXECED:-}" ] || return 0
+  local after
+  after="$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')"
+  if [ -n "$SELF_HASH_BEFORE" ] && [ "$after" != "$SELF_HASH_BEFORE" ]; then
+    log "This deploy script was updated by the fast-forward pull — re-executing the NEW version before continuing ..."
+    DEPLOY_SELF_REEXECED=1 exec bash "$SELF_PATH" "$@"
+  fi
+}
+
 usage() {
   sed -n '2,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
@@ -104,6 +122,16 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     # --ff-only guarantees we never rewrite history or lose local commits.
     git -C "$APP_DIR" pull --ff-only origin "$BRANCH" || fail \
       "git pull --ff-only failed (local changes? run 'git -C $APP_DIR status' on the VPS and resolve, then re-run)."
+    # Run the rest of THIS deploy from the just-pulled script content.
+    if [ "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")" = "$SELF_PATH" ]; then
+      self_reexec_if_updated "$@"
+    else
+      # Invoked from a copy outside the checkout (e.g. /root) — always
+      # switch to the freshly pulled canonical script inside APP_DIR.
+      [ -n "${DEPLOY_SELF_REEXECED:-}" ] || {
+        log "Switching to the freshly pulled canonical script in $APP_DIR ..."
+        DEPLOY_SELF_REEXECED=1 exec bash "$APP_DIR/deploy_vps.sh" "$@"; }
+    fi
   fi
 else
   [ -f "$APP_DIR/run.py" ] || fail "$APP_DIR/run.py not found; cannot --check-only."
