@@ -22,6 +22,13 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Must run before any FPDF is constructed: replaces fpdf2 2.8.8's
+# cluster -> ToUnicode assignment so split Devanagari clusters (pre-base
+# matras, reph) do not emit unmapped raw-CID glyphs inside Hindi words.
+from .shape_compat import apply_harfbuzz_tounicode_fix  # noqa: E402
+
+apply_harfbuzz_tounicode_fix()
+
 FONTS_DIR = Path(__file__).resolve().parent / "fonts"
 FONT_REGULAR = FONTS_DIR / "Hind-Regular.ttf"
 FONT_BOLD = FONTS_DIR / "Hind-Bold.ttf"
