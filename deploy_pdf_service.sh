@@ -39,6 +39,22 @@ CHECK_ONLY=0
 log()  { printf '%s\n' "[pdf-deploy] $*"; }
 fail() { printf '%s\n' "[pdf-deploy] ERROR: $*" >&2; exit 1; }
 
+# Path + content hash of THIS script as the shell started it; the ff pull can
+# replace it on disk while bash keeps executing old bytes. Re-exec the new
+# version once after such a self-update (same guard as deploy_vps.sh).
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+SELF_HASH_BEFORE="$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')"
+
+self_reexec_if_updated() {
+  [ -z "${DEPLOY_SELF_REEXECED:-}" ] || return 0
+  local after
+  after="$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')"
+  if [ -n "$SELF_HASH_BEFORE" ] && [ "$after" != "$SELF_HASH_BEFORE" ]; then
+    log "This deploy script was updated by the fast-forward pull — re-executing the NEW version before continuing ..."
+    DEPLOY_SELF_REEXECED=1 exec bash "$SELF_PATH" "$@"
+  fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --app-dir)   APP_DIR="${2:?--app-dir needs a path}"; shift 2 ;;
@@ -142,6 +158,7 @@ if [ -d "$APP_DIR/.git" ]; then
   git -C "$APP_DIR" checkout "$BRANCH" --quiet
   git -C "$APP_DIR" pull --ff-only origin "$BRANCH" || fail \
     "git pull --ff-only failed. Resolve locally, then re-run."
+  self_reexec_if_updated "$@"
 fi
 
 # --- dependencies (same venv as the bot; pip-only) ---
