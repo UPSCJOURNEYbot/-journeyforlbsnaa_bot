@@ -1117,6 +1117,7 @@ class ArchitectureTests(unittest.TestCase):
             "tests/test_motor_startup_compat.py",
             "tests/test_deploy_health_gate.py",
             "tests/test_part3_aiquiz_schedule.py",
+            "tests/test_telegram_crypto_fallback.py",
         }
         for path in changed:
             self.assertIn(path, allowed, f"unexpected change: {path}")
