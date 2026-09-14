@@ -522,6 +522,22 @@ def _fake_tg_msg(uid, *, text=None, poll=None):
     )
 
 
+def _fake_pyro_client():
+    """A Pyrogram client shaped like a real one for filter evaluation.
+
+    A bare ``MagicMock()`` makes ``client.me.username`` auto-generate a
+    truthy Mock, which pollutes pyrogram's command filter and the setup
+    wizard's self-echo/mention checks; a real started client has
+    ``me.username`` as an ordinary string.
+    """
+    c = MagicMock()
+    # Post-start a real Pyrogram client exposes ``me`` as a User with a
+    # ``username`` string; pyrogram's own command filter reads
+    # ``client.me.username`` (and setup_wizard's self-echo guard does too).
+    c.me = SimpleNamespace(username="journeyforlbsnaa_bot")
+    return c
+
+
 class RegistrationAuditCases(unittest.TestCase):
     """Audit what ``register()`` actually wires up, using the real filters."""
 
@@ -538,7 +554,7 @@ class RegistrationAuditCases(unittest.TestCase):
         read ``m.poll``, so they vanished. This pins the routing half."""
         uid = _uid()
         _session(uid, quiz_name="Polity")
-        ok = _run(self.catchall(MagicMock(), _fake_tg_msg(uid, poll=make_poll())))
+        ok = _run(self.catchall(_fake_pyro_client(), _fake_tg_msg(uid, poll=make_poll())))
         self.assertTrue(ok)
         creator_state.quiz_creation.pop(uid, None)
 
@@ -547,14 +563,14 @@ class RegistrationAuditCases(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 uid = _uid()
                 _session(uid, quiz_name="Polity")
-                ok = _run(self.catchall(MagicMock(), _fake_tg_msg(uid, text=f"/{cmd}")))
+                ok = _run(self.catchall(_fake_pyro_client(), _fake_tg_msg(uid, text=f"/{cmd}")))
                 self.assertFalse(ok, f"/{cmd} must not be caught by the wizard")
                 creator_state.quiz_creation.pop(uid, None)
 
     def test_catchall_ignores_users_with_no_wizard_open(self):
         uid = _uid()
         creator_state.quiz_creation.pop(uid, None)
-        ok = _run(self.catchall(MagicMock(), _fake_tg_msg(uid, poll=make_poll())))
+        ok = _run(self.catchall(_fake_pyro_client(), _fake_tg_msg(uid, poll=make_poll())))
         self.assertFalse(ok)
 
     def test_reserved_command_handlers_are_registered(self):
@@ -564,7 +580,7 @@ class RegistrationAuditCases(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 flt = self.app.message_handlers[idx]
                 self.assertTrue(
-                    _run(flt(MagicMock(), _fake_tg_msg(uid, text=f"/{cmd}")))
+                    _run(flt(_fake_pyro_client(), _fake_tg_msg(uid, text=f"/{cmd}")))
                 )
         creator_state.quiz_creation.pop(uid, None)
 

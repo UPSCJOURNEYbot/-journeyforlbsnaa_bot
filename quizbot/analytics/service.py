@@ -24,6 +24,7 @@ import logging
 from typing import Optional
 
 from quizbot.analytics import aggregation
+from quizbot.analytics.gamification import GamificationService
 from quizbot.analytics.metadata import (
     OUTCOME_CORRECT,
     OUTCOME_INCORRECT,
@@ -68,6 +69,9 @@ class AnalyticsService:
         self.mistakes = MistakeRepository(db)
         self.question_stats = QuestionStatsRepository(db)
         self.quizzes = QuizRepository(db)
+        # Phase C: XP / levels / streaks. Hooks into this same canonical
+        # completion path; it never opens a second analytics pipeline.
+        self.gamification = GamificationService(db)
 
     # ------------------------------------------------------------------ writes
 
@@ -75,6 +79,41 @@ class AnalyticsService:
         if isinstance(user_id, bool) or not isinstance(user_id, int):
             raise ValueError("analytics methods require a stable integer user_id")
         return user_id
+
+    @staticmethod
+    def _normalize_results(question_results) -> list[dict]:
+        """Fail-soft input hygiene at the canonical result boundary.
+
+        A single malformed row (non-dict, missing/non-integral ``q_index``)
+        must never abort the whole completion/result/XP pipeline. Such rows
+        are dropped; everything else is copied with ``q_index`` coerced to a
+        non-negative int. Unknown *outcomes* are preserved here and filtered
+        by the downstream consumers (events/mistakes only accept answered
+        outcomes), matching prior behaviour for valid payloads.
+        """
+
+        def _coerce_index(value):
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str):
+                s = value.strip()
+                if s.lstrip("-").isdigit():
+                    return int(s)
+            return None
+
+        clean: list[dict] = []
+        for row in question_results or []:
+            if not isinstance(row, dict):
+                continue
+            idx = _coerce_index(row.get("q_index"))
+            if idx is None or idx < 0:
+                continue
+            nr = dict(row)
+            nr["q_index"] = idx
+            clean.append(nr)
+        return clean
 
     def _prepare_snapshots(
         self, question_results: list[dict], questions: Optional[list[dict]]
@@ -174,15 +213,27 @@ class AnalyticsService:
         apply_mistakes: bool = True,
         backfilled: bool = False,
         at: Optional[str] = None,
+        revision_origins: Optional[list] = None,
     ) -> dict:
         """Record one user's finished quiz at the result boundary.
 
         ``finalize=False`` is used only by the backfill script for attempts
         that were already completed historically (it must not overwrite
         status/time or re-post leaderboard rows / participant counters).
+
+        ``revision_origins`` (Phase D) is set for /mistakes revision sessions:
+        a list aligned with canonical question index, each entry a list of
+        origin ``{qid, q_index, snapshot_id}`` the revision question stands
+        for. Results are additionally folded back into those origin mistake
+        rows (idempotent under this ``attempt_id``); it is not used for normal
+        quizzes.
         """
         user_id = self._require_user(user_id)
         at = at or _now_iso()
+
+        # Fail-soft hygiene: one malformed result row must never abort the
+        # completion / result / HTML / PDF / XP pipeline.
+        question_results = self._normalize_results(question_results)
 
         counts = aggregation.outcome_counts(question_results)
         if correct is None:
@@ -276,6 +327,65 @@ class AnalyticsService:
                 await self.quizzes.increment_participants(qid)
                 participant_incremented = True
 
+        # Phase D: /mistakes revision sessions are ad-hoc DM quizzes
+        # (quiz_persisted=False), so the stored-quiz mistake block above is
+        # intentionally skipped. Fold revision answers back into the ORIGINAL
+        # mistake rows instead. This is an additional, independently fail-soft
+        # operation: it must never block completion, results/HTML/PDF, the
+        # normal analytics writes above, or the Phase C XP/streak step below.
+        revision_folded = 0
+        # Revision sessions are ALWAYS ad-hoc DM quizzes (never a stored
+        # quiz), so the provenance key is only honoured on that path. This
+        # keeps a (crafted) stored question from ever triggering a fold.
+        if (
+            revision_origins is None
+            and not quiz_persisted
+            and isinstance(questions, list)
+        ):
+            # Origins ride along hidden on each in-memory revision question
+            # under a private key the play engine ignores; aligned to canonical
+            # question index, so option/question shuffling cannot misroute a
+            # fold. A normal/ad-hoc quiz carries no such key -> stay None.
+            extracted = [
+                q.get("_revision_origins") if isinstance(q, dict) else None
+                for q in questions
+            ]
+            if any(extracted):
+                revision_origins = extracted
+        if revision_origins:
+            try:
+                revision_folded = await self._fold_revision(
+                    user_id, attempt_id, enriched, revision_origins, at
+                )
+            except Exception:
+                logger.exception(
+                    "revision fold failed (fail-soft) user=%s attempt=%s",
+                    user_id, attempt_id,
+                )
+
+        # Phase C: XP / levels / daily IST streaks. This MUST be fail-soft: a
+        # gamification failure can never block quiz completion, result/HTML/PDF
+        # report generation, Mini App completion or scheduled completion.
+        gamification_result = None
+        try:
+            gamification_result = await self.gamification.on_completion(
+                user_id=user_id,
+                attempt_id=attempt_id,
+                source=source,
+                question_results=question_results,
+                questions=questions,
+                sections=sections,
+                finalize=finalize,
+                backfilled=backfilled,
+                at=at,
+                enriched_events=enriched,
+            )
+        except Exception:
+            logger.exception(
+                "gamification failed (fail-soft) for user=%s attempt=%s",
+                user_id, attempt_id,
+            )
+
         return {
             "attempt_id": attempt_id,
             "events_total": len(enriched),
@@ -284,7 +394,59 @@ class AnalyticsService:
             "question_stats_items": stats_items,
             "participant_incremented": participant_incremented,
             "skipped": skipped,
+            "revision_folded": revision_folded,
+            "gamification": gamification_result,
         }
+
+    async def _fold_revision(
+        self, user_id: int, attempt_id: str, enriched: list[dict],
+        origins_by_index: list, at: str,
+    ) -> int:
+        """Fold one revision session's canonical events back into the ORIGINAL
+        mistake rows, grouping by origin qid (a revision question may stand for
+        several historical rows). Idempotent under ``attempt_id`` (the
+        existing per-attempt guard arrays in ``apply_attempt``), shuffle-safe
+        (canonical indices), user-scoped and bounded by the revision size.
+        """
+        by_qid: dict[str, list[dict]] = {}
+        for ev in enriched:
+            q_index = int(ev["question_index"])
+            origins = origins_by_index[q_index] if q_index < len(
+                origins_by_index) else None
+            if not origins:
+                continue
+            seen: set = set()
+            for o in origins:
+                if not isinstance(o, dict):
+                    continue
+                origin_qid = o.get("qid")
+                origin_index = o.get("q_index")
+                if not origin_qid or origin_index is None:
+                    continue
+                try:
+                    origin_index = int(origin_index)
+                except (TypeError, ValueError):
+                    continue
+                if (origin_qid, origin_index) in seen:
+                    continue  # one fold per origin question within an attempt
+                seen.add((origin_qid, origin_index))
+                fold_ev = dict(ev)
+                fold_ev["question_index"] = origin_index
+                if o.get("snapshot_id"):
+                    fold_ev["snapshot_id"] = o["snapshot_id"]
+                by_qid.setdefault(origin_qid, []).append(fold_ev)
+        touched = 0
+        for origin_qid, evs in by_qid.items():
+            try:
+                touched += await self.mistakes.apply_attempt(
+                    user_id, origin_qid, attempt_id, evs, at=at
+                )
+            except Exception:
+                # One bad origin qid must not stop the remaining folds.
+                logger.exception(
+                    "revision fold failed for qid=%s user=%s", origin_qid, user_id
+                )
+        return touched
 
     # ------------------------------------------------------------------- reads
 

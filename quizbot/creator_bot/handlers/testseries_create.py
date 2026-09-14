@@ -703,7 +703,7 @@ async def newseries_cmd(c: Client, m: Message) -> None:
     uid = m.from_user.id
     if not config.PDF_API_BASE:
         await m.reply(
-            "PDF generation is not configured on this bot (no PDF_API_BASE set). "
+            "PDF generation is not configured on this bot (PDF microservice disabled: set PDF_API_BASE or deploy it with deploy_pdf_service.sh). "
             "Ask the bot operator to configure a PDF microservice."
         )
         return

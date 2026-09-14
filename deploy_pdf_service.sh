@@ -39,6 +39,22 @@ CHECK_ONLY=0
 log()  { printf '%s\n' "[pdf-deploy] $*"; }
 fail() { printf '%s\n' "[pdf-deploy] ERROR: $*" >&2; exit 1; }
 
+# Path + content hash of THIS script as the shell started it; the ff pull can
+# replace it on disk while bash keeps executing old bytes. Re-exec the new
+# version once after such a self-update (same guard as deploy_vps.sh).
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+SELF_HASH_BEFORE="$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')"
+
+self_reexec_if_updated() {
+  [ -z "${DEPLOY_SELF_REEXECED:-}" ] || return 0
+  local after
+  after="$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')"
+  if [ -n "$SELF_HASH_BEFORE" ] && [ "$after" != "$SELF_HASH_BEFORE" ]; then
+    log "This deploy script was updated by the fast-forward pull — re-executing the NEW version before continuing ..."
+    DEPLOY_SELF_REEXECED=1 exec bash "$SELF_PATH" "$@"
+  fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --app-dir)   APP_DIR="${2:?--app-dir needs a path}"; shift 2 ;;
@@ -121,7 +137,24 @@ else:
 with urllib.request.urlopen(base + job["download_url"], timeout=30) as r:
     pdf = r.read()
 assert pdf[:4] == b"%PDF" and len(pdf) > 5000, f"bad pdf: {len(pdf)} bytes"
-print(f"[pdf-deploy] end-to-end smoke OK ({len(pdf)} bytes, valid %PDF)")
+
+# Content + searchable-text-layer checks. A PDF that only *looks* right is
+# not enough: fpdf2 2.8.8 used to omit ToUnicode for the extra glyphs of a
+# split Devanagari cluster (pre-base i-matra: दि/कि/स्थि), so copy/search
+# extracted raw subset codes inside words ("दिGल्ली"). Verify real words
+# round-trip verbatim with PyMuPDF (a project dependency).
+import fitz
+doc = fitz.open(stream=pdf, filetype="pdf")
+assert doc.page_count >= 1
+full = "\n".join(p.get_text() for p in doc)
+for must in ("Deploy Smoke Test", "दिल्ली", "नई दिल्ली", "2 + 2",
+             "Select primes", "Answer Key"):
+    assert must in full, f"smoke PDF missing/damaged text: {must!r} -> {full[:400]!r}"
+controls = [c for c in full if ord(c) < 0x20 and c not in "\n\r\t"]
+assert not controls, f"raw-CID/control chars in PDF text layer: {controls!r}"
+assert "(cid:" not in full and "\ufffd" not in full, "unmapped glyphs in text layer"
+doc.close()
+print(f"[pdf-deploy] end-to-end smoke OK ({len(pdf)} bytes, valid %PDF, Hindi text layer intact)")
 PY
 }
 
@@ -142,6 +175,7 @@ if [ -d "$APP_DIR/.git" ]; then
   git -C "$APP_DIR" checkout "$BRANCH" --quiet
   git -C "$APP_DIR" pull --ff-only origin "$BRANCH" || fail \
     "git pull --ff-only failed. Resolve locally, then re-run."
+  self_reexec_if_updated "$@"
 fi
 
 # --- dependencies (same venv as the bot; pip-only) ---
@@ -183,16 +217,21 @@ $SUDO systemctl daemon-reload
 $SUDO systemctl enable "$SERVICE_NAME"
 $SUDO systemctl restart "$SERVICE_NAME"
 log "Service enabled (starts on boot) and restarted."
-sleep 5
-$SUDO systemctl is-active --quiet "$SERVICE_NAME" || {
-  $SUDO systemctl status "$SERVICE_NAME" --no-pager || true
-  $SUDO journalctl -u "$SERVICE_NAME" -n 40 --no-pager || true
-  fail "Service $SERVICE_NAME is not active. See logs above."
-}
-log "Service state: active."
+# Same stability gate as the bot deploy: a one-shot is-active probe cannot
+# distinguish a healthy service from a Restart=always crash loop. The gate
+# requires active(running) to hold across a stability window with one stable
+# PID and exactly one pdf_service process; the functional end-to-end render
+# check below then proves the service actually serves PDFs.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/deploy_health_gate.sh" ] || fail "Missing $SCRIPT_DIR/deploy_health_gate.sh (checkout incomplete?)."
+if ! SUDO="$SUDO" HEALTH_START_GRACE="${HEALTH_START_GRACE:-60}" \
+     HEALTH_STABLE_SECS="${HEALTH_STABLE_SECS:-30}" HEALTH_INTERVAL="${HEALTH_INTERVAL:-2}" \
+     "$SCRIPT_DIR/deploy_health_gate.sh" "$SERVICE_NAME" "$APP_DIR" "pdf_service[.]server"; then
+  fail "PDF service did not pass the stability health gate — DEPLOY FAILED. Inspect the journal above, fix the startup error, and re-run (idempotent; .env and data untouched)."
+fi
 verify_service
 
-log "PDF DEPLOY OK — $SERVICE_NAME is active and renders valid PDFs."
+log "PDF DEPLOY OK — $SERVICE_NAME passed the stability gate and renders valid PDFs end to end."
 log "NEXT: set PDF_API_BASE=http://127.0.0.1:$(pdf_port) in $APP_DIR/.env,"
 log "THEN restart the bot once so it picks up the new value:"
 log "  sudo systemctl restart quizbot"

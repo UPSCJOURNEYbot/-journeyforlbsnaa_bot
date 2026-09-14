@@ -27,11 +27,17 @@ from quizbot.database import (
 )
 from quizbot.shared import config
 from quizbot.shared.bold_words import apply_bold_to_poll_fields, format_bold_html
+from quizbot.shared.explanations import (
+    is_authored_rich,
+    poll_explanation,
+    render_rich_markdown,
+    render_telegram_messages,
+)
+
 from quizbot.shared.html.quiz_report import render_quiz_html
 from quizbot.shared.mini_app_link import mini_app_web_app_button_ptb
 from quizbot.shared.rich_quiz import (
     RichDispatchResult,
-    _is_rich,
     _normalise_math_spacing,
     enrich_question_dispatch,
     send_rich_or_fallback,
@@ -63,6 +69,17 @@ from ..telegram_utils import (
 )
 
 logger = logging.getLogger(__name__)
+def _display_order_for(session: Optional[dict], question_index: int):
+    """Return the display permutation recorded when *question_index* was
+    actually sent (Phase F option notes must reference the letters the
+    player saw, not canonical indices after option shuffling)."""
+    polls = (session or {}).get("polls") or {}
+    match = None
+    for pdata in polls.values():
+        if pdata.get("question_index") == question_index:
+            match = pdata  # last match wins if resent
+    order = (match or {}).get("display_order")
+    return order if isinstance(order, list) and order else None
 
 _ANON_ADMIN_ID = 1087968824  # Telegram's fake @GroupAnonymousBot user id.
 
@@ -154,6 +171,23 @@ async def translate_question(qdata: dict, target_lang: str) -> dict:
             t["reply_text"] = await translate_text(qdata["reply_text"], target_lang)
         if qdata.get("explanation"):
             t["explanation"] = await translate_text(qdata["explanation"], target_lang)
+        # Phase F: translate structured explanation companions the same
+        # best-effort way; indices stay bound to the original options.
+        detail = qdata.get("explanation_detail")
+        if isinstance(detail, dict):
+            translated_detail = dict(detail)
+            for key in ("why", "concept", "takeaway"):
+                if isinstance(detail.get(key), str):
+                    translated_detail[key] = await translate_text(
+                        detail[key], target_lang)
+            if isinstance(detail.get("options"), list):
+                translated_detail["options"] = [
+                    {**note, "note": await translate_text(note["note"], target_lang)}
+                    if isinstance(note, dict) and isinstance(note.get("note"), str)
+                    else note
+                    for note in detail["options"]
+                ]
+            t["explanation_detail"] = translated_detail
     except Exception as e:
         logger.error("translate_question error: %s", e)
         return qdata
@@ -312,7 +346,7 @@ async def send_private_question(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, id
         _q_text = rich_res.poll_question_override or q["question"]
         _rt = None if rich_res.suppress_reply_text else reply_text
         poll_q, poll_opts, poll_expl, overflow, poll_desc = prepare_poll_data(
-            _q_text, options, correct_ids[0], q.get("explanation"), _rt, idx, len(questions)
+            _q_text, options, correct_ids[0], poll_explanation(q), _rt, idx, len(questions)
         )
         if rich_res.poll_options_override:
             poll_opts = rich_res.poll_options_override
@@ -394,7 +428,10 @@ async def _private_timeout(chat_id: int, poll_id: str, timer: int) -> None:
 
     ctx = s.get("context")
     if ctx and s.get("quiz_data", {}).get("show_explanation"):
-        await _send_explanation_after_poll(ctx, chat_id, s["questions"][cur], thread_id=s.get("message_thread_id"))
+        await _send_explanation_after_poll(
+            ctx, chat_id, s["questions"][cur],
+            thread_id=s.get("message_thread_id"),
+            display_order=_display_order_for(s, cur))
 
     if s.get("is_last_in_section"):
         s["is_last_in_section"] = False
@@ -422,7 +459,10 @@ async def handle_private_poll_answer(poll_id: str, user_id: int, option_ids: lis
 
         ctx = s.get("context")
         if ctx and s.get("quiz_data", {}).get("show_explanation"):
-            await _send_explanation_after_poll(ctx, chat_id, s["questions"][cur], thread_id=s.get("message_thread_id"))
+            await _send_explanation_after_poll(
+                ctx, chat_id, s["questions"][cur],
+                thread_id=s.get("message_thread_id"),
+                display_order=_display_order_for(s, cur))
 
         if s.get("is_last_in_section"):
             s["is_last_in_section"] = False
@@ -565,7 +605,10 @@ async def _run_flat_quiz(chat_id, ctx, questions, quiz, protect, update, skip) -
         await asyncio.sleep(timer + 2)
 
         if quiz.get("show_explanation"):
-            await _send_explanation_after_poll(ctx, chat_id, questions[idx], thread_id=session.get("message_thread_id"))
+            await _send_explanation_after_poll(
+                ctx, chat_id, questions[idx],
+                thread_id=session.get("message_thread_id"),
+                display_order=_display_order_for(session, idx))
 
         if promo and (idx + 1) % 10 == 0 and (idx + 1) < total:
             await safe_send_message(ctx, chat_id, promo)
@@ -691,7 +734,10 @@ async def _run_sectioned_quiz(chat_id, ctx, questions, quiz, sections, protect, 
                 await asyncio.sleep(timer + 2)
 
                 if quiz.get("show_explanation"):
-                    await _send_explanation_after_poll(ctx, chat_id, questions[idx], thread_id=session.get("message_thread_id"))
+                    await _send_explanation_after_poll(
+                        ctx, chat_id, questions[idx],
+                        thread_id=session.get("message_thread_id"),
+                        display_order=_display_order_for(session, idx))
 
                 if promo and q_count % 10 == 0:
                     await safe_send_message(ctx, chat_id, promo)
@@ -764,7 +810,7 @@ async def _send_group_question(chat_id, ctx, questions, idx, total, base_timer, 
         _q_text = rich_res.poll_question_override or q["question"]
         _rt = None if rich_res.suppress_reply_text else reply_text
         poll_q, poll_opts, poll_expl, overflow, poll_desc = prepare_poll_data(
-            _q_text, options, correct_ids[0], q.get("explanation"), _rt, idx, total
+            _q_text, options, correct_ids[0], poll_explanation(q), _rt, idx, total
         )
         if rich_res.poll_options_override:
             poll_opts = rich_res.poll_options_override
@@ -899,36 +945,41 @@ async def _send_mid_quiz_leaderboard(chat_id: int, ctx: ContextTypes.DEFAULT_TYP
         logger.error("_send_mid_quiz_leaderboard error: %s", e)
 
 
-async def _send_explanation_after_poll(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, q: dict, thread_id: Optional[int] = None) -> None:
+async def _send_explanation_after_poll(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, q: dict, thread_id: Optional[int] = None, display_order: Optional[list[int]] = None) -> None:
     """Send the post-answer explanation. Uses sendRichMessage (Bot API 10.1)
-    when the explanation contains rich/math markup that the plain 4096-char
-    text send would mangle or truncate too aggressively; falls back to a
-    plain HTML message otherwise (or automatically, if sendRichMessage
-    isn't available on the receiving client)."""
+    when the explanation contains rich/math markup that plain HTML messages
+    would mangle; otherwise sends one or more chunked, HTML-safe messages
+    (Phase F structured sections carry labelled headings, and long content
+    continues in follow-ups instead of being silently truncated)."""
     try:
-        expl = (q.get("explanation") or "").strip()
-        if not expl:
-            return
         await asyncio.sleep(1.5)
         kw: dict[str, Any] = {}
         if thread_id:
             kw["message_thread_id"] = thread_id
 
-        if _is_rich(expl):
-            body = _normalise_math_spacing(f"\U0001F4A1 **Explanation:**\n\n{expl}")
-            await send_rich_or_fallback(
-                lambda method, params: send_raw_api(ctx, method, params),
-                lambda text: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, **kw),
-                chat_id, body, thread_id=thread_id,
-            )
+        if is_authored_rich(q):
+            composed = render_rich_markdown(q, display_order=display_order)
+            if composed.strip():
+                body = _normalise_math_spacing(
+                    f"\U0001F4A1 **Explanation:**\n\n{composed}")
+                await send_rich_or_fallback(
+                    lambda method, params: send_raw_api(ctx, method, params),
+                    lambda text: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, **kw),
+                    chat_id, body, thread_id=thread_id,
+                )
             return
 
-        # Important-word bolding for plain explanations (rich explanations
-        # were already handled above); pass-through text is untouched.
-        body, _fmt_ok = format_bold_html(expl[:4000])
-        await ctx.bot.send_message(
-            chat_id=chat_id, text=f"\U0001F4A1 <b>Explanation:</b>\n\n{body}", parse_mode=ParseMode.HTML, **kw,
-        )
+        # Plain path (Phase F): every chunk is HTML-safe (escaped by the
+        # renderer); a legacy single explanation produces one message just
+        # like before, while content past the message limit now continues in
+        # labelled follow-ups instead of being silently cut at 4000 chars.
+        messages = render_telegram_messages(q, display_order=display_order)
+        for i, body in enumerate(messages):
+            await ctx.bot.send_message(
+                chat_id=chat_id, text=body, parse_mode=ParseMode.HTML, **kw,
+            )
+            if i + 1 < len(messages):
+                await asyncio.sleep(0.25)
     except Exception as e:
         logger.debug("_send_explanation_after_poll: %s", e)
 
@@ -1296,6 +1347,25 @@ async def _send_pdf_report(
                     os.remove(pdf_path)
                 except OSError:
                     pass
+        else:
+            # Rendering failed (e.g. WeasyPrint native libraries missing).
+            # Tell the user instead of silently producing nothing.
+            logger.error(
+                "PDF report render returned failure for chat=%s qid=%s "
+                "(check WeasyPrint/Pango install)", chat_id,
+                quiz_data.get("qid"),
+            )
+            try:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=("⚠️ The PDF report could not be generated on this "
+                          "server (the rendering library is unavailable). "
+                          "Please ask the operator to install the PDF "
+                          "dependencies, or use the HTML report."),
+                    **({"message_thread_id": thread_id} if thread_id else {}),
+                )
+            except Exception:
+                logger.debug("could not send PDF-unavailable notice", exc_info=True)
     except Exception as e:
         logger.error("PDF report error: %s", e, exc_info=True)
 

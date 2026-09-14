@@ -55,6 +55,24 @@ SKIP_APT=0
 log()  { printf '%s\n' "[deploy] $*"; }
 fail() { printf '%s\n' "[deploy] ERROR: $*" >&2; exit 1; }
 
+# Path + content hash of THIS script as it was when the shell started it.
+# The fast-forward pull below can replace the script on disk, but a running
+# bash keeps reading the bytes it started with, so post-pull steps (pip
+# gates, health check, DEPLOY OK string) can silently execute from the OLD
+# version. If the pull changed us, we re-exec the new file once.
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+SELF_HASH_BEFORE="$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')"
+
+self_reexec_if_updated() {
+  [ -z "${DEPLOY_SELF_REEXECED:-}" ] || return 0
+  local after
+  after="$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')"
+  if [ -n "$SELF_HASH_BEFORE" ] && [ "$after" != "$SELF_HASH_BEFORE" ]; then
+    log "This deploy script was updated by the fast-forward pull — re-executing the NEW version before continuing ..."
+    DEPLOY_SELF_REEXECED=1 exec bash "$SELF_PATH" "$@"
+  fi
+}
+
 usage() {
   sed -n '2,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
@@ -104,6 +122,16 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     # --ff-only guarantees we never rewrite history or lose local commits.
     git -C "$APP_DIR" pull --ff-only origin "$BRANCH" || fail \
       "git pull --ff-only failed (local changes? run 'git -C $APP_DIR status' on the VPS and resolve, then re-run)."
+    # Run the rest of THIS deploy from the just-pulled script content.
+    if [ "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")" = "$SELF_PATH" ]; then
+      self_reexec_if_updated "$@"
+    else
+      # Invoked from a copy outside the checkout (e.g. /root) — always
+      # switch to the freshly pulled canonical script inside APP_DIR.
+      [ -n "${DEPLOY_SELF_REEXECED:-}" ] || {
+        log "Switching to the freshly pulled canonical script in $APP_DIR ..."
+        DEPLOY_SELF_REEXECED=1 exec bash "$APP_DIR/deploy_vps.sh" "$@"; }
+    fi
   fi
 else
   [ -f "$APP_DIR/run.py" ] || fail "$APP_DIR/run.py not found; cannot --check-only."
@@ -142,7 +170,12 @@ if env_has OWNER_ID; then log ".env check: OWNER_ID present (value hidden) — O
 else log ".env check: OWNER_ID — MISSING"; missing=1; fi
 # Feature-relevant but optional: warn only, never block the whole deployment.
 env_has GEMINI_API_KEY || log ".env note: GEMINI_API_KEY empty — /podcast voice generation will report its own error until set."
-env_has PDF_API_BASE   || log ".env note: PDF_API_BASE empty — /testseries will reply that PDF generation is not configured (existing behavior)."
+if grep -Eq '^[[:space:]]*PDF_API_BASE=[[:space:]]*(off|none|disabled|false|0)[[:space:]]*$' "$APP_DIR/.env"; then
+  log ".env note: PDF_API_BASE explicitly disabled — /testseries will reply that PDF generation is not configured."
+else
+  log ".env note: PDF generation targets the local microservice at 127.0.0.1:8090 (blank defaults there)."
+  log "           Run ./deploy_pdf_service.sh on THIS host to install quizbot-pdf.service, otherwise /testseries reports the PDF service unreachable."
+fi
 [ -z "${MINI_APP_DOMAIN_FROM_ENV:-}" ] || true
 if grep -Eq '^[[:space:]]*MINI_APP_DOMAIN=[[:space:]]*"?https?://[^[:space:]"]' "$APP_DIR/.env"; then
   log ".env note: MINI_APP_DOMAIN set — Mini App HTTP server will also start INSIDE the same single process (no extra poller)."
@@ -175,11 +208,41 @@ if [ "$SKIP_APT" -eq 0 ] && command -v apt-get >/dev/null 2>&1; then
     git python3 python3-venv python3-pip \
     ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin \
     libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libcairo2 \
-    libffi-dev shared-mime-info fonts-liberation
+    libffi-dev shared-mime-info fonts-liberation \
+    fonts-noto-core fonts-deva
 else
   log "Skipping apt-get (flag or non-Debian system). Ensuring ffmpeg/python exist ..."
   command -v python3 >/dev/null 2>&1 || fail "python3 not found."
   command -v ffmpeg  >/dev/null 2>&1 || fail "ffmpeg not found (required for /podcast MP3 creation)."
+fi
+
+# ---------------------------------------------------------------------------
+# 2b. Swap on small VMs (target box is 2 GB/1 vCPU). WeasyPrint report renders
+#     and ffmpeg /podcast encoding can spike RSS; without swap the OOM killer
+#     can terminate the bot (systemd restarts it, but an in-flight job is
+#     lost). Idempotent and NON-fatal: skip if swap already exists, if not
+#     root, on non-Debian hosts, or when SKIP_SWAP=1.
+# ---------------------------------------------------------------------------
+SWAP_SIZE_MB="${SWAP_SIZE_MB:-2048}"
+if [ "${SKIP_SWAP:-0}" -eq 0 ] && [ -z "$(swapon --show 2>/dev/null)" ] && [ ! -f /swapfile ]; then
+  if [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
+    log "No swap detected and this is a small VPS -- creating a ${SWAP_SIZE_MB}MB /swapfile (non-fatal) ..."
+    if $SUDO dd if=/dev/zero of=/swapfile bs=1M count="$SWAP_SIZE_MB" status=none 2>/dev/null \
+       && $SUDO chmod 600 /swapfile \
+       && $SUDO mkswap /swapfile >/dev/null 2>&1 \
+       && $SUDO swapon /swapfile >/dev/null 2>&1; then
+      if ! grep -q '^/swapfile ' /etc/fstab 2>/dev/null; then
+        echo '/swapfile none swap sw 0 0' | $SUDO tee -a /etc/fstab >/dev/null 2>&1 || true
+      fi
+      $SUDO sysctl -q vm.swappiness=10 2>/dev/null || true
+      log "Swap enabled (${SWAP_SIZE_MB}MB)."
+    else
+      $SUDO rm -f /swapfile 2>/dev/null || true
+      log "Swap setup failed/unsupported here (continuing; the service auto-restarts if the OOM killer ever fires)."
+    fi
+  fi
+else
+  log "Swap already configured (or SKIP_SWAP=1) -- leaving as-is."
 fi
 
 # ---------------------------------------------------------------------------
@@ -211,7 +274,99 @@ fi
 
 log "Installing requirements.txt (existing pinned dependencies, unchanged) ..."
 "$VENV_PY" -m pip install --upgrade pip
+# requirements.txt now pins WeasyPrint 62.3's ENTIRE transitive PDF stack
+# (pydyf/tinycss2/cssselect2/pyphen/fonttools/cffi/html5lib). Re-running this
+# command also DOWNGRADEs any previously-drifted versions (e.g. pydyf 0.12.x,
+# whose removed Stream.transform() broke every report PDF in production with
+# "AttributeError: 'super' object has no attribute 'transform'").
 "$VENV_PY" -m pip install -r "$APP_DIR/requirements.txt"
+
+# ---------------------------------------------------------------------------
+# 3b. PDF stack self-check (runs BEFORE the service is restarted).
+#     WeasyPrint's runtime dependencies are partly system libraries (pango,
+#     installed in step 2) and partly pip packages. A version drift in either
+#     layer used to ship as a bot that starts fine but fails every result PDF.
+#     Prove the EXACT declared dependency set actually renders a real page
+#     (English + Devanagari + table + a coordinate transform + a MathML tag)
+#     here, at deploy time, and abort loudly rather than restart into a
+#     broken PDF stack. The bot itself keeps its in-process fail-soft path;
+#     this gate exists so an operator never silently lands on it.
+# ---------------------------------------------------------------------------
+log "Verifying the WeasyPrint result-PDF stack (dependency pins + real render) ..."
+"$VENV_PY" - <<'PY'
+import sys
+
+errors = []
+
+# (a) Declared pydyf API that weasyprint/pdf/stream.py requires.
+import pydyf
+try:
+    parts = tuple(int(x) for x in pydyf.__version__.split(".")[:2])
+except Exception:
+    parts = (99, 99)
+if not hasattr(pydyf.Stream, "transform") or parts >= (0, 12):
+    errors.append(
+        f"pydyf {pydyf.__version__} is incompatible with WeasyPrint 62.3 "
+        "(Stream.transform removed in pydyf 0.12). requirements.txt pins "
+        "pydyf==0.10.0; re-run the pip install step.")
+else:
+    s = pydyf.Stream()
+    s.transform(1, 0, 0, 1, 0, 0)  # raises the production error on 0.12.x
+
+# (b) Dependency-consistency check (a conflicting pin breaks the render stack
+#     silently later). Only PDF-stack problems block the deploy; unrelated
+#     warnings are reported but non-fatal.
+import subprocess
+check = subprocess.run([sys.executable, "-m", "pip", "check"],
+                       capture_output=True, text=True)
+if check.returncode != 0:
+    keys = ("weasyprint", "pydyf", "tinycss2", "cssselect2", "pyphen",
+            "fonttools", "cffi", "html5lib", "pillow",
+            "pymupdf", "latex2mathml")
+    lines = [ln for ln in (check.stdout + check.stderr).splitlines()
+             if any(k in ln.lower() for k in keys)]
+    if lines:
+        errors.append("pip dependency problems: " + " | ".join(lines))
+    else:
+        print("[deploy] note: 'pip check' reports unrelated warnings "
+              "(non-PDF packages); not blocking deployment.")
+
+# (c) REAL end-to-end WeasyPrint render through pango + the pydyf writer.
+try:
+    from weasyprint import HTML
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'><style>"
+        "@page { size: A4; margin: 2cm; }"
+        "body { font-family: sans-serif; }"
+        ".rot { transform: rotate(3deg); width: 60mm; }"
+        "table { border-collapse: collapse; } td { border: 1px solid black; padding: 4px; }"
+        "</style></head><body>"
+        "<h1>PDF smoke test</h1>"
+        "<p>English and हिन्दी text: भारत की राजधानी नई दिल्ली है।</p>"
+        "<div class='rot'>rotated block (exercises stream.transform)</div>"
+        "<table><tr><th>Q</th><th>A</th></tr>"
+        "<tr><td>भारत?</td><td>दिल्ली</td></tr></table>"
+        "<p>MathML tag: <math display='inline'><mfrac><mi>x</mi><mn>2</mn></mfrac></math></p>"
+        "</body></html>")
+    pdf = HTML(string=html).write_pdf()
+    assert pdf[:5] == b"%PDF-" and len(pdf) > 2000, "not a PDF"
+    import fitz  # PyMuPDF, already a project dependency
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    assert doc.page_count >= 1
+    text = "".join(p.get_text() for p in doc)
+    assert "PDF smoke test" in text
+    print(f"[deploy] WeasyPrint render OK: {len(pdf)} bytes, {doc.page_count} page(s), Devanagari shaped.")
+except Exception as exc:  # noqa: BLE001
+    errors.append(f"live WeasyPrint render failed: {type(exc).__name__}: {exc}. "
+                  "Ensure OS packages from step 2 (libpango/libpangocairo/libcairo/"
+                  "libgdk-pixbuf2.0, fonts-noto-core/fonts-deva) are installed.")
+
+if errors:
+    for e in errors:
+        print(f"[deploy] PDF STACK CHECK FAILED: {e}")
+    sys.exit(1)
+print("[deploy] PDF stack self-check passed (WeasyPrint 62.3 + pinned pydyf, real render verified).")
+PY
 
 # Thorough .env validation with the project's own dotenv parsing (names only).
 log "Validating .env values with project parser (values never printed) ..."
@@ -294,34 +449,27 @@ $SUDO systemctl restart "$SERVICE_NAME"
 log "Service enabled (starts on boot) and restarted."
 
 # ---------------------------------------------------------------------------
-# 6. Verify: service active + EXACTLY ONE bot process (duplicate-polling guard)
-#    + recent logs. Any failure here exits non-zero with guidance.
+# 6. Verify the service is ACTIVE AND STABLE (no false "DEPLOY OK").
+#    A single is-active probe a few seconds after restart is unsafe for a
+#    Type=simple unit with Restart=always: a process that crashes AFTER the
+#    probe (or is mid crash-loop between attempts) still reports active.
+#    deploy_health_gate.sh requires active(running) continuously across a
+#    stability window, with an unchanged live main PID, no NRestarts growth,
+#    and exactly one matching run.py process — re-checked one final time
+#    after the window. It dumps status+journal and exits non-zero otherwise.
 # ---------------------------------------------------------------------------
-sleep 6
-if ! $SUDO systemctl is-active --quiet "$SERVICE_NAME"; then
-  $SUDO systemctl status "$SERVICE_NAME" --no-pager || true
-  $SUDO journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true
-  fail "Service $SERVICE_NAME is not active. See logs above (often: wrong .env values, MongoDB/Telegram unreachable)."
-fi
-log "Service state: active."
-
-# Duplicate-polling guard: exactly one 'run.py' for this app directory.
-MATCHING_PROCS="$(pgrep -af "[r]un.py" | grep -F "$APP_DIR" || true)"
-COUNT="$(printf '%s\n' "$MATCHING_PROCS" | grep -c . || true)"
-if [ "$COUNT" -eq 1 ]; then
-  log "Polling guard: exactly ONE bot process for $APP_DIR — OK"
-elif [ "$COUNT" -eq 0 ]; then
-  $SUDO journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true
-  fail "Polling guard: no bot process found for $APP_DIR although the service is active. See logs above."
-else
-  printf '%s\n' "$MATCHING_PROCS" >&2
-  fail "Polling guard: $COUNT bot processes match $APP_DIR — duplicate polling would cause Telegram getUpdates conflicts. Stop the extra one(s) (e.g. an old 'python run.py' shell session, start_single_bot.sh, or a duplicate container: 'docker ps' / 'docker stop <name>'), then re-run this script."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/deploy_health_gate.sh" ] || fail "Missing $SCRIPT_DIR/deploy_health_gate.sh (checkout incomplete?)."
+if ! SUDO="$SUDO" HEALTH_START_GRACE="${HEALTH_START_GRACE:-60}" \
+     HEALTH_STABLE_SECS="${HEALTH_STABLE_SECS:-30}" HEALTH_INTERVAL="${HEALTH_INTERVAL:-2}" \
+     "$SCRIPT_DIR/deploy_health_gate.sh" "$SERVICE_NAME" "$APP_DIR"; then
+  fail "Service did not pass the stability health gate — DEPLOY FAILED. $SERVICE_NAME was not proven healthy; inspect the journal output above, fix the startup error, and re-run this script (it is idempotent and did not change .env or data)."
 fi
 
 log "Recent logs:"
 $SUDO journalctl -u "$SERVICE_NAME" -n 20 --no-pager || true
 
-log "DEPLOY OK — $SERVICE_NAME is active, single process, restarts on crash/reboot."
+log "DEPLOY OK — $SERVICE_NAME passed the stability gate (single process, active through the health window), restarts on crash/reboot."
 log "Useful commands:"
 log "  sudo systemctl status $SERVICE_NAME --no-pager"
 log "  sudo journalctl -u $SERVICE_NAME -f"

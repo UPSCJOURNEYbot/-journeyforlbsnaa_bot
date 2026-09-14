@@ -5,52 +5,104 @@
 # HOW TO USE:
 #   1. Open Telegram → @BotFather
 #   2. Send /setcommands
-#   3. Select your bot
+#   3. Select the (single) deployed bot
 #   4. Copy the block below (without the # lines) and send it
+#
+# IMPORTANT — SINGLE BOT DEPLOYMENT
+#   The deployed application runs ONE bot (see run.py). There is no separate
+#   "creator bot" / "scheduler bot" pair anymore: quiz PLAYING commands run in
+#   groups and private chats, while quiz CREATION commands are bridged and
+#   only respond in private chat (they are enforced PM-only; help/features/
+#   listquiz are the exceptions).
+#
+#   Block 1 = the DEFAULT menu (paste this into BotFather — safe in all chats).
+#   Block 2 = the PRIVATE-CHAT creator menu. BotFather's /setcommands only sets
+#   the default scope; to install Block 2 for PM only, call the Bot API
+#   setMyCommands with scope {"type": "all_private_chats"} (e.g. via a one-off
+#   script). Every command below exists in the current code; there are no
+#   placeholders.
 
 # ════════════════════════════════════════════════════════════════════════════
-# BOT 1 — main.py  (Pyrogram — Quiz Creator Bot)
-# Send this to @BotFather → /setcommands → [select your creator bot]
+# BLOCK 1 — DEFAULT (all chats): PLAYING / GENERAL commands
 # ════════════════════════════════════════════════════════════════════════════
 
-start - Start the bot and see welcome message
-create - Create a new quiz
-done - Finish and save the current quiz
-cancel - Cancel quiz creation in progress
-list - List all your quizzes
-info - Get details about a quiz by ID
-edit - Edit an existing quiz
-delete - Delete a quiz by ID
-clone - Clone a quiz from a link
-extract - Extract quiz from a channel post or poll
-quiztxt - Create quiz from Drishti IAS or article URL
-help - Show all available commands
-features - View full feature list
-stats - Bot usage statistics (owner only)
-broadcast - Broadcast a message to all users (owner only)
-add - Authorize a user or group for paid quiz access
-rem - Remove authorization from a user or group
-ban - Ban a quiz by ID (owner only)
-check - Check system resource stats (owner only)
-cleanup - Emergency session cleanup (owner only)
-
+start - Start the bot / launch a quiz: /start <quiz_id>
+listquiz - Browse public quizzes
+pollquiz - Run a quiz as live Telegram polls in this group
+pollstop - Stop the running poll quiz
+aiquiz - Generate and play an AI quiz on a topic
+pdfquiz - Reply to a PDF to build a quiz from it
+mix - Mix questions from several quiz IDs
+weakquiz - Practise your weakest topics (personal revision)
+mistakes - Review your recorded mistakes (personal revision)
+leaderboard - Show the live top-10 leaderboard
+result - Show your most recent quiz result
+pause - Pause the running quiz (group admins)
+resume - Resume a paused quiz (group admins)
+stop - Stop the running quiz (group admins)
+slow - Lengthen the per-question timer
+fast - Shorten the per-question timer
+normal - Reset the per-question timer to normal
+schedule - Schedule a quiz auto-launch time
+viewschedule - List this chat's scheduled quizzes
+cancelschedule - Cancel a scheduled quiz
+html - Toggle the interactive HTML result report for this chat
+pdf - Toggle the PDF result report for this chat
+trans - Translate the current question to another language
+help - Show the full command reference
+features - Show a short feature overview
 
 # ════════════════════════════════════════════════════════════════════════════
-# BOT 2 — bot.py  (PTB — Quiz Scheduler / Runner Bot)
-# Send this to @BotFather → /setcommands → [select your scheduler bot]
+# BLOCK 2 — PRIVATE CHAT scope only: CREATOR / studio commands
+# Set via Bot API setMyCommands scope = all_private_chats
+# (aliases in parentheses work too; only one canonical name is listed).
 # ════════════════════════════════════════════════════════════════════════════
+#
+# create - Create a new quiz with the step-by-step builder
+# done - Finish and save the quiz you are building
+# cancel - Cancel the quiz/setup you have in progress
+# edit - Edit one of your quizzes by ID
+# stopedit - Exit quiz editing mode
+# myquizzes - List or search your own quizzes
+# search - Search all public quizzes (alias: /quiz)
+# info - Show details of one of your quizzes
+# del - Delete one of your quizzes by ID
+# delall - Delete all of your quizzes
+# convertall - Convert all legacy quizzes to the new format
+# setpromo - Set a promo message attached to your quizzes
+# ban - Ban a quiz by ID (owner only)
+# whtml - Generate the interactive HTML report for a quiz
+# leaders - Full leaderboard for a quiz (alias: /aspirants)
+# (The premium PDF studio commands are fully wired but deliberately kept
+# out of this menu; see /help. They rely on the separately deployed PDF
+# microservice.)
+# add - Authorize a user or chat for access
+# rem - Remove a user or chat authorization
+# remall - Clear all chat authorizations
+# auth - Show current authorizations
+# removeuser - Remove a user from access
+# batch - Manage your batches
+# createbatch - Create a new batch
+# searchbatch - Search among your batches
+# settings - Open creator settings
+# setkey - Save a personal AI provider API key
+# mykeys - List your saved AI provider keys
+# delkey - Delete a saved AI provider key
+# remove - Add words to the import word filter
+# mywords - Show your import word filter list
+# clearlist - Clear the import word filter list
+# limit - Show your current rate-limit usage
+#
+# Owner-only commands (not advertised in the menu):
+#   gcast, stopcast, statses, testapi
 
-start - Start the scheduler bot
-quiz - Launch a quiz session in the group
-stop - Stop the running quiz
-pause - Pause the current quiz
-resume - Resume a paused quiz
-skip - Skip the current question
-slow - Decrease quiz speed
-fast - Increase quiz speed
-normal - Reset quiz speed to normal
-leaderboard - Show current quiz leaderboard
-result - Show your personal quiz result
-compare - Compare results with another user
-check - Show system health and stats
-cleanup - Force clean up stale sessions (owner only)
+# ════════════════════════════════════════════════════════════════════════════
+# NOTES
+#   * Payments/self-serve premium (/pay) are intentionally DORMANT in this
+#     edition: every premium gate is open (all features are available), so no
+#     /pay command is registered or advertised in the bot's replies.
+#   * The PDF test-series features require the PDF microservice (PDF_API_BASE);
+#     deploy it with deploy_pdf_service.sh. Without it the commands explain
+#     that PDF generation is not configured.
+#   * Premium studio creation and playing commands run inside the ONE polling
+#     process — there must never be a second getUpdates client.

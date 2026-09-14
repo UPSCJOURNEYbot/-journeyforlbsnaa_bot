@@ -267,13 +267,30 @@ def parse_ai_questions(raw: str) -> list[dict]:
                     if not valid_c:
                         continue
                     coid = valid_c[0] if len(valid_c) == 1 else valid_c
-                    if e:
-                        e = str(e).strip()[:200]
-                    questions.append({
+                    # Phase F: "e" stays a plain string for every existing
+                    # prompt, but a provider may also return a structured
+                    # explanation object ({why/concept/takeaway/options});
+                    # it is validated by the shared sanitiser. The answer
+                    # key above is the only source of truth and is never
+                    # derived from explanation content.
+                    from quizbot.shared.explanations import (
+                        normalize_question_explanation,
+                    )
+                    item = {
                         "question": q, "options": opts,
-                        "correct_option_id": coid, "explanation": e,
+                        "correct_option_id": coid,
                         "file_id": None, "reply_text": None,
-                    })
+                    }
+                    if isinstance(e, dict):
+                        item["explanation_detail"] = e
+                    elif isinstance(e, str) and e.strip():
+                        # Keep enough room for a genuinely useful post-poll
+                        # explanation; the native poll field still trims to
+                        # its 200-char cap at presentation time. Numbers,
+                        # lists or booleans are never valid explanations.
+                        item["explanation"] = e.strip()[:600]
+                    questions.append(
+                        normalize_question_explanation(item, len(opts)))
                 if questions:
                     return questions
         except (json.JSONDecodeError, ValueError, TypeError):

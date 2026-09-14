@@ -38,7 +38,18 @@ def _js_literal(value: Any) -> str:
     """Serialize a Python value to a JSON literal safe for embedding in a
     <script> block (also neutralizes '</script>' breakout sequences)."""
     raw = json.dumps(value, ensure_ascii=False)
-    return raw.replace("</", "<\\/")
+    # SECURITY: this literal is embedded directly inside a <script> block.
+    # Escaping every angle bracket (JSON \u003c/\u003e evaluates back to the
+    # same char at runtime) means no author value can ever form the literal
+    # "</script>" that terminates the element, or any raw markup a later
+    # innerHTML use could activate. U+2028/U+2029 are also illegal in pre-ES2019
+    # script source.
+    return (
+        raw.replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 # --------------------------------------------------------------------------
@@ -870,6 +881,16 @@ def _je(t: Any) -> str:
         .replace("\n", "\\n")
         .replace("\r", "\\r")
         .replace("\t", "\\t")
+        # SECURITY: these values are interpolated into JS string literals
+        # INSIDE a <script> block. The HTML parser scans script text for the
+        # literal "</" regardless of JS quoting, so author content such as
+        # "</script><script>..." would otherwise break out and execute.
+        # Escape EVERY angle bracket (\u003c/\u003e evaluate back
+        # identically at runtime): no raw markup or '</script>' in source.
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
     )
 
 
@@ -1132,21 +1153,34 @@ async def render_quiz_html(quiz: dict, *, mode: str = "exam") -> tuple[bytes, st
     # fresh on every render (kept intentionally -- see docstring above).
     q_js_items = []
     for i, q in enumerate(questions):
-        opts = list(q.get("options") or [])
+        src_opts = list(q.get("options") or [])
         correct_idx = int(q.get("correct_option_id", 0) or 0)
-        correct_opt = opts[correct_idx] if 0 <= correct_idx < len(opts) else (opts[0] if opts else "")
-        random.shuffle(opts)
-        try:
-            new_correct_index = opts.index(correct_opt)
-        except ValueError:
+        # Permute an index list so the SAME permutation can remap Phase F
+        # option-note letters; the resulting shuffled options distribution
+        # is identical to the previous in-place random.shuffle.
+        order = list(range(len(src_opts)))
+        random.shuffle(order)
+        opts = [src_opts[k] for k in order]
+        if 0 <= correct_idx < len(src_opts):
+            new_correct_index = order.index(correct_idx)
+        else:
             new_correct_index = 0
-        opts_json = json.dumps(opts, ensure_ascii=False)
+        # json.dumps then neutralise "</" so option text can never close the
+        # surrounding <script> block (stored-script-breakout protection).
+        opts_json = _js_literal(opts)
+        # Phase F: structured explanations compose into the same plain
+        # exp field (rendered pre-wrapped by the page's renderer); legacy
+        # single explanations pass through verbatim. Option-note letters
+        # follow this report's freshly shuffled display order.
+        from quizbot.shared.explanations import render_plain_text
+        composed_exp = (render_plain_text(q, display_order=order)
+                        or "No explanation")
         q_js_items.append(
             f'{{id:{i},txt:"{_je(q.get("question", ""))}",'
             f'ref:"{_je(q.get("reply_text", ""))}",'
             f'opts:{opts_json},'
             f'ci:{new_correct_index},'
-            f'exp:"{_je(q.get("explanation", "No explanation"))}"}}'
+            f'exp:"{_je(composed_exp)}"}}'
         )
     questions_js = ",".join(q_js_items)
 
@@ -1407,6 +1441,46 @@ body{{font-family:'Poppins',-apple-system,BlinkMacSystemFont,sans-serif;backgrou
 const qd={{q:[{questions_js}],m:null,tt:{total_time},nm:{negative_marks}}},
 st={{cq:0,a:Array(qd.q.length).fill(null),mk:Array(qd.q.length).fill(false),tr:qd.tt,ti:null,sb:false,rv:false,th:'light'}};
 if(window.marked){{marked.setOptions({{gfm:true,breaks:true}})}}
+// Security: quiz text/options/explanations are AUTHOR-CONTROLLED markdown
+// rendered with marked (which keeps raw HTML) and injected via innerHTML.
+// Sanitize every rendered fragment with an allowlist before it reaches the
+// live DOM so a malicious creator cannot ship stored XSS (script tags,
+// on* handlers, javascript: URLs) in a downloadable result/report file.
+// Mirrors the sanitizer used by the Telegram Mini App.
+var REPORT_ALLOWED_TAGS={{P:1,BR:1,STRONG:1,B:1,EM:1,I:1,DEL:1,S:1,CODE:1,PRE:1,UL:1,OL:1,LI:1,BLOCKQUOTE:1,HR:1,A:1,TABLE:1,THEAD:1,TBODY:1,TR:1,TH:1,TD:1,H1:1,H2:1,H3:1,H4:1,MARK:1,IMG:1,SPAN:1,DIV:1,SUP:1,SUB:1}};
+var REPORT_ALLOWED_ATTRS={{A:['href','title'],IMG:['src','alt','title'],SPAN:['class','style','aria-hidden'],DIV:['class','style'],TD:['align'],TH:['align']}};
+function sanitizeReportHtml(html){{
+    try{{
+        var tpl=document.createElement('template');
+        tpl.innerHTML=html; // inert: no <script> runs, no resource loads here
+        var removed=[];
+        (function walk(n){{
+            var kids=Array.prototype.slice.call(n.children||[]);
+            kids.forEach(function(ch){{
+                var tag=ch.tagName;
+                if(!REPORT_ALLOWED_TAGS[tag]){{removed.push(ch);return;}}
+                var allow=REPORT_ALLOWED_ATTRS[tag]||[];
+                Array.prototype.slice.call(ch.attributes||[]).forEach(function(at){{
+                    var nm=at.name.toLowerCase();
+                    if(nm.indexOf('on')===0){{ch.removeAttribute(at.name);return;}}
+                    if(allow.indexOf(nm)===-1){{ch.removeAttribute(at.name);return;}}
+                    if((nm==='href'||nm==='src')&&/^\\s*(javascript|vbscript|data(?!:image))/i.test(at.value)){{ch.removeAttribute(at.name);}}
+                }});
+                if(tag==='A'){{ch.setAttribute('target','_blank');ch.setAttribute('rel','noopener noreferrer');}}
+                walk(ch);
+            }});
+        }})(tpl.content);
+        removed.forEach(function(n){{
+            // unwrap (keep text) instead of deleting content outright
+            while(n.firstChild)n.parentNode.insertBefore(n.firstChild,n);
+            n.parentNode.removeChild(n);
+        }});
+        return tpl.innerHTML;
+    }}catch(e){{
+        // Last-resort: if the DOM pipeline is unavailable, strip tags.
+        return String(html).replace(/<[^>]*>/g,'');
+    }}
+}}
 function renderContent(text,inline){{
     if(text===undefined||text===null||text==='')return '';
     let t=String(text);
@@ -1426,6 +1500,9 @@ function renderContent(text,inline){{
     }}catch(e){{
         html=t.replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }}
+    // Allowlist-sanitize ALL author-controlled markup while math is still an
+    // inert @@MATHPHn@@ token; trusted KaTeX HTML is substituted back after.
+    html=sanitizeReportHtml(html);
     html=html.replace(/@@MATHPH(\\d+)@@/g,(m,idx)=>{{
         const item=store[parseInt(idx)];
         if(!item)return m;
