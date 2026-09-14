@@ -1,7 +1,16 @@
 # ---- Telegram ----
 kurigram
-tgcrypto==1.2.5         
-python-telegram-bot==22.8 
+# TgCrypto is an OPTIONAL C accelerator for kurigram's MTProto AES; without
+# it kurigram transparently uses the pure-Python pyaes fallback (pinned
+# below, "Pyrogram will work the same, but at a much slower speed").
+# TgCrypto 1.2.5 (also its latest release) ships wheels only up to CPython
+# 3.11; on Python 3.12 (the Ubuntu 24.04 VPS runtime) an unconditional pin
+# forces a source build needing gcc/python3.12-dev (absent from the minimal
+# VPS image) and fails the entire pip install. Skip it on >=3.12; the bot
+# still runs on pyaes. 3.11/Docker keeps the C accelerator wheel.
+tgcrypto==1.2.5; python_version < "3.12"
+pyaes==1.6.1
+python-telegram-bot==22.8
 motor==3.7.1
 
 # ---- Async HTTP / files ----
