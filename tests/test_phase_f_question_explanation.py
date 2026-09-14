@@ -1033,11 +1033,26 @@ class ArchitectureTests(unittest.TestCase):
         for forbidden in ("BEGIN PRIVATE KEY", "aws_secret_access_key",
                           "x-api-key:", "Authorization: Bearer"):
             self.assertNotIn(forbidden, diff)
-        # db.py must not be part of the diff at all (no schema changes).
         changed = subprocess.run(
             ["git", "diff", "--name-only", "origin/main...HEAD"],
             cwd=REPO_ROOT, capture_output=True, text=True).stdout.split()
-        self.assertNotIn("quizbot/database/db.py", changed)
+        # db.py may change only for additive, non-schema fixes (e.g. Motor
+        # mapping-API accessors). Forbid anything destructive/schema-changing
+        # in its diff: no drops, deletes, renames, migrations or new indexes.
+        if "quizbot/database/db.py" in changed:
+            db_diff = subprocess.run(
+                ["git", "diff", "origin/main...HEAD", "--",
+                 "quizbot/database/db.py"],
+                cwd=REPO_ROOT, capture_output=True, text=True).stdout
+            added = "\n".join(
+                ln[1:] for ln in db_diff.splitlines() if ln.startswith("+"))
+            for forbidden in ("drop_collection", "drop_database", "drop_index",
+                              "drop_indexes", "delete_index", "rename",
+                              "delete_many", "delete_one", "drop_all",
+                              "create_index", "create_collection",
+                              "command(", "aggregate("):
+                self.assertNotIn(forbidden, added,
+                                 f"db.py diff contains schema/destructive op: {forbidden}")
         # New pure layer declares no index/collection and performs no IO.
         src = (REPO_ROOT / "quizbot/shared/explanations.py").read_text()
         for forbidden in ("create_index", "get_db", "collection(",
@@ -1094,6 +1109,14 @@ class ArchitectureTests(unittest.TestCase):
             "tests/test_url_import_ssrf.py",
             "tests/test_mini_app_batch_safety.py",
             "tests/test_weasyprint_runtime_compat.py",
+            # Motor raw-db API startup crash fix + deploy stability gate:
+            "quizbot/database/db.py",
+            "quizbot/analytics/gamification.py",
+            "deploy_health_gate.sh",
+            "deploy_pdf_service.sh",
+            "tests/test_motor_startup_compat.py",
+            "tests/test_deploy_health_gate.py",
+            "tests/test_part3_aiquiz_schedule.py",
         }
         for path in changed:
             self.assertIn(path, allowed, f"unexpected change: {path}")

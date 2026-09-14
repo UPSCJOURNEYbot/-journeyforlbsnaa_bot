@@ -306,6 +306,9 @@ class FakeDb:
     def collection(self, name):
         return self.cols.setdefault(name, FakeCol(name))
 
+    def __getitem__(self, name):
+        return self.collection(name)
+
 
 class FakeQuizRepo:
     quizzes: dict[str, dict] = {}

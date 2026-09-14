@@ -456,6 +456,11 @@ class FakeDB:
             self._cols[name] = FakeCollection(name, self)
         return self._cols[name]
 
+    def __getitem__(self, name):
+        # Motor mapping API parity: production code must be able to use
+        # db["coll"] exactly like a raw MotorDatabase.
+        return self.collection(name)
+
     def __getattr__(self, name):
         return self.collection(name)
 
