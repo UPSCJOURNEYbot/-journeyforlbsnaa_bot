@@ -553,6 +553,8 @@ _LOCATION_RES = (
     re.compile(r"\bsituated\b", re.IGNORECASE),
     re.compile(r"कहाँ"),
     re.compile(r"कहां"),
+    re.compile(r"\bkahan\b", re.IGNORECASE),
+    re.compile(r"\bkaha\b", re.IGNORECASE),
     re.compile(r"स्थित"),
     re.compile(r"राजधानी"),
     re.compile(r"मानचित्र"),
@@ -601,6 +603,7 @@ _RELATION_RES = (
     re.compile(r"निकटतम"),
     re.compile(r"के\s+(उत्तर|दक्षिण|पूर्व|पश्चिम)\s+में"),
     re.compile(r"किस\s+दिशा\s+में"),
+    re.compile(r"kis\s+disha\s+(?:mein|men)", re.IGNORECASE),
 )
 
 
@@ -626,6 +629,7 @@ _SET_ASK_RES = (
     re.compile(r"पहचान"),
     re.compile(r"चिह्नित"),
     re.compile(r"नाम"),
+    re.compile(r"\bnaam\b", re.IGNORECASE),
 )
 
 
@@ -681,6 +685,9 @@ _ROUTE_RES = (
 )
 
 _COMPARISON_INTENT_RES = (
+    re.compile(r"\bvs\b", re.IGNORECASE),
+    re.compile(r"\bv/s\b", re.IGNORECASE),
+    re.compile(r"\bversus\b", re.IGNORECASE),
     re.compile(r"\bcompar\w*\b", re.IGNORECASE),
     re.compile(r"\bcontrast\w*\b", re.IGNORECASE),
     re.compile(r"\bdistinguish\w*\b", re.IGNORECASE),
@@ -688,6 +695,8 @@ _COMPARISON_INTENT_RES = (
     re.compile(r"\bdifferent\s+from\b", re.IGNORECASE),
     re.compile(_hi_word("अंतर")),
     re.compile(_hi_word("तुलना")),
+    re.compile(r"\bantar\b", re.IGNORECASE),
+    re.compile(r"\btulna\b", re.IGNORECASE),
 )
 
 _CHRONOLOGY_RES = (
@@ -703,6 +712,8 @@ _CHRONOLOGY_RES = (
     re.compile(r"सही\s+क्रम"),
     re.compile(r"क्रम\s+में\s+(?:लग|व्यवस्थित|सजा)"),
     re.compile(r"किस\s+क्रम\s+में"),
+    re.compile(r"\bkab\b", re.IGNORECASE),
+    re.compile(r"\bkram\b", re.IGNORECASE),
 )
 
 _PROCESS_INTENT_RES = (
@@ -716,6 +727,7 @@ _PROCESS_INTENT_RES = (
     re.compile(r"प्रक्रम"),
     re.compile(r"प्रक्रिया"),
     re.compile(r"कैसे"),
+    re.compile(r"\bkaise\b", re.IGNORECASE),
 )
 
 _MECHANISM_INTENT_RES = (
@@ -742,6 +754,8 @@ _CAUSAL_INTENT_RES = (
     re.compile(r"कारण"),
     re.compile(r"प्रभाव"),
     re.compile(r"परिणाम"),
+    re.compile(r"\bkyon\b", re.IGNORECASE),
+    re.compile(r"\bkyun\b", re.IGNORECASE),
 )
 
 _CLASSIFY_INTENT_RES = (
@@ -752,6 +766,8 @@ _CLASSIFY_INTENT_RES = (
     re.compile(r"प्रकार"),
     re.compile(r"वर्गीकरण"),
     re.compile(r"श्रेणी"),
+    re.compile(r"\bke\s+types?\b", re.IGNORECASE),
+    re.compile(r"\bke\s+prakar\b", re.IGNORECASE),
 )
 
 _FEATURES_INTENT_RES = (
@@ -791,6 +807,9 @@ _RECALL_RES = (
     # a person-recall. (Spaced कौन सा stays recall: spaced से is
     # ambiguous with the with/from postposition.)
     re.compile(r"(?<![%s])कौन(?!-स[ाएी])(?![%s])" % (_DEVA, _DEVA)),
+    # Roman "kaun" (who) recalls; roman "kaun sa" stays recall too
+    # (roman rarely hyphenates, so the spaced ambiguity stands).
+    re.compile(r"\bkaun\b", re.IGNORECASE),
 )
 
 _ASSERTION_RES = (
@@ -856,18 +875,41 @@ _ORDINALS_EN = ("first", "second", "third", "fourth", "fifth", "sixth",
 _ORDINALS_HI = ("पहला", "दूसरा", "तीसरा", "चौथा", "पाँचवाँ", "पांचवां",
                 "छठा", "सातवाँ", "आठवाँ")
 
+# Sides are noun phrases: they never span sentence ends (?!), bullet
+# markers, or newlines. Without this guard a short side ("Y?") forces
+# the lazy group past the sentence end into the explanation, minting
+# garbage sides ("Y? • Apples are red"). Periods stay allowed inside
+# ("St. Louis"); the lookahead still ends sides at sentence stops.
+_CMP_SIDE = r"[^?!•▪·\n]"
 _CMP_RES = (
-    re.compile(r"differences?\s+between\s+(.+?)\s+and\s+(.+?)"
-               r"(?=[.,;:?!]|$)", re.IGNORECASE),
-    re.compile(r"(.{3,60}?)\s+(?:vs\.?|v/s|versus)\s+(.{3,60}?)"
-               r"(?=[.,;:?!]|$)", re.IGNORECASE),
-    re.compile(r"(.{2,40}?)\s+और\s+(.{2,40}?)\s+में\s+अंतर"),
-    re.compile(r"(.{2,40}?)\s+और\s+(.{2,40}?)\s+के\s+बीच\s+"
-               r"(?:क्या\s+)?(?:अंतर|तुलना)"),
-    re.compile(r"(.{3,60}?)\s+different\s+from\s+(.{3,60}?)"
-               r"(?=[.,;:?!]|$)", re.IGNORECASE),
-    re.compile(r"compar\w*\s+(.{3,50}?)\s+with\s+(.{3,50}?)"
-               r"(?=[.,;:?!]|$)", re.IGNORECASE),
+    re.compile(r"differences?\s+between\s+(%s+?)\s+and\s+(%s+?)"
+               r"(?=[.,;:?!]|$)" % (_CMP_SIDE, _CMP_SIDE),
+               re.IGNORECASE),
+    re.compile(r"(%s{3,60}?)\s+(?:vs\.?|v/s|versus)\s+(%s{3,60}?)"
+               r"(?=[.,;:?!]|$)" % (_CMP_SIDE, _CMP_SIDE),
+               re.IGNORECASE),
+    re.compile(r"(%s{2,40}?)\s+और\s+(%s{2,40}?)\s+में\s+अंतर"
+               r"(?![\u0900-\u097F])" % (_CMP_SIDE, _CMP_SIDE)),
+    re.compile(r"(%s{2,40}?)\s+और\s+(%s{2,40}?)\s+के\s+बीच\s+"
+               r"(?:क्या\s+)?(?:अंतर|तुलना)(?![\u0900-\u097F])"
+               % (_CMP_SIDE, _CMP_SIDE)),
+    re.compile(r"(%s{3,60}?)\s+different\s+from\s+(%s{3,60}?)"
+               r"(?=[.,;:?!]|$)" % (_CMP_SIDE, _CMP_SIDE),
+               re.IGNORECASE),
+    re.compile(r"compar\w*\s+(%s{3,50}?)\s+with\s+(%s{3,50}?)"
+               r"(?=[.,;:?!]|$)" % (_CMP_SIDE, _CMP_SIDE),
+               re.IGNORECASE),
+    # Hinglish (roman): X aur Y [mein/men] [kya/ka] antar; X aur Y
+    # ki tulna. Word-boundaried so antarrashtriya/tulnatmak never
+    # match; sides still need attributed bullets downstream.
+    re.compile(r"(%s{2,40}?)\s+aur\s+(%s{2,40}?)\s+"
+               r"(?:(?:mein|men)\s+)?(?:kya\s+|ka\s+)?antar\b"
+               % (_CMP_SIDE, _CMP_SIDE), re.IGNORECASE),
+    re.compile(r"(%s{2,40}?)\s+aur\s+(%s{2,40}?)\s+ki\s+tulna\b"
+               % (_CMP_SIDE, _CMP_SIDE), re.IGNORECASE),
+    re.compile(r"compar\w*\s+(?:karo\s+)?(%s{3,40}?)\s+(?:and|aur)\s+"
+               r"(%s{3,40}?)(?=[.,;:?!]|$)" % (_CMP_SIDE, _CMP_SIDE),
+               re.IGNORECASE),
 )
 
 _LEAD_QW_RE = re.compile(
@@ -899,6 +941,11 @@ _CLASSIFY_RES = (
                re.IGNORECASE),
     re.compile(r"([^:;.\n?]{3,60}?)\s*के\s+प्रकार"
                r"(?:\s*[:：](?!\s*[\u2022\-*])\s*([^.\n]{3,200}))?"),
+    # Hinglish (roman): "Rocks ke types/prakar". Space-delimited ke
+    # keeps words like "milke"/"like" safe; items still need the 3+
+    # bar downstream.
+    re.compile(r"([^:;.\n?]{3,40}?)\s+ke\s+types?\b", re.IGNORECASE),
+    re.compile(r"([^:;.\n?]{3,40}?)\s+ke\s+prakar\b", re.IGNORECASE),
 )
 
 _CONCEPT_RES = (
@@ -1066,6 +1113,54 @@ def _steps_type(subject: Optional[str], norm: str) -> str:
     return VisualType.FLOWCHART.value
 
 
+# Function words carry no reference: a side-word like "are" (from a
+# "differences between A and B are small" bleed) must never attribute
+# a bullet to that side. Casefold-compared (covers EN + roman HI).
+_SIDE_STOPWORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been",
+    "being", "am", "do", "does", "did", "have", "has", "had", "of",
+    "in", "on", "at", "to", "for", "with", "from", "by", "as", "and",
+    "or", "but", "it", "its", "this", "that", "these", "those",
+    "both", "each", "than", "then", "so", "such", "no", "not", "very",
+    "more", "most", "are", "can", "will", "would", "should",
+    "hai", "hain", "ho", "hoga", "hote", "hoti", "hota", "tha",
+    "thi", "they", "ka", "ki", "ke", "ko", "se", "mein", "men",
+    "par", "per", "aur", "ya", "kya", "jo", "woh", "wo", "ye",
+    "yeh", "vah", "ve", "kaun", "ne", "bhi", "hi", "na", "to", "toh",
+})
+
+
+def _side_patterns(side: str, skip: frozenset = frozenset()) -> list:
+    """Word-level mention matchers for one comparison side.
+
+    A side like "Chilika lake" is mentioned by any of its words
+    ("Chilika ..."), not only by the full string -- bullets use bare
+    names. Words with 3+ characters match case-insensitively on
+    script-aware boundaries; shorter words (abbreviations like "UP",
+    single letters like "X") match case-sensitively so "up"/"next"
+    never count as mentions. Punctuation-only tokens, stopwords,
+    and `skip` words (shared by both sides -- they cannot tell the
+    sides apart) are skipped.
+    """
+    patterns = []
+    for word in re.split(r"\s+", side):
+        if not re.search(r"\w", word):
+            continue
+        folded = word.casefold()
+        if folded in _SIDE_STOPWORDS or folded in skip:
+            continue
+        # Script-aware boundaries: plain \b fails Devanagari words
+        # ending in vowel signs (ा is a mark, not a \w char), so
+        # guard with word-chars + the whole Devanagari block.
+        rx = (r"(?<![\w%s])%s(?![\w%s])"
+              % (_DEVA, re.escape(word), _DEVA))
+        if len(word) >= 3:
+            patterns.append(re.compile(rx, re.IGNORECASE))
+        else:
+            patterns.append(re.compile(rx))
+    return patterns
+
+
 def _comparison_payload(norm: str, raw: str) -> Optional[dict]:
     left = right = ""
     for pattern in _CMP_RES:
@@ -1085,16 +1180,27 @@ def _comparison_payload(norm: str, raw: str) -> Optional[dict]:
     if len(bullets) < COMPARISON_MIN_BULLETS:
         return None
     left_pts, right_pts, common = [], [], []
+    # Words shared by both sides ("Sabha" in "Lok Sabha"/"Rajya
+    # Sabha") match every bullet, so they are excluded: only
+    # discriminating words can attribute a point to one side.
+    left_words = {w.casefold() for w in re.split(r"\s+", left)}
+    right_words = {w.casefold() for w in re.split(r"\s+", right)}
+    shared = frozenset(left_words & right_words)
+    left_pats = _side_patterns(left, shared)
+    right_pats = _side_patterns(right, shared)
     for bullet in bullets:
-        folded = bullet.casefold()
-        in_left = left.casefold() in folded
-        in_right = right.casefold() in folded
+        in_left = any(p.search(bullet) for p in left_pats)
+        in_right = any(p.search(bullet) for p in right_pats)
         if in_left and not in_right:
             left_pts.append(bullet)
         elif in_right and not in_left:
             right_pts.append(bullet)
         else:
             common.append(bullet)
+    if not left_pts and not right_pts:
+        # No point is attributed to either side: a sided comparison
+        # would be fiction, so yield to safer fallbacks (or None).
+        return None
     return {
         "left_title": left,
         "right_title": right,
