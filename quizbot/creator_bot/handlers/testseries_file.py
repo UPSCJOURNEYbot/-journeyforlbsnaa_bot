@@ -82,12 +82,15 @@ def _match_option(line: str) -> re.Match | None:
     return _OPTION_DEV.match(line)
 
 
-_ANSWER = re.compile(r"^\s*(?:Answers?|Ans\.?|उत्तर)\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_ANSWER = re.compile(
+    r"^\s*(?:Correct\s+Answers?|Correct\s+Options?|Answers?|Ans\.?|उत्तर|सही\s+उत्तर)\s*:\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
 _EXPLAIN = re.compile(r"^\s*(Ex\.?|Explanation|व्याख्या)\s*:\s*(.*)$", re.IGNORECASE)
 _SOLUTION = re.compile(r"^\s*(Solutions?|हल)\s*:\s*(.*)$", re.IGNORECASE)
 _EXTRA = re.compile(r"^\s*Extra\s+details?\s*:\s*(.*)$", re.IGNORECASE)
 _MARK = re.compile(r"[✅✔✓☑]\uFE0F?")
-_LETTER_VAL = re.compile(r"^\(?([A-Ja-jक-ञ])\)?\s*[.)]?\s*(.*)$")
+_LETTER_VAL = re.compile(r"^\s*\(?\s*([A-Ja-jक-ञ])\s*\)?\s*[.)]?\s*$")
 _META = re.compile(r"^\s*[^\W\d_][^:]{0,24}:\s")
 _MD_ESCAPE = re.compile(r"([\\_\*\[\`])")
 
@@ -250,26 +253,57 @@ def _split_blocks(lines: list[str]) -> list[dict]:
 def _resolve_answer(value: str, options: list[dict]) -> tuple[int | None, str]:
     """Resolve an ``Answer:`` value to an option index.
 
+    Supports:
+    - Letter: A, B, C ... (case-insensitive, with optional parens/punct)
+    - Letter with suffix: "B - Banana", "B) Banana", "B: Banana" (letter extracted)
+    - Exact option text: case-insensitive, whitespace-normalized
+    - Does NOT guess via substring/partial matches (tightened ambiguous handling)
+
     Returns ``(index, "")`` on success or ``(None, reason)`` when the
-    value matches nothing (caller turns the reason into a problem).
+    value matches nothing or is ambiguous.
     """
     cleaned = _clean_chunk(value)
     if not cleaned:
         return None, "empty Answer: line"
     norm = _norm(cleaned)
-    for i, opt in enumerate(options):
-        if _norm(opt["text"]) == norm:
-            return i, ""
+
+    # Exact option-text match (tightened: only full equality, no substring)
+    exact_matches = [i for i, opt in enumerate(options) if _norm(opt["text"]) == norm]
+    if len(exact_matches) == 1:
+        return exact_matches[0], ""
+    if len(exact_matches) > 1:
+        return None, f'answer "{cleaned}" is ambiguous (matches {len(exact_matches)} options)'
+
+    # Letter-only match (e.g. "C" or "(C)") — after exact-text check
     m = _LETTER_VAL.match(cleaned)
     if m:
-        letter, rest = m.group(1).upper(), _norm(m.group(2))
-        idx = next((i for i, o in enumerate(options) if o["letter"] == letter), None)
-        if idx is not None:
-            if not rest:
+        raw_letter = m.group(1)
+        if raw_letter.isascii():
+            letter = raw_letter.upper()
+            idx = next((i for i, o in enumerate(options) if o["letter"].upper() == letter), None)
+            if idx is not None:
                 return idx, ""
-            opt_norm = _norm(options[idx]["text"])
-            if rest == opt_norm or rest in opt_norm or opt_norm in rest:
+        else:
+            idx = next((i for i, o in enumerate(options) if o["letter"] == raw_letter), None)
+            if idx is not None:
                 return idx, ""
+
+    # Letter with suffix: "B - Banana", "B) Banana", "B: Banana", "B. Banana" etc.
+    # Extract leading letter when followed by punctuation separator and any text.
+    # This is not substring guessing: we explicitly extract the letter, not the text.
+    m2 = re.match(r"^\s*\(?\s*([A-Ja-jक-ञ])\s*\)?\s*[.\-–—:]\s*.+$", cleaned)
+    if m2:
+        raw_letter = m2.group(1)
+        if raw_letter.isascii():
+            letter = raw_letter.upper()
+            idx = next((i for i, o in enumerate(options) if o["letter"].upper() == letter), None)
+            if idx is not None:
+                return idx, ""
+        else:
+            idx = next((i for i, o in enumerate(options) if o["letter"] == raw_letter), None)
+            if idx is not None:
+                return idx, ""
+
     return None, f'answer "{cleaned}" matches no option'
 
 

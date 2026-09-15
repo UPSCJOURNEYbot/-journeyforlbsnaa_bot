@@ -64,6 +64,7 @@ class VisualType(str, Enum):
     PANELS = "panels"
     MECHANISM = "mechanism"
     SPATIAL_CHAIN = "spatial_chain"
+    THREE_D = "three_d"
 
 
 ALL_TYPES = frozenset(t.value for t in VisualType)
@@ -91,6 +92,7 @@ GENERIC_ORDER = (
     "cycle",
     "cause_effect",
     "spatial_chain",
+    "three_d",
     "mind_map",
     "concept_map",
     "panels",
@@ -118,6 +120,7 @@ _TYPE_INTENTS = {
     "classification": {"classify"},
     "mechanism": {"mechanism"},
     "spatial_chain": {"route"},
+    "three_d": {"depth"},
 }
 
 # Question frames that ask for an explicit structure. When such a frame
@@ -126,7 +129,7 @@ _TYPE_INTENTS = {
 # the features of Chilika" wants feature panels, not a locator dot).
 STRUCTURE_OVERRIDE_FRAMES = frozenset({
     "features", "process", "mechanism", "comparison", "chronology",
-    "causal", "classify", "cycle",
+    "causal", "classify", "cycle", "depth",
 })
 
 # Thresholds / caps (all pinned by tests).
@@ -790,6 +793,35 @@ _FEATURES_INTENT_RES = (
     re.compile(r"शामिल"),
 )
 
+_DEPTH_RES = (
+    re.compile(r"\b3d\b", re.IGNORECASE),
+    re.compile(r"\bthree\s*dimensional\b", re.IGNORECASE),
+    re.compile(r"\bdepth\b", re.IGNORECASE),
+    re.compile(r"\brelief\b", re.IGNORECASE),
+    re.compile(r"\blayers?\b", re.IGNORECASE),
+    re.compile(r"\bstrata\b", re.IGNORECASE),
+    re.compile(r"\bstratum\b", re.IGNORECASE),
+    re.compile(r"\bcross[\s\-]*section\b", re.IGNORECASE),
+    re.compile(r"\bprofile\b", re.IGNORECASE),
+    re.compile(r"\bisometric\b", re.IGNORECASE),
+    re.compile(r"\bcontour\b", re.IGNORECASE),
+    re.compile(r"\btopograph\w*\b", re.IGNORECASE),
+    re.compile(r"\belevation\b", re.IGNORECASE),
+    re.compile(r"\bbathymetr\w*\b", re.IGNORECASE),
+    re.compile(r"\bcrust\b", re.IGNORECASE),
+    re.compile(r"\bmantle\b", re.IGNORECASE),
+    re.compile(r"\bcore\b", re.IGNORECASE),
+    re.compile(r"\batmospher.*\blayers?\b", re.IGNORECASE),
+    re.compile(r"\bsoil\s+layers?\b", re.IGNORECASE),
+    re.compile(r"\bgeological\s+layers?\b", re.IGNORECASE),
+    re.compile(r"\bearth\s+layers?\b", re.IGNORECASE),
+    re.compile(r"गहराई"),
+    re.compile(r"परत"),
+    re.compile(r"स्तर"),
+    re.compile(r"त्रि\s*विमीय"),
+    re.compile(r"उच्चावच"),
+)
+
 _RECALL_RES = (
     re.compile(r"^\s*who\b", re.IGNORECASE),
     re.compile(r"\bwho\s+(was|were|is|are|led|founded|wrote|discovered|"
@@ -834,6 +866,7 @@ _INTENT_TABLE: tuple[tuple[str, tuple], ...] = (
     ("causal", _CAUSAL_INTENT_RES),
     ("classify", _CLASSIFY_INTENT_RES),
     ("features", _FEATURES_INTENT_RES),
+    ("depth", _DEPTH_RES),
 )
 
 
@@ -1541,6 +1574,47 @@ def _chain_payload(raw: str, expl_text: str) -> Optional[dict]:
     return payload
 
 
+def _depth_payload(raw: str, norm: str, intents: tuple[str, ...]) -> Optional[dict]:
+    """3D / depth-layers evidence: depth intent + >=3 layered items.
+
+    Deterministic, PDF-safe, bounded, no fabricated data:
+    - Requires depth intent (3D, depth, relief, layers, strata, cross-section, etc.)
+    - Requires at least 3 items from author's own numbered/bullet list
+    - Requires layer-related wording in the normalized text to avoid decoration
+    - Returns at most 6 layers, preserving author order
+    - Safe fallback: None -> caller falls back to 2D or NO_VISUAL
+    """
+    if "depth" not in intents:
+        return None
+    # Layer-related wording must be present in the combined text
+    layer_keywords = (
+        "layer", "layers", "strata", "stratum", "depth", "relief",
+        "elevation", "topograph", "cross-section", "cross section",
+        "profile", "crust", "mantle", "core", "atmosphere",
+        "soil", "geological", "earth", "3d", "three dimensional",
+        "isometric", "contour", "bathymetr",
+        "परत", "स्तर", "गहराई", "उच्चावच", "त्रि",
+    )
+    if not any(kw in norm.lower() for kw in layer_keywords):
+        return None
+    # Prefer numbered items, then flat bullets, then any bullet list
+    items = _numbered_items(raw)
+    if len(items) < 3:
+        items = _flat_items(raw)
+    if len(items) < 3:
+        items = _bullets(raw)
+    if len(items) < 3:
+        return None
+    layers = []
+    for it in items[:6]:
+        label = _clean_item(it, 80)
+        if label:
+            layers.append({"label": label})
+    if len(layers) < 3:
+        return None
+    return {"layers": layers}
+
+
 def _route_covers(routes: list[dict], link_ids: list[str]) -> bool:
     """True when a sourced route connects every chain link."""
     wanted = set(link_ids)
@@ -1760,6 +1834,10 @@ def decide_visual(question: object,
         candidates[VisualType.SPATIAL_CHAIN.value] = chain
         bits[VisualType.SPATIAL_CHAIN.value] = "links=%d" % len(
             chain["links"])
+    depth = _depth_payload(struct_raw, struct_norm, intents)
+    if depth:
+        candidates[VisualType.THREE_D.value] = depth
+        bits[VisualType.THREE_D.value] = "layers=%d" % len(depth["layers"])
     panels = _panels_payload(struct_raw, struct_norm, intents)
     if panels:
         candidates[VisualType.PANELS.value] = panels

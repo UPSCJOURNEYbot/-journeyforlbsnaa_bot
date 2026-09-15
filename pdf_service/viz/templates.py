@@ -453,6 +453,34 @@ def layout_chain(n: int, has_hi: list[bool], x: float, y: float, w: float
 # ---------------------------------------------------------------------------
 
 
+def layout_three_d(n: int, x: float, y: float, w: float
+                   ) -> tuple[list[dict], float]:
+    """Stacked layers with depth cue to simulate 3D.
+
+    Deterministic, PDF-safe, bounded, geometry-clean:
+    - n capped at 6 by engine
+    - Each layer is a full-width box stacked vertically with gap
+    - Alternating fills imply depth, no extra overlapping boxes
+    - No external resources, no randomness
+    - Height = n * layer_h + (n-1)*gap
+    - All boxes in-bounds, no partial overlaps (containment only)
+    """
+    if n <= 0:
+        return [], 0.0
+    layer_h = 12.0
+    gap = 3.0
+    total_h = n * layer_h + (n - 1) * gap
+    elements: list[dict] = []
+    for i in range(n):
+        by = y + i * (layer_h + gap)
+        fill = (235, 240, 250) if i % 2 == 0 else (230, 245, 235)
+        # Main layer box with depth shading via fill, left-aligned label
+        elements.append(_box(x, by, w, layer_h, "__LAYER__%d" % i,
+                             size=8.0, bold=False, fill=fill, line=LINE,
+                             align="L", max_lines=2))
+    return elements, total_h
+
+
 def _layout_for_spec(spec: VisualSpec, x: float, y: float, w: float
                      ) -> tuple[list[dict], float]:
     """Pure layout for a spec (placeholder texts resolved by caller)."""
@@ -495,6 +523,8 @@ def _layout_for_spec(spec: VisualSpec, x: float, y: float, w: float
                             [bool(link.get("name_hi"))
                              for link in payload.get("links", [])],
                             x, y, w)
+    if kind == "three_d":
+        return layout_three_d(len(payload.get("layers", [])), x, y, w)
     raise ValueError(f"No template for visual type: {kind!r}")
 
 
@@ -588,6 +618,10 @@ def _resolve_texts(spec: VisualSpec, elements: list[dict]) -> None:
                 i + 1, textstyle.clean_label(link.get("name_en", ""), 40))
             mapping["__HI__%d" % i] = textstyle.clean_label(
                 link.get("name_hi", ""), 40)
+    elif kind == "three_d":
+        for i, layer in enumerate(payload.get("layers", [])):
+            mapping["__LAYER__%d" % i] = "%d. %s" % (
+                i + 1, textstyle.clean_label(layer.get("label", ""), 70))
     for element in elements:
         if element["k"] == "box" and element["text"] in mapping:
             element["text"] = mapping[element["text"]]

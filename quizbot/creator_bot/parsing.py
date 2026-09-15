@@ -219,7 +219,7 @@ _CHECK_PREFIX_RE = re.compile(r"^[\W_]*✅")
 _CHECK_ANY_RE = re.compile(r"✅")
 
 _ANSWER_LINE_RE = re.compile(
-    r"^\s*(?:correct\s+answer|correct\s+option|answer|ans|उत्तर|सही\s+उत्तर)"
+    r"^\s*(?:correct\s+answers?|correct\s+options?|answers?|ans|उत्तर|सही\s+उत्तर)"
     r"\s*[:：]\s*(.+)$", re.I)
 _EXPL_LINE_RE = re.compile(
     r"^\s*(?:explanation|solution|sol|ex|व्याख्या|समाधान|हल)"
@@ -230,7 +230,7 @@ _SOURCE_LINE_RE = re.compile(
     r"^(?:source|reference|स्रोत|संदर्भ|सन्दर्भ)\s*[:：]", re.I)
 # Keywords that terminate option collection when encountered mid-region
 _STOP_IN_OPT_RE = re.compile(
-    r"^(?:answer|ans|उत्तर|सही\s+उत्तर|ex|explanation|solution|व्याख्या|"
+    r"^(?:correct\s+answers?|correct\s+options?|answers?|ans|उत्तर|सही\s+उत्तर|ex|explanation|solution|व्याख्या|"
     r"समाधान|हल|extra\s+details?|अतिरिक्त\s+जानकारी|source|reference|"
     r"स्रोत|संदर्भ|सन्दर्भ)\s*[:：]",
     re.I)
@@ -239,7 +239,7 @@ _TERM_IN_OPT_RE = re.compile(
     r"अतिरिक्त\s+जानकारी|source|reference|स्रोत|संदर्भ|सन्दर्भ)\s*[:：]",
     re.I)
 _ANSWER_KEYWORD_RE = re.compile(
-    r"(?:correct\s+answer|correct\s+option|\banswer\b|\bans\b|उत्तर|सही\s+उत्तर)",
+    r"(?:correct\s+answers?|correct\s+options?|\banswers?\b|\bans\b|उत्तर|सही\s+उत्तर)",
     re.I)
 
 # Question-start badges
@@ -270,27 +270,76 @@ def _strip_question_badge(line: str, ordinal: Optional[int] = None):
 # ---------------------------------------------------------------------------
 # Answer spec resolution
 # ---------------------------------------------------------------------------
-def _resolve_answer_spec(spec: str, n_opts: int):
+def _norm_text(s: str) -> str:
+    """Collapse whitespace and casefold for exact-text answer matching."""
+    return " ".join(str(s).split()).casefold()
+
+
+def _resolve_answer_spec(spec: str, n_opts: int, option_texts: list[str] | None = None):
     """Map an Answer: line to option indices.
+
+    Supports:
+    - letter labels (A-J), Devanagari (क-ञ), ordinals (1..n)
+    - exact option text (case-insensitive, whitespace-normalized)
+    - option-level ✅ handled elsewhere
 
     Returns ``(indices, bad_range, bad_text)``. ``indices`` may contain
     several values (multi-answer). Tokens shaped like option labels or
     ordinals that fall beyond the available options go in ``bad_range``
     (out of range); anything else goes in ``bad_text`` (unrecognised).
+
+    Ambiguous exact-text matches (same normalized text in multiple options)
+    are NOT guessed — they become bad_text so the caller rejects with
+    RE_UNRECOGNIZED_ANSWER rather than silently picking one.
     """
     indices: list[int] = []
     bad_range: list[str] = []
     bad_text: list[str] = []
+
+    _strip_punct = "()[]{}." + chr(92)  # ()[]{}.\  - avoid raw string ending issue
+
+    # Pre-normalize option texts for exact matching if provided
+    norm_opts: list[str] = []
+    if option_texts is not None:
+        norm_opts = [_norm_text(o) for o in option_texts]
+
+        # First, try whole spec as exact option text (common case:
+        # "Answer: Delhi is the capital")
+        whole_norm = _norm_text(spec.strip().strip(_strip_punct).strip())
+        # Strip leading "option"/"choice" wrappers that sometimes surround text
+        whole_tmp = re.sub(r"^(?:OPTION|CHOICE)\s*", "", whole_norm, flags=re.I)
+        whole_tmp = re.sub(r"\s*(?:OPTION|CHOICE)$", "", whole_tmp, flags=re.I).strip()
+        if whole_tmp:
+            matches = [i for i, no in enumerate(norm_opts) if no == whole_tmp]
+            if len(matches) == 1:
+                return [matches[0]], [], []
+            if len(matches) > 1:
+                # Ambiguous exact text — do not guess
+                return [], [], [spec.strip()]
+
     parts = re.split(r"\s*(?:,|/|;|\band\b|और|،)\s*", spec, flags=re.I)
     for raw in parts:
-        token = raw.strip().strip("()[]{}.").rstrip(".").strip()
+        token = raw.strip().strip(_strip_punct).rstrip(".").strip()
         if not token:
             continue
         token = re.sub(r"^(?:OPTION|CHOICE)\s*", "", token, flags=re.I)
         token = re.sub(r"\s*(?:OPTION|CHOICE)$", "", token, flags=re.I).strip()
-        token = _CHECK_ANY_RE.sub("", token).strip().strip("()[]{}.").rstrip(".").strip()
+        token = _CHECK_ANY_RE.sub("", token).strip().strip(_strip_punct).rstrip(".").strip()
         if not token:
             continue
+
+        # Exact option-text match (tightened: no substring guessing)
+        if norm_opts:
+            tnorm = _norm_text(token)
+            exact_matches = [i for i, no in enumerate(norm_opts) if no == tnorm]
+            if len(exact_matches) == 1:
+                indices.append(exact_matches[0])
+                continue
+            if len(exact_matches) > 1:
+                # Ambiguous duplicate option texts — do not guess
+                bad_text.append(token)
+                continue
+
         m_num = re.match(r"^(\d{1,3})(?:st|nd|rd|th)?$", token, re.I)
         letter = None
         m_let = re.match(r"^([A-Za-z])\)?[.]?$", token)
@@ -530,7 +579,7 @@ def _core_parse(blk: str):
     bad_range_all: list[str] = []
     bad_text_all: list[str] = []
     for line_no, spec in answer_specs:
-        ids, bad_range, bad_text = _resolve_answer_spec(spec, n_opts)
+        ids, bad_range, bad_text = _resolve_answer_spec(spec, n_opts, option_texts)
         per_line.append((line_no, ids, bad_range, bad_text))
         bad_range_all.extend(bad_range)
         bad_text_all.extend(bad_text)
