@@ -151,17 +151,17 @@ def _bundled_font_face_css() -> str:
         if emoji.is_file() else "")
 
     blocks = [
-        f"@font-face {{ font-family: 'Noto Sans'; font-weight: 400; "
+        f"@font-face {{ font-family: 'QuizReportSans'; font-weight: 400; "
         f"font-style: normal; src: url('{_uri(regular)}'); }}",
-        f"@font-face {{ font-family: 'Noto Sans Devanagari'; font-weight: 400; "
+        f"@font-face {{ font-family: 'QuizReportSansDevanagari'; font-weight: 400; "
         f"font-style: normal; src: url('{_uri(regular)}'); }}",
     ]
     if bold.is_file():
         blocks.append(
-            f"@font-face {{ font-family: 'Noto Sans'; font-weight: 700; "
+            f"@font-face {{ font-family: 'QuizReportSans'; font-weight: 700; "
             f"font-style: normal; src: url('{_uri(bold)}'); }}")
         blocks.append(
-            f"@font-face {{ font-family: 'Noto Sans Devanagari'; font-weight: 700; "
+            f"@font-face {{ font-family: 'QuizReportSansDevanagari'; font-weight: 700; "
             f"font-style: normal; src: url('{_uri(bold)}'); }}")
     if emoji_block:
         blocks.append(emoji_block.rstrip("\n"))
@@ -620,9 +620,9 @@ def _build_questions_html(
 
 _CLASSIC_CSS = """
 @page { size: A4; margin: 1.5cm 1.5cm 2cm 1.5cm;
-  @bottom-center { content: "Page " counter(page); font-family: 'Noto Sans', sans-serif; font-size: 9pt; color: #64748b; }
-  @top-right { content: "{title_short}"; font-family: 'Noto Sans', sans-serif; font-size: 8pt; color: #94a3b8; font-style: italic; } }
-body { font-family: 'Noto Sans', 'Noto Sans Devanagari', sans-serif; color: #1e293b; line-height: 1.5; font-size: 10pt; background-color: #fff; }
+  @bottom-center { content: "Page " counter(page); font-family: 'QuizReportSans', sans-serif; font-size: 9pt; color: #64748b; }
+  @top-right { content: "{title_short}"; font-family: 'QuizReportSans', sans-serif; font-size: 8pt; color: #94a3b8; font-style: italic; } }
+body { font-family: 'QuizReportSans', 'QuizReportSansDevanagari', sans-serif; color: #1e293b; line-height: 1.5; font-size: 10pt; background-color: #fff; }
 .report-header { text-align: center; border-bottom: 2px solid #1e3a8a; padding-bottom: 15px; margin-bottom: 20px; }
 .report-title { font-family: 'Merriweather', serif; font-size: 20pt; color: #1e3a8a; margin: 0 0 5px 0; }
 .report-meta { font-size: 9pt; color: #64748b; margin-top: 5px; }
@@ -652,8 +652,8 @@ math { font-size: 9.5pt; } math[display="block"] { display: block; margin: 6px a
 
 _MODERN_CSS = """
 @page { size: A4; margin: 1.5cm 1.5cm 2cm 1.5cm;
-  @bottom-center { content: "Page " counter(page); font-family: 'Noto Sans', sans-serif; font-size: 9pt; color: #64748b; } }
-body { font-family: 'Noto Sans', 'Noto Sans Devanagari', sans-serif; color: #1e293b; line-height: 1.6; font-size: 10pt; background-color: #fff; }
+  @bottom-center { content: "Page " counter(page); font-family: 'QuizReportSans', sans-serif; font-size: 9pt; color: #64748b; } }
+body { font-family: 'QuizReportSans', 'QuizReportSansDevanagari', sans-serif; color: #1e293b; line-height: 1.6; font-size: 10pt; background-color: #fff; }
 .report-header { text-align: center; padding: 20px; margin-bottom: 20px; background: linear-gradient(135deg, #667eea, #764ba2); border-radius: 10px; color: white; }
 .report-title { font-family: 'Merriweather', serif; font-size: 22pt; margin: 0 0 8px 0; }
 .report-meta { font-size: 9.5pt; opacity: 0.9; }
