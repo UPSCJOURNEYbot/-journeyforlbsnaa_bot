@@ -30,7 +30,10 @@ from .. import state
 from ..parsing import filter_words, parse_question_block, strip_source_noise
 from ..ratelimit import ratelimit
 from ..subscribe_gate import subscribe_gate
-from .file_import import process_public_url, process_uploaded_file
+from .file_import import (
+    _process_json, _process_text_content, process_public_url,
+    process_uploaded_file, _summarize_skipped,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -484,48 +487,106 @@ async def _finalize_quiz(c: Client, reply_target, uid: int, from_user_name: str)
             logger.debug("Failed to announce new quiz in BOT_GROUP", exc_info=True)
 
 
+# /create accepts EXACTLY these document extensions (case-insensitive,
+# extension-based -- MIME type never bypasses the gate). Image attachments
+# keep their dedicated OCR route; JSON arrives via pasted text / links.
+_DOC_EXTS = (".txt", ".md", ".markdown", ".pdf")
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+
+_UNSUPPORTED_FILE_MSG = (
+    "⚠️ Supported files: TXT, MD, MARKDOWN or PDF (with the correct option "
+    "marked), or an image for OCR. You can also paste questions as text, "
+    "forward quiz polls, or share a public link."
+)
+_JSON_ATTACHMENT_MSG = (
+    "⚠️ JSON attachments are not imported directly. Paste the JSON text "
+    "into this chat instead (or share a public link to it)."
+)
+
+
+async def _load_remove_words(uid: int) -> list[str]:
+    """Best-effort remove-words lookup; never blocks an import when the
+    user profile cannot be loaded."""
+    try:
+        user = await UserRepository(get_db()).get_or_create(uid)
+        return user.get("remove_words", []) or []
+    except Exception:
+        logger.debug("Could not load remove_words", exc_info=True)
+        return []
+
+
+def _import_summary(prefix: str, count: int, report: Optional[dict],
+                    total: int, *, image: bool = False) -> str:
+    """User-facing import summary, honestly including skips."""
+    noun = "question" if count == 1 else "questions"
+    via = " extracted from image;" if image else ""
+    text = f"{prefix}{via} {count} {noun} processed! Total: {total}\n"
+    skipped = (report or {}).get("skipped") or []
+    if skipped:
+        text += (f"⚠️ {len(skipped)} block(s) skipped: "
+                 f"{_summarize_skipped(skipped)}.\n")
+    text += "Send more or /done"
+    return text
+
+
 async def handle_document(c: Client, m: Message) -> None:
-    """Handle a .txt/.json file sent while a quiz-creation session is
-    active -- imports questions in bulk (see handlers/file_import.py)."""
+    """Handle a document sent while a quiz-creation session is active.
+
+    Extension-only gate (case-insensitive): exactly .txt/.md/.markdown/
+    .pdf are bulk-imported, images go to OCR, .json is refused with a
+    paste hint, and everything else (.docx/.csv/.exe/archives, even with
+    a spoofed text/plain MIME) is refused before any download.
+    """
     uid = m.from_user.id
     if uid not in state.quiz_creation:
         return
-    filename = (m.document.file_name or "").lower()
-    supported_ext = (".txt", ".md", ".markdown", ".json", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
-    mime = (m.document.mime_type or "").lower()
-    if not filename.endswith(supported_ext) and not any(x in mime for x in ("text/plain", "text/markdown", "json", "pdf", "image/")):
-        await m.reply("⚠️ Supported: TXT, MD, JSON, PDF, PNG/JPG/WEBP/BMP/TIFF.")
+    filename = m.document.file_name or ""
+    lower = filename.lower().split("?", 1)[0]
+
+    if lower.endswith(".json"):
+        await m.reply(_JSON_ATTACHMENT_MSG)
+        return
+    if not lower.endswith(_DOC_EXTS + _IMAGE_EXTS):
+        # MIME type is deliberately NOT consulted: it is attacker-
+        # controlled and must never widen the extension allowlist.
+        await m.reply(_UNSUPPORTED_FILE_MSG)
         return
 
     status = await m.reply("⏳ Processing...")
-    file_bytes = await c.download_media(m.document.file_id, in_memory=True)
-    file_bytes.seek(0)
-    content = file_bytes.read()
+    try:
+        file_bytes = await c.download_media(m.document.file_id, in_memory=True)
+        file_bytes.seek(0)
+        content = file_bytes.read()
+    except Exception as exc:
+        logger.warning("document download failed", exc_info=True)
+        await status.edit_text(f"❌ Could not download that file: {exc}")
+        return
 
-    user = await UserRepository(get_db()).get_or_create(uid)
-    remove_words = user.get("remove_words", [])
-
-    # Parsing (especially large/scanned PDFs) is CPU-bound: run it off the
-    # event loop so the single PTB poller never appears frozen while a file
-    # is being processed.
-    count, error = await asyncio.to_thread(
+    remove_words = await _load_remove_words(uid)
+    count, error, report = await asyncio.to_thread(
         process_uploaded_file,
-        content, m.document.file_name or "upload.txt", state.quiz_creation[uid]["questions"], remove_words
+        content, filename or "upload.txt",
+        state.quiz_creation[uid]["questions"], remove_words
     )
+    is_image = lower.endswith(_IMAGE_EXTS)
     if error:
-        await status.edit_text(f"❌ Error: {error}")
-    elif count == 0:
-        await status.edit_text(
-            "⚠️ No questions could be read from this file.\n"
-            "Send .txt/.json, a text-based PDF with marked answers, or an image of the questions. /done"
-        )
+        await status.edit_text(f"❌ {error}")
+    elif not count:
+        problems = (report or {}).get("error_summary")
+        msg = "⚠️ No questions could be read from this file."
+        if problems:
+            msg += f" Problems: {problems}."
+        msg += ("\nSend TXT/MD/MARKDOWN/PDF with marked answers, paste "
+                "questions as text, forward polls, or /done")
+        await status.edit_text(msg)
     else:
         total = len(state.quiz_creation[uid]["questions"])
-        await status.edit_text(f"✅ {count} questions processed! Total: {total}\nSend more, paste text, send an image, PDF/MD/TXT, or public AI link. /done")
+        await status.edit_text(
+            _import_summary("✅", count, report, total, image=is_image))
 
 
 async def handle_photo(c: Client, m: Message) -> None:
-    """OCR a question image while creating a quiz."""
+    """OCR a question image (Telegram photo message) while creating a quiz."""
     uid = m.from_user.id
     if uid not in state.quiz_creation:
         return
@@ -534,16 +595,23 @@ async def handle_photo(c: Client, m: Message) -> None:
         file_bytes = await c.download_media(m.photo.file_id, in_memory=True)
         file_bytes.seek(0)
         content = file_bytes.read()
-        user = await UserRepository(get_db()).get_or_create(uid)
-        remove_words = user.get("remove_words", [])
-        count, error = process_uploaded_file(
-            content, "question.jpg", state.quiz_creation[uid]["questions"], remove_words
+        remove_words = await _load_remove_words(uid)
+        count, error, report = await asyncio.to_thread(
+            process_uploaded_file,
+            content, "question.jpg",
+            state.quiz_creation[uid]["questions"], remove_words
         )
         if error:
             await status.edit_text(f"❌ {error}")
+        elif not count:
+            problems = (report or {}).get("error_summary")
+            await status.edit_text(
+                "⚠️ No questions could be read from that image."
+                + (f" Problems: {problems}." if problems else ""))
         else:
             total = len(state.quiz_creation[uid]["questions"])
-            await status.edit_text(f"✅ {count} questions extracted from image. Total: {total}\nSend more or /done")
+            await status.edit_text(
+                _import_summary("✅", count, report, total, image=True))
     except Exception as exc:
         logger.exception("Image import failed")
         await status.edit_text(f"❌ Image could not be processed: {exc}")
@@ -669,12 +737,12 @@ async def handle_creation_message(c: Client, m: Message) -> None:
         "awaiting_name", "awaiting_timer", "awaiting_section_count",
         "awaiting_section_name", "awaiting_question_range", "awaiting_section_timer"
     )):
-        user = await UserRepository(get_db()).get_or_create(uid)
-        remove_words = user.get("remove_words", [])
+        remove_words = await _load_remove_words(uid)
         status = await m.reply("⏳ Reading public link and extracting questions...")
         imported, errors = 0, []
         for url in urls[:3]:
-            count, error = await process_public_url(url.rstrip(")]>"), ud["questions"], remove_words)
+            count, error, _report = await process_public_url(
+                url.rstrip(")]>"), ud["questions"], remove_words)
             imported += count or 0
             if error:
                 errors.append(error)
@@ -685,10 +753,10 @@ async def handle_creation_message(c: Client, m: Message) -> None:
             await status.edit_text(errors[0] if errors else "❌ No valid questions found.")
         return
 
-    # Free-text question paste.
+    # Free-text question paste (structured JSON payload or plain MCQ text).
     if not m.text:
         return
-    blocks = m.text.split("\n\n")
+    pasted = m.text.strip()
     reply_msg = m.reply_to_message
     reply_text = reply_msg.text if reply_msg and reply_msg.text else None
     file_id = None
@@ -699,25 +767,58 @@ async def handle_creation_message(c: Client, m: Message) -> None:
         except Exception:
             logger.debug("Failed to copy pasted question photo", exc_info=True)
 
-    parsed_any = False
-    for block in blocks:
-        if not block.strip():
-            continue
-        parsed = parse_question_block(block)
-        if not parsed:
-            await m.reply(
-                "⚠️ Invalid format.\n\nMark the correct option with a check-mark emoji, "
-                "or use A) B) C) D) labels."
-            )
+    # Pasted structured JSON (the JSON attachment flow survives here).
+    if pasted.startswith(("{", "[")):
+        import json as _json
+        try:
+            data = _json.loads(pasted)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("questions"), list):
+            remove_words = await _load_remove_words(uid)
+            json_skipped: list[dict] = []
+            json_count = await asyncio.to_thread(
+                _process_json, data, remove_words,
+                ud["questions"], json_skipped)
+            if json_count:
+                total = len(ud["questions"])
+                note = ""
+                if json_skipped:
+                    note = (f"\n⚠️ {len(json_skipped)} entry/entries skipped: "
+                            f"{_summarize_skipped(json_skipped)}.")
+                await m.reply(
+                    f"✅ {json_count} questions saved! Total: {total}.{note}"
+                    "\nSend more or /done")
+            else:
+                await m.reply(
+                    "⚠️ That JSON contained no importable questions. Each "
+                    "item needs question_text, options (>=2) and "
+                    "correct_option_id.")
             return
+
+    remove_words = await _load_remove_words(uid)
+    batch: list[dict] = []
+    text_skipped: list[dict] = []
+    count = await asyncio.to_thread(
+        _process_text_content, m.text, remove_words, batch, text_skipped)
+    if not count:
+        first = (text_skipped[0] if text_skipped else {})
+        detail = first.get("detail") or first.get("reason") or ""
+        await m.reply(
+            "⚠️ Invalid format."
+            + (f" {detail}." if detail else "")
+            + "\n\nMark the correct option with a check-mark emoji (✅), "
+              "add an 'Answer:' line or answer-key section, or use A) B) "
+              "C) D) labels.")
+        return
+    for parsed in batch:
         parsed["file_id"] = file_id
         parsed["reply_text"] = reply_text
-        ud["questions"].append(parsed)
-        parsed_any = True
-
-    if not parsed_any:
-        await m.reply("⚠️ No valid question found.")
-        return
+    ud["questions"].extend(batch)
+    if text_skipped:
+        await m.reply(
+            f"⚠️ {len(text_skipped)} block(s) skipped: "
+            f"{_summarize_skipped(text_skipped)}.")
     total = len(ud["questions"])
     await m.reply(f"✅ {total} questions saved! Send more or /done")
 

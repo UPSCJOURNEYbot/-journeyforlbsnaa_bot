@@ -155,12 +155,18 @@ async def _show_question_edit(cb: CallbackQuery, qid: str, idx: int) -> None:
 
 
 async def _replace_question(m: Message, uid: int, qid: str, idx: int, text: str) -> None:
-    from ..parsing import parse_question_block
+    from ..parsing import parse_question_block_strict
 
-    parsed = parse_question_block(text)
-    if not parsed or isinstance(parsed["correct_option_id"], list):
+    # Same canonical parser as /create imports; a strict parse gives the
+    # creator the exact structural reason for rejection instead of a
+    # generic format error.
+    result = parse_question_block_strict(text)
+    parsed = result.question
+    if not parsed or isinstance(parsed.get("correct_option_id"), list):
+        reason = (result.detail or "could not read a single-answer MCQ")
         await m.reply(
-            "⚠️ Invalid format.\n\nFormat:\nQuestion\nOpt1\nOpt2 (correct one marked with a check emoji)\nOpt3\nEx: Explanation"
+            "⚠️ Invalid format: "
+            f"{reason}.\n\nFormat:\nQuestion\nA) Opt1\nB) Opt2 (correct one marked with ✅ or an Answer: line)\nC) Opt3\nEx: Explanation"
         )
         return
     repo = QuizRepository(get_db())
@@ -261,38 +267,50 @@ async def _update_field(m: Message, uid: int, qid: str, field: str, value: str) 
 
 
 async def _add_questions(m: Message, uid: int, qid: str, text: str) -> None:
-    from ..parsing import parse_question_block
+    from ..parsing import parse_question_document
+    from .file_import import _summarize_skipped
 
     repo = QuizRepository(get_db())
     quiz = await repo.get(qid)
     questions = quiz.get("questions", [])
     current_count = len(questions)
-    new_questions = []
-    for block in text.strip().split("\n\n"):
-        if not block.strip():
-            continue
-        parsed = parse_question_block(block)
-        if not parsed:
-            continue
-        new_questions.append(
-            {
-                "question": parsed["question"],
-                "options": parsed["options"],
-                "correct_option_id": parsed["correct_option_id"],
-                "explanation": parsed.get("explanation"),
-                "file_id": None,
-                "reply_text": None,
-            }
-        )
+
+    # Canonical document parse: every bad block is reported with a reason
+    # instead of being silently dropped.
+    report = parse_question_document(text)
+    new_questions = [
+        {
+            "question": parsed["question"],
+            "options": parsed["options"],
+            "correct_option_id": parsed["correct_option_id"],
+            "explanation": parsed.get("explanation"),
+            "file_id": None,
+            "reply_text": None,
+        }
+        for parsed in report.questions
+        if not isinstance(parsed.get("correct_option_id"), list)
+    ]
     if not new_questions:
-        await m.reply("⚠️ No valid questions found.")
+        detail = _summarize_skipped(
+            [{"reason": s.reason, "detail": s.detail} for s in report.skipped])
+        await m.reply(
+            "⚠️ No valid questions found."
+            + (f" Problems: {detail}." if detail else ""))
         return
     if current_count + len(new_questions) > 500:
         await m.reply("⚠️ Max 500 questions per quiz.")
         return
     questions.extend(new_questions)
     await repo.update_field(qid, "questions", questions)
-    await m.reply(f"✅ {len(new_questions)} added. Total: {current_count + len(new_questions)}")
+    note = ""
+    if report.skipped:
+        skipped_dicts = [
+            {"reason": s.reason, "detail": s.detail} for s in report.skipped]
+        note = (f"\n⚠️ {len(report.skipped)} block(s) skipped: "
+                f"{_summarize_skipped(skipped_dicts)}.")
+    await m.reply(
+        f"✅ {len(new_questions)} added. Total: {current_count + len(new_questions)}"
+        f"{note}")
     state.edit_sessions[uid]["field"] = None
 
 
