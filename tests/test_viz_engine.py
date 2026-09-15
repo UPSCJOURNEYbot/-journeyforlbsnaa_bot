@@ -96,7 +96,7 @@ class DataLayerCases(unittest.TestCase):
         self.assertEqual(set(viz.SUPPORTED_TYPES),
                          set(engine.ALL_TYPES) - {"historical_map",
                                                   "labelled_diagram"})
-        self.assertEqual(len(viz.SUPPORTED_TYPES), 12)
+        self.assertEqual(len(viz.SUPPORTED_TYPES), 15)
         union = set()
         for entry in viz.load_subjects()["subjects"]:
             union.update(entry["preferred"])

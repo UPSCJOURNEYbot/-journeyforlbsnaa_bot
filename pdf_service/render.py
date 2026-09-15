@@ -444,10 +444,16 @@ def _maybe_solution_visual(doc: _Doc, question: dict,
         from pdf_service.viz import engine as viz_engine
         from pdf_service.viz import mapdraw, templates
 
+        opts = list(question.get("options", []) or [])
+        answer_id = question.get("correct_option_id", -1)
+        correct = (opts[answer_id]
+                   if isinstance(answer_id, int)
+                   and 0 <= answer_id < len(opts) else "")
         spec = viz_engine.safe_decide_visual(
             question.get("question", ""),
-            tuple(question.get("options", []) or []),
-            question.get("explanation", ""))
+            tuple(opts),
+            question.get("explanation", ""),
+            correct_answer=correct)
         if spec is None:
             return
         pdf = doc.pdf
