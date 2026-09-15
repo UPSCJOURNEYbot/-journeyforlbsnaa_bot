@@ -26,6 +26,7 @@ raises, so the optional visual layer can never break PDF generation.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
@@ -373,14 +374,29 @@ def _norm(text: object) -> str:
     return _WS_RE.sub(" ", str(text or "")).strip()
 
 
+@functools.lru_cache(maxsize=4096)
+def _en_rx(keyword: str) -> "re.Pattern[str]":
+    return re.compile(r"\b" + re.escape(keyword.lower()) + r"\b",
+                      flags=re.ASCII)
+
+
+@functools.lru_cache(maxsize=4096)
+def _hi_rx(keyword: str) -> "re.Pattern[str]":
+    return re.compile(r"(?<![%s])%s(?![%s])" % (_DEVA, re.escape(keyword),
+                                               _DEVA))
+
+
+@functools.lru_cache(maxsize=512)
+def _year_rx(year: int) -> "re.Pattern[str]":
+    return re.compile(r"\b%d\b" % year)
+
+
 def _en_hit(keyword: str, lowered: str) -> bool:
-    return re.search(r"\b" + re.escape(keyword.lower()) + r"\b", lowered,
-                     flags=re.ASCII) is not None
+    return _en_rx(keyword).search(lowered) is not None
 
 
 def _hi_hit(keyword: str, text: str) -> bool:
-    return re.search(r"(?<![%s])%s(?![%s])" % (_DEVA, re.escape(keyword),
-                                              _DEVA), text) is not None
+    return _hi_rx(keyword).search(text) is not None
 
 
 def detect_subject(text: object) -> Optional[str]:
@@ -499,13 +515,11 @@ def _ordered_places(text: object) -> list[dict]:
     for place in load_places()["places"]:
         best: Optional[int] = None
         for alias in place["match_en"]:
-            match = re.search(r"\b" + re.escape(alias.lower()) + r"\b",
-                              lowered, flags=re.ASCII)
+            match = _en_rx(alias).search(lowered)
             if match and (best is None or match.start() < best):
                 best = match.start()
         for alias in place["match_hi"]:
-            match = re.search(r"(?<![%s])%s(?![%s])"
-                              % (_DEVA, re.escape(alias), _DEVA), blob)
+            match = _hi_rx(alias).search(blob)
             if match and (best is None or match.start() < best):
                 best = match.start()
         if best is not None:
@@ -842,13 +856,34 @@ def _clean_item(text: str, limit: int = MAX_ITEM_CHARS) -> str:
     return textstyle.clean_label(text, limit)
 
 
+# Scan window for bullet/numbered collection: every consumer caps at
+# 4-8 items or applies a small threshold, so scanning past this many raw
+# markers can only burn time, never change a threshold gate (all gates
+# stay exact: a true count above the window still saturates above every
+# threshold). Generous headroom over any realistic explanation.
+_BULLET_SCAN_WINDOW = 256
+
+
 def _numbered_items(raw: str) -> list[str]:
-    return [_clean_item(m.group(1)) for m in _NUMBERED_RE.finditer(raw)]
+    items = []
+    for index, match in enumerate(_NUMBERED_RE.finditer(raw)):
+        if index >= _BULLET_SCAN_WINDOW:
+            break
+        item = _clean_item(match.group(1))
+        if item:
+            items.append(item)
+    return items
 
 
 def _bullets(raw: str) -> list[str]:
-    return [_clean_item(m.group(1)) for m in _BULLET_RE.finditer(raw)
-            if _clean_item(m.group(1))]
+    items = []
+    for index, match in enumerate(_BULLET_RE.finditer(raw)):
+        if index >= _BULLET_SCAN_WINDOW:
+            break
+        item = _clean_item(match.group(1))
+        if item:
+            items.append(item)
+    return items
 
 
 def _ordinal_steps(text: str) -> list[str]:
@@ -856,11 +891,10 @@ def _ordinal_steps(text: str) -> list[str]:
     marks: list[tuple[int, int, int]] = []  # (order, start, end)
     lowered = text.lower()
     for i, word in enumerate(_ORDINALS_EN):
-        for m in re.finditer(r"\b" + word + r"\b", lowered, flags=re.ASCII):
+        for m in _en_rx(word).finditer(lowered):
             marks.append((i, m.start(), m.end()))
     for i, word in enumerate(_ORDINALS_HI):
-        for m in re.finditer(r"(?<![%s])%s(?![%s])" % (_DEVA, re.escape(word),
-                                                      _DEVA), text):
+        for m in _hi_rx(word).finditer(text):
             marks.append((i + 100, m.start(), m.end()))
     marks.sort(key=lambda t: t[1])
     ordered = [m for m in marks if m[0] < 100]
@@ -937,7 +971,7 @@ def _timeline_payload(raw: str, norm: str) -> Optional[dict]:
         label = ""
         for line in lines:
             if str(year) in line:
-                label = _clean_item(re.sub(r"\b%d\b" % year, "", line))
+                label = _clean_item(_year_rx(year).sub("", line))
                 break
         events.append({"year": year, "label": label or str(year)})
     payload: dict = {"events": events}
@@ -1080,13 +1114,19 @@ def _mind_payload(raw: str) -> Optional[dict]:
     for line in raw.splitlines():
         top = _TOP_BULLET_RE.match(line)
         if top:
+            if len(branches) >= MAX_BRANCHES:
+                # This and all later lines can only extend branches
+                # the [:MAX_BRANCHES] slice drops anyway.
+                break
             current = {"name": _clean_item(top.group(2), 60), "children": []}
             branches.append(current)
             continue
         sub = _SUB_BULLET_RE.match(line)
         if sub and current is not None:
+            if len(current["children"]) >= MAX_BRANCH_CHILDREN:
+                continue
             item = _clean_item(sub.group(1))
-            if item and len(current["children"]) < MAX_BRANCH_CHILDREN:
+            if item:
                 current["children"].append(item)
     branches = branches[:MAX_BRANCHES]
     children = sum(len(b["children"]) for b in branches)
@@ -1139,9 +1179,13 @@ _TOP_ITEM_RE = re.compile(
 def _flat_items(raw: str) -> list[str]:
     """Top-level bullets/numbered items (indent of at most one space)."""
     items = []
+    scanned = 0
     for line in raw.splitlines():
         match = _TOP_ITEM_RE.match(line)
         if match:
+            if scanned >= _BULLET_SCAN_WINDOW:
+                break
+            scanned += 1
             item = _clean_item(match.group(1))
             if item:
                 items.append(item)
