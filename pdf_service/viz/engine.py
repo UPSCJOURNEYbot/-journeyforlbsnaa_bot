@@ -4,7 +4,12 @@ The engine is intentionally conservative (accuracy-first):
 
 * Maps are emitted only for places in the curated dataset that fall
   inside a region with a base map. Unknown places, regions without a
-  base map, and extent/boundary questions all yield ``None``.
+  base map, and extent/boundary questions all yield ``None``. The map
+  uses the smallest base map containing every shown place.
+* Routes are drawn only from sourced vertex geometry: every route
+  entry needs a provenance note, dataset place references, and
+  vertices inside a mappable base. Route questions without a sourced
+  route keep the ordered place chain instead of invented lines.
 * Diagram templates only re-structure text already present in the
   question/explanation (steps, bullets, years, labelled sections).
   They never assert facts of their own, and quiz *options* are never
@@ -241,6 +246,59 @@ def _validate_bases(data: Any) -> dict:
     return data
 
 
+def _validate_routes(data: Any, places_by_id: dict,
+                     bases: dict) -> dict:
+    """Validate geo_routes.json against the dataset places and bases.
+
+    Unlike base polygons, route vertices are OPEN polylines (never
+    closed): they trace sourced geometry such as a river course, so no
+    closure is required. Every entry must cite its source.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("routes"),
+                                                   list):
+        raise ValueError("geo_routes.json: expected {routes: [...]}")
+    seen: set[str] = set()
+    for entry in data["routes"]:
+        rid = entry.get("id")
+        if not rid or rid in seen:
+            raise ValueError(f"geo_routes.json: bad/duplicate id {rid!r}")
+        seen.add(rid)
+        if not isinstance(entry.get("name_en"), str) or not entry["name_en"]:
+            raise ValueError(f"geo_routes.json: {rid} missing name_en")
+        if "name_hi" in entry and not isinstance(entry["name_hi"], str):
+            raise ValueError(f"geo_routes.json: {rid} bad name_hi")
+        for key in ("match_en", "match_hi"):
+            if (not isinstance(entry.get(key), list) or not entry[key]
+                    or not all(isinstance(v, str) and v
+                               for v in entry[key])):
+                raise ValueError(f"geo_routes.json: {rid} bad {key}")
+        place_ids = entry.get("place_ids")
+        if (not isinstance(place_ids, list) or not place_ids
+                or not all(isinstance(v, str) for v in place_ids)):
+            raise ValueError(f"geo_routes.json: {rid} bad place_ids")
+        unknown = [v for v in place_ids if v not in places_by_id]
+        if unknown:
+            raise ValueError(f"geo_routes.json: {rid} unknown places "
+                             f"{unknown}")
+        if not isinstance(entry.get("source"), str) or not entry["source"]:
+            raise ValueError(f"geo_routes.json: {rid} missing source")
+        verts = entry.get("vertices")
+        if (not isinstance(verts, list) or len(verts) < 2
+                or any(len(v) != 2 for v in verts)
+                or not all(isinstance(c, (int, float))
+                           for v in verts for c in v)):
+            raise ValueError(f"geo_routes.json: {rid} needs >=2 vertices")
+        for lon, lat in verts:
+            if not -180 <= lon <= 180 or not -90 <= lat <= 90:
+                raise ValueError(f"geo_routes.json: {rid} bad vertex "
+                                 f"{[lon, lat]}")
+            if not any(point_in_bbox(lon, lat, base["bbox"])
+                       for base in bases.values()):
+                raise ValueError(f"geo_routes.json: {rid} vertex outside "
+                                 f"every base {[lon, lat]}")
+    return data
+
+
 def load_subjects() -> dict:
     """Load + validate subjects.json (cached)."""
     if "subjects" not in _CACHE:
@@ -260,6 +318,16 @@ def load_base_maps() -> dict:
     if "bases" not in _CACHE:
         _CACHE["bases"] = _validate_bases(_read_json("geo_base.json"))
     return _CACHE["bases"]
+
+
+def load_routes() -> dict:
+    """Load + validate geo_routes.json (cached)."""
+    if "routes" not in _CACHE:
+        places = {p["id"]: p for p in load_places()["places"]}
+        bases = load_base_maps()["bases"]
+        _CACHE["routes"] = _validate_routes(_read_json("geo_routes.json"),
+                                            places, bases)
+    return _CACHE["routes"]
 
 
 def reload_data() -> None:
@@ -346,6 +414,22 @@ def find_places(text: object) -> list[dict]:
     return [hits[pid] for pid in sorted(hits)]
 
 
+def find_routes(text: object) -> list[dict]:
+    """All dataset routes mentioned in `text`, sorted by id (deduped)."""
+    blob = _norm(text)
+    if not blob:
+        return []
+    lowered = blob.lower()
+    hits: dict[str, dict] = {}
+    for route in load_routes()["routes"]:
+        matched = any(_en_hit(a, lowered) for a in route["match_en"])
+        if not matched:
+            matched = any(_hi_hit(a, blob) for a in route["match_hi"])
+        if matched:
+            hits[route["id"]] = route
+    return [hits[rid] for rid in sorted(hits)]
+
+
 def usable_places(places: list[dict]) -> list[dict]:
     """Places that can actually be mapped: region has a base map and the
     point falls inside that base map's bbox. Input order preserved."""
@@ -357,6 +441,26 @@ def usable_places(places: list[dict]) -> list[dict]:
                                   base["bbox"]):
             out.append(place)
     return out
+
+
+def _bbox_area(bbox: list) -> float:
+    return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+
+
+def select_base(shown: list[dict]) -> str:
+    """Smallest base (by bbox area) containing every shown place.
+
+    Falls back to the first place's own region, which is always
+    mappable for usable input. Deterministic (id order breaks ties).
+    """
+    bases = load_base_maps()["bases"]
+    covering = [bid for bid, base in bases.items()
+                if all(point_in_bbox(p["lon"], p["lat"], base["bbox"])
+                       for p in shown)]
+    if covering:
+        return min(sorted(covering),
+                   key=lambda bid: _bbox_area(bases[bid]["bbox"]))
+    return shown[0].get("region", "")
 
 
 def _ordered_places(text: object) -> list[dict]:
@@ -1187,6 +1291,12 @@ def _chain_payload(raw: str, expl_text: str) -> Optional[dict]:
     return payload
 
 
+def _route_covers(routes: list[dict], link_ids: list[str]) -> bool:
+    """True when a sourced route connects every chain link."""
+    wanted = set(link_ids)
+    return any(wanted <= set(r.get("place_ids", [])) for r in routes)
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -1272,12 +1382,25 @@ def decide_visual(question: object,
         and not recall_block
         and (subject in MAP_SUBJECTS or subject is None or located_q)
     )
+    map_routes: list[dict] = []
     if map_allowed:
         assert usable  # for type-checkers; guaranteed by map_allowed
         shown = usable[:MAX_PLACES]
+        base_id = select_base(shown)
+        base_bbox = load_base_maps()["bases"][base_id]["bbox"]
+        for route in find_routes(question_text + "\n" + expl_text):
+            verts = route["vertices"]
+            if all(point_in_bbox(lon, lat, base_bbox)
+                   for lon, lat in verts):
+                map_routes.append(route)
         payload: dict = {
-            "base": shown[0]["region"],
+            "base": base_id,
             "places": [_place_payload(p) for p in shown],
+            "routes": [{"id": r["id"], "name_en": r["name_en"],
+                        "name_hi": r.get("name_hi", ""),
+                        "vertices": [[lon, lat] for lon, lat in
+                                     r["vertices"]]}
+                       for r in map_routes],
         }
         notes: list[str] = []
         if len(usable) > MAX_PLACES:
@@ -1298,7 +1421,9 @@ def decide_visual(question: object,
             payload=payload, notes=tuple(notes),
             evidence=("intent=%s" % _intent_tag(intents),
                       "places=%d" % len(usable),
-                      "focus=%s" % (focus or "none")))
+                      "focus=%s" % (focus or "none"))
+            + ((("routes=%d" % len(map_routes),)
+                if map_routes else ())))
     else:
         map_spec = None
 
@@ -1410,6 +1535,19 @@ def decide_visual(question: object,
                           bits[visual_type]))
             if map_spec is not None and not (
                     set(intents) & STRUCTURE_OVERRIDE_FRAMES):
+                if (visual_type == VisualType.SPATIAL_CHAIN.value
+                        and "route" in intents
+                        and "location" not in intents
+                        and chain is not None
+                        and not _route_covers(
+                            map_routes,
+                            [link["id"] for link in chain["links"]])):
+                    # A route ask wants the ordered journey: dots on a
+                    # map cannot show it, so the chain wins -- unless
+                    # the question is an explicit where-ask or a
+                    # sourced route covers the same links (then the
+                    # map draws the real geometry).
+                    return struct_spec
                 return map_spec
             return struct_spec
     return map_spec

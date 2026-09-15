@@ -455,11 +455,13 @@ class RobustnessCases(M3Base):
         self._inspect(res, entries)
 
     def test_skip_set_renders_clean(self):
+        # Milestone B maps the world, so the former skip/world entries
+        # now earn maps (renamed geo/map-world*); the remaining four
+        # entries must still decide None.
         entries = [e for e in POOL
-                   if e["tag"] in ("skip/unknown", "skip/world",
-                                   "skip/world2", "none/arithmetic2",
+                   if e["tag"] in ("skip/unknown", "none/arithmetic2",
                                    "skip/no-expl-none", "none/arithmetic")]
-        self.assertEqual(len(entries), 6)
+        self.assertEqual(len(entries), 4)
         res = self._pipeline(entries, "m3-skip.txt",
                              emit_text(entries, "mixed").encode("utf-8"),
                              "M3 Skip", TIME_CAPS[10])

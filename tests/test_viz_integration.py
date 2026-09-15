@@ -114,11 +114,15 @@ class WiringCases(_RenderBase):
         for badge in BADGES:
             self.assertNotIn(badge, text)
 
-    def test_uncertain_data_skipped(self):
+    def test_world_base_renders_map(self):
+        # Milestone B: London sits on the sourced world outline, so a
+        # map renders (unknown places still skip -- see
+        # test_unknown_place_skipped).
         path, _info = self._pdf([LONDON_Q])
         text, _drawings = self._text_and_drawings(path)
         self.assertIn("London is the capital of the UK.", text)
-        self.assertNotIn("Not to scale", text)
+        self.assertIn("Not to scale", text)
+        self.assertIn("London", text)
 
     def test_unknown_place_skipped(self):
         path, _info = self._pdf([UNKNOWN_Q])

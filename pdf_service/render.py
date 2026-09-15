@@ -469,7 +469,8 @@ def _maybe_solution_visual(doc: _Doc, question: dict,
         if is_map:
             mapdraw.draw_map(pdf, base_id=spec.payload["base"],
                              places=spec.payload["places"], rect=rect,
-                             title=spec.title)
+                             title=spec.title,
+                             routes=spec.payload.get("routes", []))
         else:
             templates.draw_diagram(pdf, spec, rect)
         pdf.set_xy(pdf.l_margin, top + height + 3)

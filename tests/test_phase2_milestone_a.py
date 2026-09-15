@@ -362,14 +362,19 @@ class ChainCases(unittest.TestCase):
             ["delhi", "jaipur", "ahmedabad"])
 
     def test_chain_gates(self):
-        # Two known places are not a chain.
-        self.assertIsNone(decide(
+        # Two known places are not a chain -- but with the Milestone B
+        # world base they still earn honest locator dots.
+        spec = decide(
             "Trace the route from London to Paris.",
-            "The route runs from London to Paris via Calais."))
-        # Places without movement phrasing are not a chain.
-        self.assertIsNone(decide(
+            "The route runs from London to Paris via Calais.")
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.visual_type, "regional_map")
+        # Places without movement phrasing are not a chain either.
+        spec = decide(
             "Name three world capitals.",
-            "London, Paris and Tokyo are famous capitals."))
+            "London, Paris and Tokyo are famous capitals.")
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.visual_type, "regional_map")
 
     def test_chain_grounded_in_dataset(self):
         spec = decide("Trace the route from London to Tokyo.",

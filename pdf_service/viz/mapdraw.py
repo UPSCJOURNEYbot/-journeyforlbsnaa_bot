@@ -9,11 +9,11 @@ a coarse teaching sketch is never mistaken for a survey map.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Optional
 
 from ..render import BRAND
 from . import textstyle
-from .engine import load_base_maps
+from .engine import load_base_maps, point_in_bbox
 
 NAVY = (20, 40, 90)
 INK = (30, 30, 30)
@@ -21,6 +21,7 @@ MUTED = (110, 110, 110)
 GRID = (214, 218, 224)
 LAND_FILL = (233, 238, 245)
 MARKER = (178, 34, 34)
+ROUTE = (0, 102, 153)
 
 MIN_MAP_W = 45.0
 MIN_MAP_H = 32.0
@@ -28,6 +29,7 @@ PAD = 2.0
 CAPTION_H = 6.0
 
 KIND_LABELS = {
+    "country": "Country",
     "city": "City",
     "river": "River",
     "mountain": "Peak",
@@ -170,6 +172,28 @@ def _place_labels(pdf: Any, markers: list[tuple[float, float]],
     return placed
 
 
+def _draw_routes(pdf: Any, routes: list[dict], bbox: list,
+                 box: tuple) -> None:
+    """Sourced route polylines with endpoint dots.
+
+    A route is drawn only whole: any vertex outside the base bbox
+    skips the route rather than drawing a partial (dishonest) line.
+    """
+    for route in routes or []:
+        verts = route.get("vertices", [])
+        if len(verts) < 2 or not all(
+                point_in_bbox(lon, lat, bbox) for lon, lat in verts):
+            continue
+        pts = [project(lon, lat, bbox, box) for lon, lat in verts]
+        pdf.set_draw_color(*ROUTE)
+        pdf.set_line_width(0.7)
+        for start, end in zip(pts, pts[1:]):
+            pdf.line(start[0], start[1], end[0], end[1])
+        pdf.set_fill_color(*ROUTE)
+        for cx, cy in (pts[0], pts[-1]):
+            pdf.ellipse(cx - 1.2, cy - 1.2, 2.4, 2.4, style="F")
+
+
 def _draw_markers(pdf: Any, places: list[dict], bbox: list,
                   box: tuple) -> None:
     markers = [project(p["lon"], p["lat"], bbox, box) for p in places]
@@ -237,7 +261,8 @@ def _draw_north_arrow(pdf: Any, box: tuple) -> None:
 
 def draw_map(pdf: Any, *, base_id: str, places: list[dict],
              rect: tuple[float, float, float, float],
-             title: str = "") -> None:
+             title: str = "",
+             routes: Optional[list[dict]] = None) -> None:
     """Draw a bordered locator map inside `rect` = (x, y, w, h) in mm.
 
     Raises ValueError for an unknown base id or a rect smaller than the
@@ -255,6 +280,7 @@ def draw_map(pdf: Any, *, base_id: str, places: list[dict],
     box = _fitted_box(bbox, inner)
     _draw_graticule(pdf, base, bbox, box)
     _draw_land(pdf, base, bbox, box)
+    _draw_routes(pdf, routes or [], bbox, box)
     if places:
         _draw_markers(pdf, places, bbox, box)
     _draw_scale_bar(pdf, bbox, box)
