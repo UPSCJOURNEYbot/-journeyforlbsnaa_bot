@@ -600,6 +600,7 @@ _RELATION_RES = (
     re.compile(r"पड़ोस"),
     re.compile(r"निकटतम"),
     re.compile(r"के\s+(उत्तर|दक्षिण|पूर्व|पश्चिम)\s+में"),
+    re.compile(r"किस\s+दिशा\s+में"),
 )
 
 
@@ -701,6 +702,7 @@ _CHRONOLOGY_RES = (
     re.compile(r"घटनाक्रम"),
     re.compile(r"सही\s+क्रम"),
     re.compile(r"क्रम\s+में\s+(?:लग|व्यवस्थित|सजा)"),
+    re.compile(r"किस\s+क्रम\s+में"),
 )
 
 _PROCESS_INTENT_RES = (
@@ -730,7 +732,16 @@ _CAUSAL_INTENT_RES = (
     re.compile(r"\beffects?\s+and\s+causes?\b", re.IGNORECASE),
     re.compile(r"\bfactors?\s+and\s+(effects?|consequences?)\b",
                re.IGNORECASE),
+    re.compile(r"\bwhy\b", re.IGNORECASE),
+    re.compile(r"\bcauses?\b", re.IGNORECASE),
+    re.compile(r"\beffects?\b", re.IGNORECASE),
+    re.compile(r"\breasons?\b", re.IGNORECASE),
+    re.compile(r"\bfactors?\b", re.IGNORECASE),
     re.compile(r"कारण\s+और\s+प्रभाव"),
+    re.compile(r"क्यों"),
+    re.compile(r"कारण"),
+    re.compile(r"प्रभाव"),
+    re.compile(r"परिणाम"),
 )
 
 _CLASSIFY_INTENT_RES = (
@@ -851,6 +862,8 @@ _CMP_RES = (
     re.compile(r"(.{3,60}?)\s+(?:vs\.?|v/s|versus)\s+(.{3,60}?)"
                r"(?=[.,;:?!]|$)", re.IGNORECASE),
     re.compile(r"(.{2,40}?)\s+और\s+(.{2,40}?)\s+में\s+अंतर"),
+    re.compile(r"(.{2,40}?)\s+और\s+(.{2,40}?)\s+के\s+बीच\s+"
+               r"(?:क्या\s+)?(?:अंतर|तुलना)"),
     re.compile(r"(.{3,60}?)\s+different\s+from\s+(.{3,60}?)"
                r"(?=[.,;:?!]|$)", re.IGNORECASE),
     re.compile(r"compar\w*\s+(.{3,50}?)\s+with\s+(.{3,50}?)"
