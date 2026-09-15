@@ -77,6 +77,7 @@ CB_CODE = {
     "tagline": "tg",
     "answer_key": "ak",
     "solutions": "so",
+    "answer_sheet": "as",
     "visuals": "vi",
     "marks_correct": "mc",
     "marks_negative": "mn",
@@ -171,6 +172,7 @@ class TestSeriesConfig:
     tagline: str = ""
     answer_key: bool = True
     solutions: bool = True
+    answer_sheet: bool = False
     visuals: str = "auto"  # auto | yes | no
     marks_correct: float = 2.0
     marks_negative: float = -0.66
@@ -291,6 +293,7 @@ def build_series_setup(cfg: TestSeriesConfig, assets: dict) -> dict:
         "wm_image_b64": _b64_or_none(assets.get("wm_image")),
         "answer_key": cfg.answer_key,
         "solutions": cfg.solutions,
+        "answer_sheet": cfg.answer_sheet,
         "visuals": cfg.visuals,
     }
 
@@ -441,6 +444,10 @@ def _prompt(step: str, uid: int, session: dict) -> tuple[str, InlineKeyboardMark
     if step == "solutions":
         return ("**Detailed Solutions**\n\nInclude detailed solutions?",
                 _yn_kb(uid, step))
+    if step == "answer_sheet":
+        return ("**Answer Sheet**\n\nInclude a bubble answer sheet for "
+                "candidates (after the questions)?",
+                _yn_kb(uid, step))
     if step == "visuals":
         kb = InlineKeyboardMarkup([
             [_cb(uid, "visuals", "Automatic", "auto"),
@@ -547,6 +554,7 @@ def _render_preview(cfg: TestSeriesConfig) -> str:
         f"Marks: +{cfg.marks_correct:g} / {cfg.marks_negative:g}\n"
         f"Key: {'Yes' if cfg.answer_key else 'No'} • "
         f"Solutions: {'Yes' if cfg.solutions else 'No'} • "
+        f"Sheet: {'Yes' if cfg.answer_sheet else 'No'} • "
         f"Visuals: {cfg.visuals.title()}\n"
         f"Candidate boxes: {md_escape(', '.join(cand)) if cand else 'None'}\n"
         f"Institute: {md_escape(cfg.institute_name)}\n"
@@ -596,10 +604,22 @@ def _advance(session: dict) -> None:
     session["step"] = nxt
     if session.get("edit_return"):
         ends = SECTION_ENDS.get(session.get("edit_section") or "", set())
-        if step in ends:
+        # A branch step (manual number, custom marks, ...) is only done
+        # once its follow-up input step completes: returning here would
+        # silently drop the change the user came to make.
+        if step in ends and nxt not in _BRANCH_INPUTS:
             session["step"] = "preview"
             session["edit_return"] = False
             session["edit_section"] = None
+
+
+# Follow-up steps that still need user input after a branch choice; the
+# edit-mode return must wait until these complete.
+_BRANCH_INPUTS = frozenset({
+    "test_number_input", "booklet_series_input", "booklet_number_input",
+    "logo_upload", "wm_text", "wm_image",
+    "marks_correct_input", "marks_negative_input",
+})
 
 
 _STATIC_NEXT = {
@@ -622,7 +642,8 @@ _STATIC_NEXT = {
     "wm_image": "tagline",
     "tagline": "answer_key",
     "answer_key": "solutions",
-    "solutions": "visuals",
+    "solutions": "answer_sheet",
+    "answer_sheet": "visuals",
     "visuals": "marks_correct",
     "marks_correct_input": "marks_negative",
     "marks_negative_input": "paper",
@@ -867,7 +888,7 @@ async def _apply_choice(c: Client, cb: CallbackQuery, uid: int,
         cfg[step] = ""
         _advance(sess)
         return True
-    if step in ("answer_key", "solutions"):
+    if step in ("answer_key", "solutions", "answer_sheet"):
         if value not in ("0", "1"):
             return await reject("Invalid choice.")
         cfg[step] = (value == "1")
@@ -932,8 +953,8 @@ BUTTON_ONLY_STEPS = {
     "intake", "test_number", "booklet_series", "booklet_number",
     "cand_name", "cand_roll", "cand_regid", "cand_batch", "cand_date",
     "cand_candsig", "cand_evalsig", "logo", "watermark", "answer_key",
-    "solutions", "visuals", "marks_correct", "marks_negative", "preview",
-    "edit_menu",
+    "solutions", "answer_sheet", "visuals", "marks_correct", "marks_negative",
+    "preview", "edit_menu",
 }
 IMAGE_STEPS = {"logo_upload", "wm_image"}
 

@@ -515,6 +515,10 @@ class ButtonStepCases(_FlowBase):
         self.tap(uid, "so", "1")
         self.assertFalse(self.cfg(uid)["answer_key"])
         self.assertTrue(self.cfg(uid)["solutions"])
+        self.assertEqual(self.step(uid), "answer_sheet")
+        self.tap(uid, "as", "1")
+        self.assertTrue(self.cfg(uid)["answer_sheet"])
+        self.assertEqual(self.step(uid), "visuals")
         for value in ("auto", "yes", "no"):
             uid2 = _uid()
             self.seed(uid2, "visuals")
@@ -921,6 +925,7 @@ class FullPathCases(_FlowBase):
         self.say(uid, "Dream Series")
         self.tap(uid, "ak", "1")
         self.tap(uid, "so", "1")
+        self.tap(uid, "as", "1")
         self.tap(uid, "vi", "auto")
         self.tap(uid, "mc", "custom")
         self.say(uid, "4")

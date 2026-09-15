@@ -870,17 +870,33 @@ def _looks_like_title_noise(body: str) -> bool:
 # ---------------------------------------------------------------------------
 _KEY_ROW_HEAD_RE = re.compile(
     r"^\s*(?:Q\.?\s*)?0*(\d{1,3})\s*[.)]\s*[\-–—:]?\s*"
-    r"\(?([A-Ja-jक-ञ]|[1-9]|10)\)?[.,;:]?\s*(.*)$")
+    r"\(?([A-Ja-jक-ञ]|10|[1-9])\)?[.,;:]?\s*(.*)$")
 _KEY_HYPHEN_RE = re.compile(
-    r"^\s*Q?\s*0*(\d{1,3})\s*[-–—]\s*\(?([A-Ja-jक-ञ]|[1-9]|10)\)?\s*[,;]?\s*(.*)$")
+    r"^\s*Q?\s*0*(\d{1,3})\s*[-–—]\s*\(?([A-Ja-jक-ञ]|10|[1-9])\)?\s*[,;]?\s*(.*)$")
 _KEY_INLINE_PAIR_RE = re.compile(
     r"Q?\s*(\d{1,3})\s*[-.)]\s*\(?([A-Ja-jक-ञ])\)?")
 _SOLN_PREFIX_RE = re.compile(
     r"^\s*(?:solution|question|q|ans)\s*0*(\d{1,3})\s*[:.)\-]\s*(.*)$", re.I)
+# A bare EXPLANATIONS/SOLUTIONS header INSIDE the key region switches the
+# rest of the region to solutions-only: ordinal-headed lines there are
+# explanations by number, never key rows ("1. Delhi is capital." must not
+# read as answer D). Carries no payload by construction.
+_SOLN_REGION_HEADER_RE = re.compile(
+    r"^\s*(?:EXPLANATIONS?|SOLUTIONS?|व्याख्या|समाधान|हल)\s*[:：#-]?[ ]*$",
+    re.I)
+# Ordinal-headed line inside the solutions region: explanation by number.
+_SOLN_ROW_RE = re.compile(
+    r"^\s*(?:Q\.?\s*)?0*(\d{1,3})\s*[.)\-–—:]\s*(.*)$")
+# Ordinal-headed but unreadable as a key row ("2. Z"): malformed, never a
+# solution line for the previous question and never an answer.
+_MALFORMED_ROW_RE = re.compile(
+    r"^\s*(?:Q\.?\s*)?0*(\d{1,3})\s*[.)\-–—:]\s*\S")
 
 
 def _letter_to_index(token: str) -> Optional[int]:
     t = token.strip().strip("().,;")
+    if t == "10":
+        return 9
     if len(t) != 1:
         return None
     if "A" <= t.upper() <= "J":
@@ -894,23 +910,36 @@ def _letter_to_index(token: str) -> Optional[int]:
 
 
 def _parse_key_section(k_lines: list[str]):
-    """Return ({ordinal: (idx_or_None, solution_text)}, rows_found,
-    malformed_flag)."""
+    """Return (rows, rows_found, solutions, dup_conflict, malformed).
+
+    ``rows`` maps ordinal -> (option index or None, inline rest);
+    ``dup_conflict`` holds ordinals keyed twice with different answers
+    (first row wins, the question is rejected, never guessed);
+    ``malformed`` holds ordinals whose key row is unreadable (rejected,
+    never leaked into a neighbour's solution).
+    """
     rows: dict[int, tuple[Optional[int], str]] = {}
     soln: dict[int, list[str]] = {}
+    dup_conflict: set[int] = set()
+    malformed: set[int] = set()
     rows_found = 0
     current_ord: Optional[int] = None
+    solutions_mode = False
 
-    # Grid layout: a line of ascending ordinals then a line of letters.
+    # Grid layout only scans the answer rows: a bare EXPLANATIONS header
+    # starts solutions-only content where ordinals are never key rows.
+    soln_at = next((i for i, ln in enumerate(k_lines)
+                    if _SOLN_REGION_HEADER_RE.match(ln.strip())), len(k_lines))
+    key_scan = k_lines[:soln_at]
     grid: dict[int, int] = {}
     int_re = re.compile(r"^\d{1,3}$")
     let_re = re.compile(r"^[A-Ja-jक-ञ]$")
-    for i, ln in enumerate(k_lines):
+    for i, ln in enumerate(key_scan):
         toks = ln.split()
         if (len(toks) >= 2 and all(int_re.match(t) for t in toks)
                 and [int(t) for t in toks] == sorted(int(t) for t in toks)
-                and i + 1 < len(k_lines)):
-            ltoks = k_lines[i + 1].split()
+                and i + 1 < len(key_scan)):
+            ltoks = key_scan[i + 1].split()
             if len(ltoks) == len(toks) and all(let_re.match(t) for t in ltoks):
                 for o, l in zip((int(t) for t in toks), ltoks):
                     idx = _letter_to_index(l)
@@ -927,6 +956,21 @@ def _parse_key_section(k_lines: list[str]):
             text = m.group(1).strip() or text
         soln.setdefault(ordn, []).append(text)
 
+    def record_row(n, idx, rest):
+        nonlocal rows_found, current_ord
+        rows_found += 1
+        current_ord = n
+        if n in rows:
+            if rows[n][0] != idx:
+                # Same question keyed twice with different answers:
+                # keep the first row but flag the conflict.
+                dup_conflict.add(n)
+                return
+        else:
+            rows[n] = (idx, (rest or "").strip())
+        if (rest or "").strip():
+            attach_solution(n, rest)
+
     for raw in k_lines:
         st = raw.rstrip()
         stripped = st.strip()
@@ -935,83 +979,98 @@ def _parse_key_section(k_lines: list[str]):
         # Key rows must start at the left margin (continuation prose is
         # indented, e.g. "   2-C pairing below ...").
         indented = raw.startswith((" ", "\t", "  ")) and len(st) - len(st.lstrip()) >= 2
+        if not indented and _SOLN_REGION_HEADER_RE.match(stripped):
+            solutions_mode = True
+            current_ord = None
+            continue
         used = False
-        # Lines carrying several pairs ("Q1-B, Q2-B") take priority over
-        # the single-row patterns so the trailing pair is never swallowed
-        # as solution prose.
-        line_pairs = _KEY_INLINE_PAIR_RE.findall(st)
-        if not indented and line_pairs and _KEY_INLINE_PAIR_RE.match(st):
-            if len(line_pairs) >= 2 or not (_KEY_ROW_HEAD_RE.match(st)
-                                            or _KEY_HYPHEN_RE.match(st)):
-                for os, ls in line_pairs:
-                    n = int(os)
-                    rows[n] = (_letter_to_index(ls), "")
-                    rows_found += 1
-                    current_ord = n
-                continue
-        m = _KEY_ROW_HEAD_RE.match(st)
-        if m and not indented:
-            n = int(m.group(1))
-            idx = _letter_to_index(m.group(2))
-            rows[n] = (idx, m.group(3).strip())
-            rows_found += 1
-            current_ord = n
-            if m.group(3).strip():
-                attach_solution(n, m.group(3))
-            used = True
-        else:
-            m = _KEY_HYPHEN_RE.match(st)
-            if m and not indented:
-                n = int(m.group(1))
-                idx = _letter_to_index(m.group(2))
-                rows[n] = (idx, m.group(3).strip())
-                rows_found += 1
-                current_ord = n
-                if m.group(3).strip():
-                    attach_solution(n, m.group(3))
+        if solutions_mode:
+            ms = _SOLN_PREFIX_RE.match(st)
+            if ms and not indented:
+                current_ord = int(ms.group(1))
+                if ms.group(2).strip():
+                    attach_solution(current_ord, ms.group(2))
                 used = True
             else:
-                ms = _SOLN_PREFIX_RE.match(st)
-                if ms and not indented:
-                    n = int(ms.group(1))
-                    rest = ms.group(2).strip()
-                    lm = re.match(
-                        r"\(?([A-Ja-jक-ञ]|[1-9]|10)\)?(?:[.:;)]+(?:\s|$)|\s+|$)(.*)$",
-                        rest)
-                    if lm:
-                        rows[n] = (_letter_to_index(lm.group(1)), lm.group(2).strip())
-                        rows_found += 1
-                        current_ord = n
-                        if lm.group(2).strip():
-                            attach_solution(n, lm.group(2))
-                        used = True
-                    else:
-                        current_ord = n
-                        used = True
+                m = _SOLN_ROW_RE.match(st)
+                if m and not indented:
+                    current_ord = int(m.group(1))
+                    if m.group(2).strip():
+                        attach_solution(current_ord, m.group(2))
+                    used = True
+        else:
+            # Lines carrying several pairs ("Q1-B, Q2-B") take priority over
+            # the single-row patterns so the trailing pair is never swallowed
+            # as solution prose.
+            line_pairs = _KEY_INLINE_PAIR_RE.findall(st)
+            if not indented and line_pairs and _KEY_INLINE_PAIR_RE.match(st):
+                if len(line_pairs) >= 2 or not (_KEY_ROW_HEAD_RE.match(st)
+                                                or _KEY_HYPHEN_RE.match(st)):
+                    for os, ls in line_pairs:
+                        record_row(int(os), _letter_to_index(ls), "")
+                    continue
+            m = _KEY_ROW_HEAD_RE.match(st)
+            if m and not indented:
+                record_row(int(m.group(1)), _letter_to_index(m.group(2)),
+                           m.group(3))
+                used = True
+            else:
+                m = _KEY_HYPHEN_RE.match(st)
+                if m and not indented:
+                    record_row(int(m.group(1)), _letter_to_index(m.group(2)),
+                               m.group(3))
+                    used = True
                 else:
-                    # Comma-separated inline pairs on one line.
-                    pairs = _KEY_INLINE_PAIR_RE.findall(st)
-                    if pairs and not indented and _KEY_INLINE_PAIR_RE.match(st):
-                        for os, ls in pairs:
-                            n = int(os)
-                            rows[n] = (_letter_to_index(ls), "")
-                            rows_found += 1
-                        used = True
+                    ms = _SOLN_PREFIX_RE.match(st)
+                    if ms and not indented:
+                        n = int(ms.group(1))
+                        rest = ms.group(2).strip()
+                        lm = re.match(
+                            r"\(?([A-Ja-j\u0915-\u091e]|10|[1-9])\)?(?:[.:;)]+(?:\s|$)|\s+|$)(.*)$",
+                            rest)
+                        if lm:
+                            record_row(n, _letter_to_index(lm.group(1)),
+                                       lm.group(2))
+                            used = True
+                        else:
+                            current_ord = n
+                            used = True
+                    else:
+                        # Comma-separated inline pairs on one line.
+                        pairs = _KEY_INLINE_PAIR_RE.findall(st)
+                        if pairs and not indented and _KEY_INLINE_PAIR_RE.match(st):
+                            for os, ls in pairs:
+                                record_row(int(os), _letter_to_index(ls), "")
+                            used = True
+                        elif not indented:
+                            mm = _MALFORMED_ROW_RE.match(st)
+                            if mm:
+                                # Ordinal-headed but unreadable as a key row
+                                # ("2. Z"): never an answer, never leaked
+                                # into the previous question's solution.
+                                malformed.add(int(mm.group(1)))
+                                current_ord = int(mm.group(1))
+                                used = True
         if not used:
-            if current_ord is not None:
-                deco = _strip_decoration(stripped)
-                if _SOURCE_LINE_RE.match(deco):
-                    continue
-                am = _ANSWER_LINE_RE.match(deco)
-                if am:
-                    continue
-                attach_solution(current_ord, deco)
+            if current_ord is None:
+                continue
+            if _KEY_HEADER_RE.match(stripped) \
+                    or _SOLN_REGION_HEADER_RE.match(stripped):
+                # A repeated bare section header is structure, never prose.
+                continue
+            deco = _strip_decoration(stripped)
+            if _SOURCE_LINE_RE.match(deco):
+                continue
+            am = _ANSWER_LINE_RE.match(deco)
+            if am:
+                continue
+            attach_solution(current_ord, deco)
 
     for o, idx in grid.items():
         rows.setdefault(o, (idx, ""))
         rows_found = max(rows_found, len(rows))
     solutions = {o: "\n".join(v).strip() for o, v in soln.items() if v}
-    return rows, rows_found, solutions
+    return rows, rows_found, solutions, dup_conflict, malformed
 
 
 # ---------------------------------------------------------------------------
@@ -1033,8 +1092,8 @@ def parse_question_document(text: str, *, allow_multiple_answer: bool = False
     candidates = [(o, b) for (o, b) in raw_candidates
                   if not _looks_like_title_noise(b)]
 
-    key_rows, key_rows_found, key_solutions = (
-        _parse_key_section(k_lines) if has_header else ({}, 0, {}))
+    key_rows, key_rows_found, key_solutions, key_dup, key_malformed = (
+        _parse_key_section(k_lines) if has_header else ({}, 0, {}, set(), set()))
     answer_key_detected = has_header and (key_rows_found > 0)
 
     questions: list[dict] = []
@@ -1072,6 +1131,20 @@ def parse_question_document(text: str, *, allow_multiple_answer: bool = False
             skipped.append(SkippedBlock(
                 RE_MULTIPLE_CORRECT_UNSUPPORTED,
                 "multiple options marked correct (single-answer quizzes only)",
+                ordinal, snippet))
+            continue
+
+        if has_header and ordinal in key_dup:
+            skipped.append(SkippedBlock(
+                RE_CONFLICTING_ANSWERS,
+                f"answer-key rows for question {ordinal} name different options",
+                ordinal, snippet))
+            continue
+
+        if has_header and ordinal in key_malformed:
+            skipped.append(SkippedBlock(
+                RE_MALFORMED_ANSWER_KEY,
+                f"answer-key row for question {ordinal} is malformed",
                 ordinal, snippet))
             continue
 
@@ -1115,6 +1188,13 @@ def parse_question_document(text: str, *, allow_multiple_answer: bool = False
         q["correct_option_id"] = correct
         q.pop("_answer_warnings", None)
         questions.append(q)
+
+    if has_header:
+        known = {decl or pos for pos, (decl, _b) in enumerate(candidates, start=1)}
+        for n in sorted(set(key_rows) | set(key_solutions)):
+            if n not in known:
+                warnings.append(
+                    f"answer-key entry for unknown question {n} ignored")
 
     if has_header and key_rows_found == 0 and candidates:
         # Clearly labelled key section but nothing parseable.

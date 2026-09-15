@@ -15,9 +15,10 @@ Nothing here modifies Workflows 1-4: generation is delegated to
 
 Supported file layouts (mixable per question inside one file):
 
-* **Format A** -- headers ``Q.1.`` / ``Q26`` / ``Question 26``, options
-  ``A)`` / ``a)`` / ``A.``, correct option marked with ``✅``, optional
-  ``Ex:`` explanation line(s).
+* **Format A** -- headers ``Q.1.`` / ``Q26`` / ``Question 26`` / bare
+  ``1.`` / ``1)``, options ``A)`` / ``a)`` / ``A.`` / ``(A)`` /
+  ``क)``, correct option marked with ``✅``, optional ``Ex:``
+  explanation line(s).
 * **Format B** -- same headers/options, answer given as ``Answer: C`` or
   ``Answer: <option text>``, optional ``Solution:`` and
   ``Extra details:`` line(s).
@@ -63,17 +64,22 @@ _Q_START = re.compile(
 # the option text as group 2 via the helper below):
 #   * parenthesized:  "(A) text", "（A）text", "(A). text", "(A) text"
 #   * suffixed:       "A) text", "A. text", "A: text", "A- text", "A– text"
+#   * devanagari:     "क) text", "क. text" (Hindi-medium papers)
 _OPTION_PAREN = re.compile(r"^\s*[\(（]\s*([A-Za-z])\s*[\)）]\s*[).:–-]?\s*(\S.*?)\s*$")
 _OPTION_SUFFIX = re.compile(r"^\s*([A-Za-z])\s*[).:–-]\s*(\S(?:.*)?)\s*$")
+_OPTION_DEV = re.compile(r"^\s*([क-ञ])\s*[).:–-]\s*(\S(?:.*)?)\s*$")
 
 
 def _match_option(line: str) -> re.Match | None:
-    """Return a 2-group match (letter, text) for parenthesized or suffixed
-    option lines, normalising both shapes to one capture layout."""
+    """Return a 2-group match (letter, text) for parenthesized, suffixed or
+    Devanagari option lines, normalising all shapes to one capture layout."""
     m = _OPTION_PAREN.match(line)
     if m:
         return m
-    return _OPTION_SUFFIX.match(line)
+    m = _OPTION_SUFFIX.match(line)
+    if m:
+        return m
+    return _OPTION_DEV.match(line)
 
 
 _ANSWER = re.compile(r"^\s*(?:Answers?|Ans\.?|उत्तर)\s*:\s*(.+?)\s*$", re.IGNORECASE)
@@ -81,7 +87,7 @@ _EXPLAIN = re.compile(r"^\s*(Ex\.?|Explanation|व्याख्या)\s*:\s*(
 _SOLUTION = re.compile(r"^\s*(Solutions?|हल)\s*:\s*(.*)$", re.IGNORECASE)
 _EXTRA = re.compile(r"^\s*Extra\s+details?\s*:\s*(.*)$", re.IGNORECASE)
 _MARK = re.compile(r"[✅✔✓☑]\uFE0F?")
-_LETTER_VAL = re.compile(r"^\(?([A-Ja-j])\)?\s*[.)]?\s*(.*)$")
+_LETTER_VAL = re.compile(r"^\(?([A-Ja-jक-ञ])\)?\s*[.)]?\s*(.*)$")
 _META = re.compile(r"^\s*[^\W\d_][^:]{0,24}:\s")
 _MD_ESCAPE = re.compile(r"([\\_\*\[\`])")
 
@@ -139,8 +145,66 @@ class PdfText:
 
 
 # ─── Block segmentation + parsing (pure) ──────────────────────────────
+_BARE_NUM = re.compile(r"^\s*0*(\d{1,4})\s*[.)]\s*(.*)$")
+# Latin abbreviations ("e.g. ...", "i.e. ...") look option-shaped but are
+# never options; they must not count as option context either.
+_ABBREV_HEAD_RE = re.compile(r"^[A-Za-z]\.\s*[a-z]\.")
+
+
+def _is_option_context(line: str) -> bool:
+    st = line.strip()
+    if not st or _ABBREV_HEAD_RE.match(st):
+        return False
+    return _match_option(st) is not None
+
+
+def _bare_header(line: str, lines: list[str], idx: int,
+                 last_num: int | None) -> tuple[int, str] | None:
+    """Bare ``1.``/``1)`` header (no Q badge): accepted only when sequential
+    and option-shaped lines follow, so years (``1947.``), decimals
+    (``2.5``) and numbered prose never split a block. The counter is
+    shared with Q-badged headers, so ``Q1`` … ``2.`` mixes stay ordered.
+    """
+    m = _BARE_NUM.match(line)
+    if not m:
+        return None
+    rest = (m.group(2) or "").strip()
+    if rest[:1].isdigit():
+        return None  # decimals ("2.5") and dotted numeric runs
+    try:
+        n = int(m.group(1))
+    except ValueError:
+        return None
+    if last_num is not None and n != last_num + 1:
+        return None
+    for ln in lines[idx + 1:idx + 9]:
+        if _is_option_context(ln):
+            return n, rest
+    return None
+
+
+def _block_has_bare(body_head: str, body: list[str], want: int) -> bool:
+    """True when the in-progress block already holds a bare ``want.`` line
+    (a ``want+1.`` line then continues that numbered run -- UPSC
+    "consider the statements" stems -- instead of starting a question).
+    """
+    for ln in [body_head, *body]:
+        m = _BARE_NUM.match(ln or "")
+        if not m:
+            continue
+        rest = (m.group(2) or "").strip()
+        if rest[:1].isdigit():
+            continue
+        try:
+            if int(m.group(1)) == want:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _split_blocks(lines: list[str]) -> list[dict]:
-    """Split lines into question blocks at Q-start headers.
+    """Split lines into question blocks at Q-start/bare-number headers.
 
     Text before the first header (preamble/instructions) is not a
     question and is ignored -- every block from here on is accounted
@@ -148,15 +212,36 @@ def _split_blocks(lines: list[str]) -> list[dict]:
     """
     blocks: list[dict] = []
     current: dict | None = None
-    for line in lines:
+    last_num: int | None = None
+    heads_seen = 0
+    for idx, line in enumerate(lines):
         m = _Q_START.match(line)
+        bare = None if m else _bare_header(line, lines, idx, last_num)
+        if bare is not None and current is not None and heads_seen == 0:
+            # No options yet in this block: a bare "N." line is a numbered
+            # statement ("1./2./3." stems) when the block already holds
+            # "N-1.", else a genuinely option-less question header.
+            if _block_has_bare(current["head"], current["body"], bare[0] - 1):
+                bare = None
         if m:
             if current is not None:
                 blocks.append(current)
             num = next((int(g) for g in m.groups()[:3] if g), None)
             current = {"number": num, "head": m.group(4).strip(), "body": []}
+            if num is not None:
+                last_num = num
+            heads_seen = 0
+        elif bare is not None:
+            if current is not None:
+                blocks.append(current)
+            num, head = bare
+            current = {"number": num, "head": head, "body": []}
+            last_num = num
+            heads_seen = 0
         elif current is not None:
             current["body"].append(line)
+            if _is_option_context(line):
+                heads_seen += 1
     if current is not None:
         blocks.append(current)
     return blocks
@@ -338,7 +423,7 @@ def parse_testseries_text(text: str) -> FileParseResult:
             ok=False,
             error=(
                 "No questions detected in this file. Mark each question with "
-                "Q.1. / Q26 / Question 26, give 2–10 A) options, and mark the "
+                "1. / Q.1. / Q26 / Question 26, give 2–10 A) options, and mark the "
                 "answer with ✅ or an Answer: line."
             ),
         )
@@ -624,7 +709,7 @@ async def start_upload_flow(c: Client, m: Message) -> None:
         "📄 Send me a question file — `.txt`, `.md` or `.pdf` — with options "
         "and marked answers, and I'll build the test-series PDF.\n\n"
         "Formats understood:\n"
-        "• `Q.1.` / `Q26` / `Question 26` headers, `A)` options\n"
+        "• `1.` / `1)` / `Q.1.` / `Q26` / `Question 26` headers, `A)` options\n"
         "• Correct answer: ✅ on the option, or `Answer: C` / `Answer: <option text>`\n"
         "• Explanations: `Ex:` / `Solution:` / `Extra details:`\n\n"
         "Or generate from your saved quizzes:\n"
