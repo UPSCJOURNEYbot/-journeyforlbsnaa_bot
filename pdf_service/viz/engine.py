@@ -378,6 +378,17 @@ def _is_location_question(question: str) -> bool:
     return any(rx.search(question) for rx in _LOCATION_RES)
 
 
+def _has_visual_intent(question: str) -> bool:
+    """Question-level gate: explanations never request a visual by themselves."""
+    return bool(re.search(
+        r"\\b(where|located|location|route|routes|flows?|passes|lies|situated|through|between|"
+        r"compare|difference|contrast|why|cause|effect|how|steps?|process|arrange|order|"
+        r"classif|categor|timeline|chronolog|list|sequence|relation|relationship|"
+        r"distribution|spread|which\\s+(?:of|are)|describe\\s+the\\s+process)\\b"
+        r"|कहाँ|स्थित|मार्ग|बहती|बहता|क्यों|कैसे|चरण|क्रम|तुलना|अंतर|वर्गी|संबंध|वितरण|कारण|प्रभाव",
+        question, re.I))
+
+
 # ---------------------------------------------------------------------------
 # Structure extractors (content-derived only)
 # ---------------------------------------------------------------------------
@@ -758,10 +769,13 @@ def decide_visual(question: object,
 
     # -- maps (accuracy-gated) ----------------------------------------
     q_places = find_places(question_text)
-    places = q_places or find_places(expl_text)
-    usable = usable_places(places)
+    # Evidence in an explanation cannot turn an otherwise factual question
+    # into a map request.  Available data is optional capability, never a
+    # reason to render.
+    usable = usable_places(q_places)
     map_allowed = (
         bool(usable)
+        and _is_location_question(question_text)
         and not _is_extent_question(question_text)
         and (subject in MAP_SUBJECTS or subject is None
              or _is_location_question(question_text))
@@ -784,7 +798,10 @@ def decide_visual(question: object,
                           payload=payload, notes=tuple(notes))
 
     # -- structure visuals (content-derived) ---------------------------
-    if len(norm.strip()) < MIN_STRUCTURE_CHARS:
+    # A long explanation and a keyword are not intent.  Require the question
+    # itself to ask for a relationship, sequence, comparison, distribution,
+    # or location; otherwise the correct result is NO_VISUAL.
+    if len(norm.strip()) < MIN_STRUCTURE_CHARS or not _has_visual_intent(question_text):
         return None
 
     candidates: dict[str, dict] = {}
