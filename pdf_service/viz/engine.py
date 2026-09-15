@@ -582,6 +582,56 @@ def _is_location_question(question: str) -> bool:
     return _has_location_phrasing(question)
 
 
+# Spatial-relationship asks: the question is about how places relate
+# in space (direction, adjacency, distance). Unlike a where-ask, these
+# need two mappable parties to be answerable -- a single dot cannot
+# show a relationship, and the missing party must never be invented.
+_RELATION_RES = (
+    re.compile(r"\b(north|south|east|west)\s+of\b", re.IGNORECASE),
+    re.compile(r"\bborders?\b", re.IGNORECASE),
+    re.compile(r"\bbordering\b", re.IGNORECASE),
+    re.compile(r"\bbordered\b", re.IGNORECASE),
+    re.compile(r"\bbounded\s+by\b", re.IGNORECASE),
+    re.compile(r"\badjacent\b", re.IGNORECASE),
+    re.compile(r"\bneighbou?rs?\b", re.IGNORECASE),
+    re.compile(r"\bnearest\b", re.IGNORECASE),
+    re.compile(r"\bdistance\b", re.IGNORECASE),
+    re.compile(r"\bdirection\b", re.IGNORECASE),
+    re.compile(r"पड़ोस"),
+    re.compile(r"निकटतम"),
+    re.compile(r"के\s+(उत्तर|दक्षिण|पूर्व|पश्चिम)\s+में"),
+)
+
+
+def _is_relation_question(question: str) -> bool:
+    return any(rx.search(question) for rx in _RELATION_RES)
+
+
+# Set-enumeration asks: the question wants a set of places named or
+# marked ("name the lakes"). The set must be geo-framed and hold 2+
+# mappable places -- "list the features of X" with one incidental
+# place is not a spatial set. ("marks" is deliberately excluded: exam
+# marks are not map marks.)
+_SET_ASK_RES = (
+    re.compile(r"\bnames?\b", re.IGNORECASE),
+    re.compile(r"\bnamed\b", re.IGNORECASE),
+    re.compile(r"\blists?\b", re.IGNORECASE),
+    re.compile(r"\blisted\b", re.IGNORECASE),
+    re.compile(r"\bidentif\w+\b", re.IGNORECASE),
+    re.compile(r"\bmark\b", re.IGNORECASE),
+    re.compile(r"\bmarked\b", re.IGNORECASE),
+    re.compile(r"\benumerate\w*\b", re.IGNORECASE),
+    re.compile(r"सूची"),
+    re.compile(r"पहचान"),
+    re.compile(r"चिह्नित"),
+    re.compile(r"नाम"),
+)
+
+
+def _is_set_question(question: str) -> bool:
+    return any(rx.search(question) for rx in _SET_ASK_RES)
+
+
 # ---------------------------------------------------------------------------
 # Question intent (interrogative frame; Milestone A)
 #
@@ -725,7 +775,11 @@ _RECALL_RES = (
     re.compile(r"\bled\s+by\b", re.IGNORECASE),
     re.compile(r"\bfounded\s+by\b", re.IGNORECASE),
     re.compile(r"किसने"),
-    re.compile(_hi_word("कौन")),
+    # Bare कौन (who) recalls a person; hyphenated कौन-सा/से/सी
+    # (which ...) asks about a thing -- like EN "which city", never
+    # a person-recall. (Spaced कौन सा stays recall: spaced से is
+    # ambiguous with the with/from postposition.)
+    re.compile(r"(?<![%s])कौन(?!-स[ाएी])(?![%s])" % (_DEVA, _DEVA)),
 )
 
 _ASSERTION_RES = (
@@ -1448,22 +1502,33 @@ def decide_visual(question: object,
     places = q_places or find_places(expl_text)
     usable = usable_places(places)
     located_q = _is_location_question(question_text)
+    route_ask = "route" in intents
+    relation_ask = _is_relation_question(question_text)
+    set_ask = _is_set_question(question_text)
+    if (set_ask or relation_ask) and q_places and len(usable) < 2:
+        # Set/relation asks are about a collection: when the question
+        # names only part of it, the explanation may supply the other
+        # NAMED members (never invented ones). Where-asks and the
+        # content-set rule stay question-scoped.
+        have = {p["id"] for p in q_places}
+        extra = [p for p in find_places(expl_text) if p["id"] not in have]
+        usable = usable_places(q_places + extra)
     recall_block = (
         "recall" in intents
         and not located_q
         and not _has_location_phrasing(expl_text)
     )
-    map_allowed = (
-        bool(usable)
-        and not _is_extent_question(question_text)
-        and not recall_block
-        and (subject in MAP_SUBJECTS or subject is None or located_q)
-    )
+    # Question-requirement gate: a place mention alone never earns a
+    # map. The question must ask something spatial (location, route,
+    # or relation -- each with answerable evidence), ask to enumerate
+    # a geo-framed set of 2+ places, or the content must present 3+
+    # places (the same 3+ bar every structure gate uses). Route
+    # geometry resolves before the gate so a single-place route ask
+    # maps only when drawable geometry actually exists.
+    shown = usable[:MAX_PLACES]
+    base_id = select_base(shown) if shown else ""
     map_routes: list[dict] = []
-    if map_allowed:
-        assert usable  # for type-checkers; guaranteed by map_allowed
-        shown = usable[:MAX_PLACES]
-        base_id = select_base(shown)
+    if shown:
         base_bbox = load_base_maps()["bases"][base_id]["bbox"]
         for route in find_routes(question_text + "\n" + expl_text):
             verts = route["vertices"]
@@ -1471,6 +1536,22 @@ def decide_visual(question: object,
                          if point_in_bbox(lon, lat, base_bbox))
             if inside >= 2:
                 map_routes.append(route)
+    geo_framed = subject in MAP_SUBJECTS or subject is None
+    ask_ok = (
+        located_q
+        or (relation_ask and len(usable) >= 2)
+        or (route_ask and (len(usable) >= 2 or map_routes))
+    )
+    map_allowed = (
+        bool(usable)
+        and not _is_extent_question(question_text)
+        and not recall_block
+        and (ask_ok
+             or (set_ask and geo_framed and len(usable) >= 2)
+             or (geo_framed and len(usable) >= 3))
+    )
+    if map_allowed:
+        assert usable  # for type-checkers; guaranteed by map_allowed
         payload: dict = {
             "base": base_id,
             "places": [_place_payload(p) for p in shown],

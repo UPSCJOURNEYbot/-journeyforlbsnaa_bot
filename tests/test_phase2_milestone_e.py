@@ -114,14 +114,17 @@ class NoVetoCases(unittest.TestCase):
         self.assertIsNotNone(spec)
         self.assertEqual(spec.visual_type, "timeline")
 
-    def test_general_question_keeps_static_default(self):
-        # No interrogative signal: the map still beats structure.
+    def test_general_question_prefers_evidenced_structure(self):
+        # Correction (question-first): a general ask with a single
+        # river mention and no spatial requirement earns NO map; the
+        # explanation's three dated events still earn a timeline
+        # (the 3+ evidence bar is met).
         spec = decide(
             "Tell me about the Ganga.",
             "In 1857 pilgrims gathered. In 1919 a flood struck. "
             "In 1942 a bridge opened.")
         self.assertIsNotNone(spec)
-        self.assertEqual(spec.visual_type, "location_map")
+        self.assertEqual(spec.visual_type, "timeline")
 
     def test_fallback_types_never_boost(self):
         # Nested + long: mind and infographic both eligible, features
