@@ -109,7 +109,8 @@ def layout_timeline(n: int, x: float, y: float, w: float
                              align="L" if right else "R"))
         elements.append(_box(cx - 8.0, yy + 1.0, 16.0, 5.0,
                              "__YEAR__%d" % i, size=6.5, bold=True,
-                             fill=NAVY, line=NAVY, color=WHITE))
+                             fill=NAVY, line=NAVY, color=WHITE,
+                             max_lines=1))
         dot_x = bx if right else bx + box_w
         elements.append(_dot((dot_x, yy + row_h / 2.0), 1.4))
         elements.append(_line((cx, yy + row_h / 2.0),
@@ -367,6 +368,86 @@ def layout_infographic(n: int, x: float, y: float, w: float
     return elements, (yy - gap - y) if n else 0.0
 
 
+def layout_panels(n: int, x: float, y: float, w: float
+                  ) -> tuple[list[dict], float]:
+    """2x2 (or general two-column) grid of numbered feature panels."""
+    gap, panel_h = 2.5, 24.0
+    pw = (w - gap) / 2.0
+    elements: list[dict] = []
+    for i in range(max(0, n)):
+        row, col = divmod(i, 2)
+        px = x + col * (pw + gap)
+        py = y + row * (panel_h + gap)
+        elements.append(_box(px, py, pw, panel_h, ""))
+        elements.append(_box(px + 1.5, py + 1.2, 6.0, 5.0, str(i + 1),
+                             size=7.0, bold=True, fill=NAVY, line=NAVY,
+                             color=WHITE, max_lines=1))
+        elements.append(_box(px + 9.5, py + 1.0, pw - 11.0, panel_h - 2.0,
+                             "__P%d" % i, size=7.5, align="L", fill=None,
+                             line=None, max_lines=4))
+    rows = (max(0, n) + 1) // 2
+    return elements, (rows * panel_h + (rows - 1) * gap) if rows else 0.0
+
+
+def layout_mechanism(has_role: list[bool], x: float, y: float, w: float
+                     ) -> tuple[list[dict], float]:
+    """Vertical stage boxes with down-arrows and optional role chips.
+
+    ``has_role[i]`` marks stages whose own text gave a role label
+    ("Source:", "Target:", ...); those stages get a role chip above
+    the stage box. Height is exact for the given flags.
+    """
+    chip_h, box_h, arrow = 5.0, 10.0, 3.0
+    elements: list[dict] = []
+    yy = y
+    n = len(has_role)
+    for i, role in enumerate(has_role):
+        if role:
+            elements.append(_box(x, yy, w, chip_h, "__ROLE__%d" % i,
+                                 size=6.5, bold=True, fill=ACCENT_BG,
+                                 max_lines=1))
+            yy += chip_h + 1.0
+        elements.append(_box(x, yy, w, box_h, "__TEXT__%d" % i))
+        elements[-1]["number"] = i + 1
+        yy += box_h
+        if i < n - 1:
+            elements.append(_arrow((x + w / 2, yy + 0.4),
+                                   (x + w / 2, yy + arrow - 0.4)))
+            yy += arrow
+    return elements, (yy - y) if n else 0.0
+
+
+def layout_chain(n: int, has_hi: list[bool], x: float, y: float, w: float
+                 ) -> tuple[list[dict], float]:
+    """Vertical route-chain nodes (English + Devanagari) with arrows.
+
+    ``has_hi[i]`` marks links with a Devanagari name; those nodes get
+    a second label line. Follows mapdraw's bilingual convention (one
+    script per label) so shaping stays single-script per text run.
+    """
+    node_w = min(64.0, w * 0.6)
+    nx = x + (w - node_w) / 2.0
+    en_h, hi_h, gap, arrow = 7.0, 6.0, 1.0, 3.5
+    elements: list[dict] = []
+    yy = y
+    for i in range(max(0, n)):
+        elements.append(_box(nx, yy, node_w, en_h, "__TEXT__%d" % i,
+                             size=8.0, bold=True, fill=ACCENT_BG,
+                             max_lines=1))
+        ny = yy + en_h
+        if i < len(has_hi) and has_hi[i]:
+            elements.append(_box(nx, ny + gap, node_w, hi_h, "__HI__%d" % i,
+                                 size=7.0, fill=None, line=None,
+                                 max_lines=1))
+            ny += gap + hi_h
+        if i < n - 1:
+            elements.append(_arrow((nx + node_w / 2, ny + 0.3),
+                                   (nx + node_w / 2, ny + arrow - 0.3)))
+            ny += arrow
+        yy = ny
+    return elements, (yy - y) if n else 0.0
+
+
 # ---------------------------------------------------------------------------
 # Measuring + frame + dispatch
 # ---------------------------------------------------------------------------
@@ -403,6 +484,17 @@ def _layout_for_spec(spec: VisualSpec, x: float, y: float, w: float
         return layout_classification([len(payload.get("items", []))], x, y, w)
     if kind == "infographic":
         return layout_infographic(len(payload.get("points", [])), x, y, w)
+    if kind == "panels":
+        return layout_panels(len(payload.get("panels", [])), x, y, w)
+    if kind == "mechanism":
+        return layout_mechanism(
+            [bool(stage.get("role"))
+             for stage in payload.get("stages", [])], x, y, w)
+    if kind == "spatial_chain":
+        return layout_chain(len(payload.get("links", [])),
+                            [bool(link.get("name_hi"))
+                             for link in payload.get("links", [])],
+                            x, y, w)
     raise ValueError(f"No template for visual type: {kind!r}")
 
 
@@ -479,6 +571,23 @@ def _resolve_texts(spec: VisualSpec, elements: list[dict]) -> None:
     elif kind == "infographic":
         for i, point in enumerate(payload.get("points", [])):
             mapping["__TEXT__%d" % i] = textstyle.clean_label(point, 120)
+    elif kind == "panels":
+        for i, panel in enumerate(payload.get("panels", [])):
+            mapping["__P%d" % i] = textstyle.clean_label(
+                panel.get("text", ""), 160)
+    elif kind == "mechanism":
+        for i, stage in enumerate(payload.get("stages", [])):
+            mapping["__TEXT__%d" % i] = "%d. %s" % (
+                i + 1, textstyle.clean_label(stage.get("label", ""), 90))
+            if stage.get("role_text"):
+                mapping["__ROLE__%d" % i] = textstyle.clean_label(
+                    stage.get("role_text", ""), 24).upper()
+    elif kind == "spatial_chain":
+        for i, link in enumerate(payload.get("links", [])):
+            mapping["__TEXT__%d" % i] = "%d. %s" % (
+                i + 1, textstyle.clean_label(link.get("name_en", ""), 40))
+            mapping["__HI__%d" % i] = textstyle.clean_label(
+                link.get("name_hi", ""), 40)
     for element in elements:
         if element["k"] == "box" and element["text"] in mapping:
             element["text"] = mapping[element["text"]]

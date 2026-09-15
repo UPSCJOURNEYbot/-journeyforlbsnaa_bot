@@ -139,6 +139,9 @@ BADGES = {
     "labelled_diagram": "Diagram",
     "classification": "Classification",
     "infographic": "Quick Revision",
+    "panels": "Four Panels",
+    "mechanism": "Mechanism",
+    "spatial_chain": "Route Chain",
 }
 
 

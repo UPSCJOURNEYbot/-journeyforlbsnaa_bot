@@ -4,7 +4,15 @@ The engine is intentionally conservative (accuracy-first):
 
 * Maps are emitted only for places in the curated dataset that fall
   inside a region with a base map. Unknown places, regions without a
-  base map, and extent/boundary questions all yield ``None``.
+  base map, and extent/boundary questions all yield ``None``. The map
+  uses the smallest base map containing every shown place.
+* Routes are drawn only from sourced vertex geometry: every route
+  entry needs a provenance note, dataset place references, and
+  vertices inside a mappable base. A route attaches when at least
+  two of its vertices fall inside the chosen base and is then drawn
+  clipped to the map frame (standard atlas crop); route questions
+  without a drawable sourced route keep the ordered place chain
+  instead of invented lines.
 * Diagram templates only re-structure text already present in the
   question/explanation (steps, bullets, years, labelled sections).
   They never assert facts of their own, and quiz *options* are never
@@ -18,6 +26,7 @@ raises, so the optional visual layer can never break PDF generation.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
@@ -52,6 +61,9 @@ class VisualType(str, Enum):
     LABELLED_DIAGRAM = "labelled_diagram"
     CLASSIFICATION = "classification"
     INFOGRAPHIC = "infographic"
+    PANELS = "panels"
+    MECHANISM = "mechanism"
+    SPATIAL_CHAIN = "spatial_chain"
 
 
 ALL_TYPES = frozenset(t.value for t in VisualType)
@@ -73,19 +85,49 @@ GENERIC_ORDER = (
     "comparison",
     "classification",
     "timeline",
+    "mechanism",
     "flowchart",
     "process",
     "cycle",
     "cause_effect",
+    "spatial_chain",
     "mind_map",
     "concept_map",
+    "panels",
     "infographic",
 )
 
 # Generic bullet-derived visuals are always tried last (per-type and
 # per-subject): an explicit comparison/timeline/etc. signal must beat a
 # mere "there are bullets" fallback.
-FALLBACK_TYPES = ("mind_map", "concept_map", "infographic")
+FALLBACK_TYPES = ("mind_map", "concept_map", "panels", "infographic")
+
+# Rule 13: the interrogative intent each explicit structure type answers
+# natively. When the question carries such an intent AND a matching
+# candidate exists, matching candidates race among themselves before the
+# static order (a timeline answers a chronology ask better than a
+# same-text route chain). Fallback types never match: they stay last by
+# design. mind_map is absent: nested bullets answer any frame.
+_TYPE_INTENTS = {
+    "timeline": {"chronology"},
+    "comparison": {"comparison"},
+    "cause_effect": {"causal"},
+    "cycle": {"cycle"},
+    "process": {"process"},
+    "flowchart": {"process"},
+    "classification": {"classify"},
+    "mechanism": {"mechanism"},
+    "spatial_chain": {"route"},
+}
+
+# Question frames that ask for an explicit structure. When such a frame
+# is present AND structure evidence exists, the structure visual answers
+# the question better than a topic map, so it wins over maps ("what are
+# the features of Chilika" wants feature panels, not a locator dot).
+STRUCTURE_OVERRIDE_FRAMES = frozenset({
+    "features", "process", "mechanism", "comparison", "chronology",
+    "causal", "classify", "cycle",
+})
 
 # Thresholds / caps (all pinned by tests).
 MIN_STRUCTURE_CHARS = 60
@@ -107,6 +149,10 @@ MAX_GROUPS = 6
 MAX_GROUP_ITEMS = 4
 MAX_CAUSES = 4
 MAX_EFFECTS = 4
+PANELS_COUNT = 4
+MECHANISM_MIN_STAGES = 3
+CHAIN_MIN_LINKS = 3
+MAX_LINKS = 6
 MAX_TITLE_CHARS = 100
 MAX_LABEL_CHARS = 80
 MAX_ITEM_CHARS = 140
@@ -121,6 +167,7 @@ class VisualSpec:
     title: str
     payload: dict
     notes: tuple = field(default_factory=tuple)
+    evidence: tuple = field(default_factory=tuple)
 
     def to_dict(self) -> dict:
         return {
@@ -129,6 +176,7 @@ class VisualSpec:
             "title": self.title,
             "payload": json.loads(json.dumps(self.payload)),
             "notes": list(self.notes),
+            "evidence": list(self.evidence),
         }
 
 
@@ -220,6 +268,59 @@ def _validate_bases(data: Any) -> dict:
     return data
 
 
+def _validate_routes(data: Any, places_by_id: dict,
+                     bases: dict) -> dict:
+    """Validate geo_routes.json against the dataset places and bases.
+
+    Unlike base polygons, route vertices are OPEN polylines (never
+    closed): they trace sourced geometry such as a river course, so no
+    closure is required. Every entry must cite its source.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("routes"),
+                                                   list):
+        raise ValueError("geo_routes.json: expected {routes: [...]}")
+    seen: set[str] = set()
+    for entry in data["routes"]:
+        rid = entry.get("id")
+        if not rid or rid in seen:
+            raise ValueError(f"geo_routes.json: bad/duplicate id {rid!r}")
+        seen.add(rid)
+        if not isinstance(entry.get("name_en"), str) or not entry["name_en"]:
+            raise ValueError(f"geo_routes.json: {rid} missing name_en")
+        if "name_hi" in entry and not isinstance(entry["name_hi"], str):
+            raise ValueError(f"geo_routes.json: {rid} bad name_hi")
+        for key in ("match_en", "match_hi"):
+            if (not isinstance(entry.get(key), list) or not entry[key]
+                    or not all(isinstance(v, str) and v
+                               for v in entry[key])):
+                raise ValueError(f"geo_routes.json: {rid} bad {key}")
+        place_ids = entry.get("place_ids")
+        if (not isinstance(place_ids, list) or not place_ids
+                or not all(isinstance(v, str) for v in place_ids)):
+            raise ValueError(f"geo_routes.json: {rid} bad place_ids")
+        unknown = [v for v in place_ids if v not in places_by_id]
+        if unknown:
+            raise ValueError(f"geo_routes.json: {rid} unknown places "
+                             f"{unknown}")
+        if not isinstance(entry.get("source"), str) or not entry["source"]:
+            raise ValueError(f"geo_routes.json: {rid} missing source")
+        verts = entry.get("vertices")
+        if (not isinstance(verts, list) or len(verts) < 2
+                or any(len(v) != 2 for v in verts)
+                or not all(isinstance(c, (int, float))
+                           for v in verts for c in v)):
+            raise ValueError(f"geo_routes.json: {rid} needs >=2 vertices")
+        for lon, lat in verts:
+            if not -180 <= lon <= 180 or not -90 <= lat <= 90:
+                raise ValueError(f"geo_routes.json: {rid} bad vertex "
+                                 f"{[lon, lat]}")
+            if not any(point_in_bbox(lon, lat, base["bbox"])
+                       for base in bases.values()):
+                raise ValueError(f"geo_routes.json: {rid} vertex outside "
+                                 f"every base {[lon, lat]}")
+    return data
+
+
 def load_subjects() -> dict:
     """Load + validate subjects.json (cached)."""
     if "subjects" not in _CACHE:
@@ -239,6 +340,16 @@ def load_base_maps() -> dict:
     if "bases" not in _CACHE:
         _CACHE["bases"] = _validate_bases(_read_json("geo_base.json"))
     return _CACHE["bases"]
+
+
+def load_routes() -> dict:
+    """Load + validate geo_routes.json (cached)."""
+    if "routes" not in _CACHE:
+        places = {p["id"]: p for p in load_places()["places"]}
+        bases = load_base_maps()["bases"]
+        _CACHE["routes"] = _validate_routes(_read_json("geo_routes.json"),
+                                            places, bases)
+    return _CACHE["routes"]
 
 
 def reload_data() -> None:
@@ -263,14 +374,29 @@ def _norm(text: object) -> str:
     return _WS_RE.sub(" ", str(text or "")).strip()
 
 
+@functools.lru_cache(maxsize=4096)
+def _en_rx(keyword: str) -> "re.Pattern[str]":
+    return re.compile(r"\b" + re.escape(keyword.lower()) + r"\b",
+                      flags=re.ASCII)
+
+
+@functools.lru_cache(maxsize=4096)
+def _hi_rx(keyword: str) -> "re.Pattern[str]":
+    return re.compile(r"(?<![%s])%s(?![%s])" % (_DEVA, re.escape(keyword),
+                                               _DEVA))
+
+
+@functools.lru_cache(maxsize=512)
+def _year_rx(year: int) -> "re.Pattern[str]":
+    return re.compile(r"\b%d\b" % year)
+
+
 def _en_hit(keyword: str, lowered: str) -> bool:
-    return re.search(r"\b" + re.escape(keyword.lower()) + r"\b", lowered,
-                     flags=re.ASCII) is not None
+    return _en_rx(keyword).search(lowered) is not None
 
 
 def _hi_hit(keyword: str, text: str) -> bool:
-    return re.search(r"(?<![%s])%s(?![%s])" % (_DEVA, re.escape(keyword),
-                                              _DEVA), text) is not None
+    return _hi_rx(keyword).search(text) is not None
 
 
 def detect_subject(text: object) -> Optional[str]:
@@ -325,6 +451,22 @@ def find_places(text: object) -> list[dict]:
     return [hits[pid] for pid in sorted(hits)]
 
 
+def find_routes(text: object) -> list[dict]:
+    """All dataset routes mentioned in `text`, sorted by id (deduped)."""
+    blob = _norm(text)
+    if not blob:
+        return []
+    lowered = blob.lower()
+    hits: dict[str, dict] = {}
+    for route in load_routes()["routes"]:
+        matched = any(_en_hit(a, lowered) for a in route["match_en"])
+        if not matched:
+            matched = any(_hi_hit(a, blob) for a in route["match_hi"])
+        if matched:
+            hits[route["id"]] = route
+    return [hits[rid] for rid in sorted(hits)]
+
+
 def usable_places(places: list[dict]) -> list[dict]:
     """Places that can actually be mapped: region has a base map and the
     point falls inside that base map's bbox. Input order preserved."""
@@ -336,6 +478,54 @@ def usable_places(places: list[dict]) -> list[dict]:
                                   base["bbox"]):
             out.append(place)
     return out
+
+
+def _bbox_area(bbox: list) -> float:
+    return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+
+
+def select_base(shown: list[dict]) -> str:
+    """Smallest base (by bbox area) containing every shown place.
+
+    Falls back to the first place's own region, which is always
+    mappable for usable input. Deterministic (id order breaks ties).
+    """
+    bases = load_base_maps()["bases"]
+    covering = [bid for bid, base in bases.items()
+                if all(point_in_bbox(p["lon"], p["lat"], base["bbox"])
+                       for p in shown)]
+    if covering:
+        return min(sorted(covering),
+                   key=lambda bid: _bbox_area(bases[bid]["bbox"]))
+    return shown[0].get("region", "")
+
+
+def _ordered_places(text: object) -> list[dict]:
+    """Dataset places in first-mention order (deduped).
+
+    Ties (same offset, e.g. overlapping aliases) resolve by place id,
+    so the order is deterministic. Used for route/chain evidence where
+    the mention order in the author's own text is the honest sequence.
+    """
+    blob = _norm(text)
+    if not blob:
+        return []
+    lowered = blob.lower()
+    hits: list[tuple[int, dict]] = []
+    for place in load_places()["places"]:
+        best: Optional[int] = None
+        for alias in place["match_en"]:
+            match = _en_rx(alias).search(lowered)
+            if match and (best is None or match.start() < best):
+                best = match.start()
+        for alias in place["match_hi"]:
+            match = _hi_rx(alias).search(blob)
+            if match and (best is None or match.start() < best):
+                best = match.start()
+        if best is not None:
+            hits.append((best, place))
+    hits.sort(key=lambda item: (item[0], item[1]["id"]))
+    return [place for _pos, place in hits]
 
 
 # ---------------------------------------------------------------------------
@@ -363,10 +553,21 @@ _LOCATION_RES = (
     re.compile(r"\bsituated\b", re.IGNORECASE),
     re.compile(r"कहाँ"),
     re.compile(r"कहां"),
+    re.compile(r"\bkahan\b", re.IGNORECASE),
+    re.compile(r"\bkaha\b", re.IGNORECASE),
     re.compile(r"स्थित"),
     re.compile(r"राजधानी"),
     re.compile(r"मानचित्र"),
     re.compile(r"अवस्थित"),
+)
+
+# Extra location phrasing (Milestone A): distribution questions and
+# map-marking tasks ask for a spatial visual even without "where".
+_LOCATION_EXTRA_RES = (
+    re.compile(r"\bdistribution\s+of\b", re.IGNORECASE),
+    re.compile(r"\bmarks?\b.{0,30}\bmaps?\b", re.IGNORECASE),
+    re.compile(r"\bmaps?\b.{0,30}\bmarks?\b", re.IGNORECASE),
+    re.compile(r"किस\s+(राज्य|क्षेत्र|तट|जिले|भाग|देश|स्थान)"),
 )
 
 
@@ -374,8 +575,288 @@ def _is_extent_question(question: str) -> bool:
     return any(rx.search(question) for rx in _EXTENT_RES)
 
 
+def _has_location_phrasing(text: str) -> bool:
+    return any(rx.search(text)
+               for rx in _LOCATION_RES + _LOCATION_EXTRA_RES)
+
+
 def _is_location_question(question: str) -> bool:
-    return any(rx.search(question) for rx in _LOCATION_RES)
+    return _has_location_phrasing(question)
+
+
+# Spatial-relationship asks: the question is about how places relate
+# in space (direction, adjacency, distance). Unlike a where-ask, these
+# need two mappable parties to be answerable -- a single dot cannot
+# show a relationship, and the missing party must never be invented.
+_RELATION_RES = (
+    re.compile(r"\b(north|south|east|west)\s+of\b", re.IGNORECASE),
+    re.compile(r"\bborders?\b", re.IGNORECASE),
+    re.compile(r"\bbordering\b", re.IGNORECASE),
+    re.compile(r"\bbordered\b", re.IGNORECASE),
+    re.compile(r"\bbounded\s+by\b", re.IGNORECASE),
+    re.compile(r"\badjacent\b", re.IGNORECASE),
+    re.compile(r"\bneighbou?rs?\b", re.IGNORECASE),
+    re.compile(r"\bnearest\b", re.IGNORECASE),
+    re.compile(r"\bdistance\b", re.IGNORECASE),
+    re.compile(r"\bdirection\b", re.IGNORECASE),
+    re.compile(r"पड़ोस"),
+    re.compile(r"निकटतम"),
+    re.compile(r"के\s+(उत्तर|दक्षिण|पूर्व|पश्चिम)\s+में"),
+    re.compile(r"किस\s+दिशा\s+में"),
+    re.compile(r"kis\s+disha\s+(?:mein|men)", re.IGNORECASE),
+)
+
+
+def _is_relation_question(question: str) -> bool:
+    return any(rx.search(question) for rx in _RELATION_RES)
+
+
+# Set-enumeration asks: the question wants a set of places named or
+# marked ("name the lakes"). The set must be geo-framed and hold 2+
+# mappable places -- "list the features of X" with one incidental
+# place is not a spatial set. ("marks" is deliberately excluded: exam
+# marks are not map marks.)
+_SET_ASK_RES = (
+    re.compile(r"\bnames?\b", re.IGNORECASE),
+    re.compile(r"\bnamed\b", re.IGNORECASE),
+    re.compile(r"\blists?\b", re.IGNORECASE),
+    re.compile(r"\blisted\b", re.IGNORECASE),
+    re.compile(r"\bidentif\w+\b", re.IGNORECASE),
+    re.compile(r"\bmark\b", re.IGNORECASE),
+    re.compile(r"\bmarked\b", re.IGNORECASE),
+    re.compile(r"\benumerate\w*\b", re.IGNORECASE),
+    re.compile(r"सूची"),
+    re.compile(r"पहचान"),
+    re.compile(r"चिह्नित"),
+    re.compile(r"नाम"),
+    re.compile(r"\bnaam\b", re.IGNORECASE),
+)
+
+
+def _is_set_question(question: str) -> bool:
+    return any(rx.search(question) for rx in _SET_ASK_RES)
+
+
+# ---------------------------------------------------------------------------
+# Question intent (interrogative frame; Milestone A)
+#
+# Intent is read ONLY from the question stem (never from options). It is
+# one input to the decision -- every visual type additionally needs
+# explanation-side structural evidence, so a matching keyword alone can
+# never force a visual. Intents:
+#
+# * ``assertion`` -- "consider statements" / "match the following": the
+#   question text holds unevaluated claims, so structure evidence may
+#   come only from the (authoritative) explanation.
+# * ``recall`` -- who/whom/led-by style person/single-fact asks: generic
+#   list visuals (mind/concept/panels/infographic) are suppressed and
+#   maps need explicit location phrasing (a person-seeking question
+#   alone never justifies a map of a mentioned place).
+# * ``features`` -- features/measures/provisions/parts asks: required
+#   (together with exactly four flat items) for the 2x2 panels visual,
+#   and steers numbered lists away from process/flowchart readings.
+# * ``mechanism`` -- mechanism/working/pathway asks: required (together
+#   with explicit ordered stages) for the mechanism visual.
+# * other frames (location/route/comparison/chronology/process/causal/
+#   classify/cycle) are recorded as decision evidence; the matching
+#   visual types stay evidence-driven.
+# ---------------------------------------------------------------------------
+
+def _hi_word(word: str) -> str:
+    """Devanagari word with script boundaries (mirrors _hi_hit)."""
+    return r"(?<![%s])%s(?![%s])" % (_DEVA, re.escape(word), _DEVA)
+
+
+_ROUTE_RES = (
+    re.compile(r"\broute\b", re.IGNORECASE),
+    re.compile(r"\bvia\b", re.IGNORECASE),
+    re.compile(r"\bcorridor\b", re.IGNORECASE),
+    re.compile(r"\bflows?\s+from\b", re.IGNORECASE),
+    re.compile(r"\bpass(?:es|ed)?\s+through\b", re.IGNORECASE),
+    re.compile(r"\bjoins?\b", re.IGNORECASE),
+    re.compile(r"\bconnects?\b", re.IGNORECASE),
+    re.compile(r"मार्ग"),
+    re.compile(r"होकर"),
+    re.compile(r"गलियारा"),
+    re.compile(r"जोड़ता"),
+    re.compile(r"जोड़ती"),
+    re.compile(r"मिलती"),
+    re.compile(r"मिलता"),
+)
+
+_COMPARISON_INTENT_RES = (
+    re.compile(r"\bvs\b", re.IGNORECASE),
+    re.compile(r"\bv/s\b", re.IGNORECASE),
+    re.compile(r"\bversus\b", re.IGNORECASE),
+    re.compile(r"\bcompar\w*\b", re.IGNORECASE),
+    re.compile(r"\bcontrast\w*\b", re.IGNORECASE),
+    re.compile(r"\bdistinguish\w*\b", re.IGNORECASE),
+    re.compile(r"\bdifferences?\s+between\b", re.IGNORECASE),
+    re.compile(r"\bdifferent\s+from\b", re.IGNORECASE),
+    re.compile(_hi_word("अंतर")),
+    re.compile(_hi_word("तुलना")),
+    re.compile(r"\bantar\b", re.IGNORECASE),
+    re.compile(r"\btulna\b", re.IGNORECASE),
+)
+
+_CHRONOLOGY_RES = (
+    re.compile(r"\bchronolog\w*\b", re.IGNORECASE),
+    re.compile(r"\barrange\b.{0,40}\border\b", re.IGNORECASE),
+    re.compile(r"\bcorrect\s+(order|sequence)\b", re.IGNORECASE),
+    re.compile(r"\bsequence\s+of\s+(events?|reigns?|plans?|years?|"
+               r"milestones?|struggles?)\b", re.IGNORECASE),
+    re.compile(r"\boccurred?\s+first\b", re.IGNORECASE),
+    re.compile(r"कालानुक्रम"),
+    re.compile(r"कालक्रम"),
+    re.compile(r"घटनाक्रम"),
+    re.compile(r"सही\s+क्रम"),
+    re.compile(r"क्रम\s+में\s+(?:लग|व्यवस्थित|सजा)"),
+    re.compile(r"किस\s+क्रम\s+में"),
+    re.compile(r"\bkab\b", re.IGNORECASE),
+    re.compile(r"\bkram\b", re.IGNORECASE),
+)
+
+_PROCESS_INTENT_RES = (
+    re.compile(r"\bstages?\b", re.IGNORECASE),
+    re.compile(r"\bsteps?\b", re.IGNORECASE),
+    re.compile(r"\bprocess\s+of\b", re.IGNORECASE),
+    re.compile(r"\bprocedure\b", re.IGNORECASE),
+    re.compile(r"\bformation\s+of\b", re.IGNORECASE),
+    re.compile(r"\bhow\s+(is|are|was|were|does|do|can)\b", re.IGNORECASE),
+    re.compile(r"चरण"),
+    re.compile(r"प्रक्रम"),
+    re.compile(r"प्रक्रिया"),
+    re.compile(r"कैसे"),
+    re.compile(r"\bkaise\b", re.IGNORECASE),
+)
+
+_MECHANISM_INTENT_RES = (
+    re.compile(r"\bmechanism\b", re.IGNORECASE),
+    re.compile(r"\bhow\s+does\b.{0,50}\bwork\b", re.IGNORECASE),
+    re.compile(r"\bworking\s+of\b", re.IGNORECASE),
+    re.compile(r"\bpathway\b", re.IGNORECASE),
+    re.compile(r"क्रियाविधि"),
+    re.compile(r"कार्यप्रणाली"),
+)
+
+_CAUSAL_INTENT_RES = (
+    re.compile(r"\bcauses?\s+and\s+effects?\b", re.IGNORECASE),
+    re.compile(r"\beffects?\s+and\s+causes?\b", re.IGNORECASE),
+    re.compile(r"\bfactors?\s+and\s+(effects?|consequences?)\b",
+               re.IGNORECASE),
+    re.compile(r"\bwhy\b", re.IGNORECASE),
+    re.compile(r"\bcauses?\b", re.IGNORECASE),
+    re.compile(r"\beffects?\b", re.IGNORECASE),
+    re.compile(r"\breasons?\b", re.IGNORECASE),
+    re.compile(r"\bfactors?\b", re.IGNORECASE),
+    re.compile(r"कारण\s+और\s+प्रभाव"),
+    re.compile(r"क्यों"),
+    re.compile(r"कारण"),
+    re.compile(r"प्रभाव"),
+    re.compile(r"परिणाम"),
+    re.compile(r"\bkyon\b", re.IGNORECASE),
+    re.compile(r"\bkyun\b", re.IGNORECASE),
+)
+
+_CLASSIFY_INTENT_RES = (
+    re.compile(r"\btypes?\s+of\b", re.IGNORECASE),
+    re.compile(r"\bkinds?\s+of\b", re.IGNORECASE),
+    re.compile(r"\bclassif\w*\b", re.IGNORECASE),
+    re.compile(r"\bcategor\w+\b", re.IGNORECASE),
+    re.compile(r"प्रकार"),
+    re.compile(r"वर्गीकरण"),
+    re.compile(r"श्रेणी"),
+    re.compile(r"\bke\s+types?\b", re.IGNORECASE),
+    re.compile(r"\bke\s+prakar\b", re.IGNORECASE),
+)
+
+_FEATURES_INTENT_RES = (
+    re.compile(r"\bfeatures?\b", re.IGNORECASE),
+    re.compile(r"\bcharacteristics?\b", re.IGNORECASE),
+    re.compile(r"\bmeasures?\b", re.IGNORECASE),
+    re.compile(r"\bprovisions?\b", re.IGNORECASE),
+    re.compile(r"\bfunctions?\b", re.IGNORECASE),
+    re.compile(r"\bdimensions?\b", re.IGNORECASE),
+    re.compile(r"\baspects?\b", re.IGNORECASE),
+    re.compile(r"\bparts?\s+of\b", re.IGNORECASE),
+    re.compile(r"\bcompris\w*\b", re.IGNORECASE),
+    re.compile(r"\bincludes?\b", re.IGNORECASE),
+    re.compile(r"\bconsists?\s+of\b", re.IGNORECASE),
+    re.compile(r"विशेषता"),
+    re.compile(r"लक्षण"),
+    re.compile(r"उपाय"),
+    re.compile(r"प्रावधान"),
+    re.compile(r"आयाम"),
+    re.compile(r"शामिल"),
+)
+
+_RECALL_RES = (
+    re.compile(r"^\s*who\b", re.IGNORECASE),
+    re.compile(r"\bwho\s+(was|were|is|are|led|founded|wrote|discovered|"
+               r"started|built|gave|issued)\b", re.IGNORECASE),
+    re.compile(r"\bwhom\b", re.IGNORECASE),
+    re.compile(r"\bwhose\b", re.IGNORECASE),
+    re.compile(r"\bwhich\s+(king|queen|ruler|leader|president|person|poet|"
+               r"author|scientist|general|saint|philosopher|sultan|"
+               r"emperor)\b", re.IGNORECASE),
+    re.compile(r"\bled\s+by\b", re.IGNORECASE),
+    re.compile(r"\bfounded\s+by\b", re.IGNORECASE),
+    re.compile(r"किसने"),
+    # Bare कौन (who) recalls a person; hyphenated कौन-सा/से/सी
+    # (which ...) asks about a thing -- like EN "which city", never
+    # a person-recall. (Spaced कौन सा stays recall: spaced से is
+    # ambiguous with the with/from postposition.)
+    re.compile(r"(?<![%s])कौन(?!-स[ाएी])(?![%s])" % (_DEVA, _DEVA)),
+    # Roman "kaun" (who) recalls; roman "kaun sa" stays recall too
+    # (roman rarely hyphenates, so the spaced ambiguity stands).
+    re.compile(r"\bkaun\b", re.IGNORECASE),
+)
+
+_ASSERTION_RES = (
+    re.compile(r"\bconsider\s+(the\s+)?following\s+statements?\b",
+               re.IGNORECASE),
+    re.compile(r"\bmatch\s+the\s+following\b", re.IGNORECASE),
+    re.compile(r"\bpair\s+the\s+following\b", re.IGNORECASE),
+    re.compile(r"निम्नलिखित\s+कथन"),
+    re.compile(r"कथनों\s+पर\s+विचार"),
+    re.compile(r"सुमेलित"),
+)
+
+_INTENT_TABLE: tuple[tuple[str, tuple], ...] = (
+    ("assertion", _ASSERTION_RES),
+    ("recall", _RECALL_RES),
+    ("location", _LOCATION_RES + _LOCATION_EXTRA_RES),
+    ("route", _ROUTE_RES),
+    ("comparison", _COMPARISON_INTENT_RES),
+    ("chronology", _CHRONOLOGY_RES),
+    ("mechanism", _MECHANISM_INTENT_RES),
+    ("process", _PROCESS_INTENT_RES),
+    ("causal", _CAUSAL_INTENT_RES),
+    ("classify", _CLASSIFY_INTENT_RES),
+    ("features", _FEATURES_INTENT_RES),
+)
+
+
+def classify_intent(question: object) -> tuple[str, ...]:
+    """Interrogative frames detected in the question (sorted tuple).
+
+    Multi-intent: a question may carry several frames (e.g. "stages of
+    the water cycle" is both ``process`` and ``cycle``). An empty tuple
+    means a general question with no specific frame. Deterministic.
+    """
+    text = _norm(question)
+    if not text:
+        return ()
+    # _CYCLE_RES lives with the structure extractors below; looked up at
+    # call time so definition order does not matter.
+    table = list(_INTENT_TABLE) + [("cycle", _CYCLE_RES)]
+    found = [name for name, pats in table
+             if any(rx.search(text) for rx in pats)]
+    return tuple(sorted(found))
+
+
+def _intent_tag(intents: tuple[str, ...]) -> str:
+    return "+".join(intents) if intents else "general"
 
 
 # ---------------------------------------------------------------------------
@@ -394,13 +875,52 @@ _ORDINALS_EN = ("first", "second", "third", "fourth", "fifth", "sixth",
 _ORDINALS_HI = ("पहला", "दूसरा", "तीसरा", "चौथा", "पाँचवाँ", "पांचवां",
                 "छठा", "सातवाँ", "आठवाँ")
 
+# Sides are noun phrases: they never span sentence ends (?!), bullet
+# markers, or newlines. Without this guard a short side ("Y?") forces
+# the lazy group past the sentence end into the explanation, minting
+# garbage sides ("Y? • Apples are red"). Periods stay allowed inside
+# ("St. Louis"); the lookahead still ends sides at sentence stops.
+_CMP_SIDE = r"[^?!•▪·\n]"
 _CMP_RES = (
-    re.compile(r"differences?\s+between\s+(.+?)\s+and\s+(.+?)"
-               r"(?=[.,;:?!]|$)", re.IGNORECASE),
-    re.compile(r"(.{3,60}?)\s+(?:vs\.?|v/s|versus)\s+(.{3,60}?)"
-               r"(?=[.,;:?!]|$)", re.IGNORECASE),
-    re.compile(r"(.{2,40}?)\s+और\s+(.{2,40}?)\s+में\s+अंतर"),
+    re.compile(r"differences?\s+between\s+(%s+?)\s+and\s+(%s+?)"
+               r"(?=[.,;:?!]|$)" % (_CMP_SIDE, _CMP_SIDE),
+               re.IGNORECASE),
+    re.compile(r"(%s{3,60}?)\s+(?:vs\.?|v/s|versus)\s+(%s{3,60}?)"
+               r"(?=[.,;:?!]|$)" % (_CMP_SIDE, _CMP_SIDE),
+               re.IGNORECASE),
+    re.compile(r"(%s{2,40}?)\s+और\s+(%s{2,40}?)\s+में\s+अंतर"
+               r"(?![\u0900-\u097F])" % (_CMP_SIDE, _CMP_SIDE)),
+    re.compile(r"(%s{2,40}?)\s+और\s+(%s{2,40}?)\s+के\s+बीच\s+"
+               r"(?:क्या\s+)?(?:अंतर|तुलना)(?![\u0900-\u097F])"
+               % (_CMP_SIDE, _CMP_SIDE)),
+    re.compile(r"(%s{3,60}?)\s+different\s+from\s+(%s{3,60}?)"
+               r"(?=[.,;:?!]|$)" % (_CMP_SIDE, _CMP_SIDE),
+               re.IGNORECASE),
+    re.compile(r"compar\w*\s+(%s{3,50}?)\s+with\s+(%s{3,50}?)"
+               r"(?=[.,;:?!]|$)" % (_CMP_SIDE, _CMP_SIDE),
+               re.IGNORECASE),
+    # Hinglish (roman): X aur Y [mein/men] [kya/ka] antar; X aur Y
+    # ki tulna. Word-boundaried so antarrashtriya/tulnatmak never
+    # match; sides still need attributed bullets downstream.
+    re.compile(r"(%s{2,40}?)\s+aur\s+(%s{2,40}?)\s+"
+               r"(?:(?:mein|men)\s+)?(?:kya\s+|ka\s+)?antar\b"
+               % (_CMP_SIDE, _CMP_SIDE), re.IGNORECASE),
+    re.compile(r"(%s{2,40}?)\s+aur\s+(%s{2,40}?)\s+ki\s+tulna\b"
+               % (_CMP_SIDE, _CMP_SIDE), re.IGNORECASE),
+    re.compile(r"compar\w*\s+(?:karo\s+)?(%s{3,40}?)\s+(?:and|aur)\s+"
+               r"(%s{3,40}?)(?=[.,;:?!]|$)" % (_CMP_SIDE, _CMP_SIDE),
+               re.IGNORECASE),
 )
+
+_LEAD_QW_RE = re.compile(
+    r"^(how\s+(is|are|was|were|does|do|can)|what\s+(is|are|was|were)|"
+    r"why\s+(is|are)|is|are|was|were|the)\s+", re.IGNORECASE)
+
+
+def _strip_lead(value: str) -> str:
+    """Drop a leading interrogative ("How is X" -> "X")."""
+    cleaned = _LEAD_QW_RE.sub("", value.strip()).strip()
+    return cleaned or value.strip()
 
 _CAUSE_LABELS = {
     "causes": ("causes", "reasons", "कारण"),
@@ -409,15 +929,23 @@ _CAUSE_LABELS = {
 }
 
 _CYCLE_RES = (
-    re.compile(r"\bcycl\w*\b", re.IGNORECASE),
-    re.compile(r"चक्र"),
+    # "cycle/cycles/cyclic/cyclical" only: bare "cycl*" also matched
+    # "cyclone/cyclonic", which are not cycles.
+    re.compile(r"\bcycl(?:e|es|ic|ical)?\b", re.IGNORECASE),
+    re.compile(r"(?<![%s])चक्र(?![%s])" % (_DEVA, _DEVA)),
 )
 
 _CLASSIFY_RES = (
     re.compile(r"(?:types?|kinds?)\s+of\s+([^:;.\n?]{3,60})"
-               r"(?::\s*([^.\n]{3,200}))?", re.IGNORECASE),
+               r"(?::(?!\s*[\u2022\-*])\s*([^.\n]{3,200}))?",
+               re.IGNORECASE),
     re.compile(r"([^:;.\n?]{3,60}?)\s*के\s+प्रकार"
-               r"(?:\s*[:：]\s*([^.\n]{3,200}))?"),
+               r"(?:\s*[:：](?!\s*[\u2022\-*])\s*([^.\n]{3,200}))?"),
+    # Hinglish (roman): "Rocks ke types/prakar". Space-delimited ke
+    # keeps words like "milke"/"like" safe; items still need the 3+
+    # bar downstream.
+    re.compile(r"([^:;.\n?]{3,40}?)\s+ke\s+types?\b", re.IGNORECASE),
+    re.compile(r"([^:;.\n?]{3,40}?)\s+ke\s+prakar\b", re.IGNORECASE),
 )
 
 _CONCEPT_RES = (
@@ -442,13 +970,34 @@ def _clean_item(text: str, limit: int = MAX_ITEM_CHARS) -> str:
     return textstyle.clean_label(text, limit)
 
 
+# Scan window for bullet/numbered collection: every consumer caps at
+# 4-8 items or applies a small threshold, so scanning past this many raw
+# markers can only burn time, never change a threshold gate (all gates
+# stay exact: a true count above the window still saturates above every
+# threshold). Generous headroom over any realistic explanation.
+_BULLET_SCAN_WINDOW = 256
+
+
 def _numbered_items(raw: str) -> list[str]:
-    return [_clean_item(m.group(1)) for m in _NUMBERED_RE.finditer(raw)]
+    items = []
+    for index, match in enumerate(_NUMBERED_RE.finditer(raw)):
+        if index >= _BULLET_SCAN_WINDOW:
+            break
+        item = _clean_item(match.group(1))
+        if item:
+            items.append(item)
+    return items
 
 
 def _bullets(raw: str) -> list[str]:
-    return [_clean_item(m.group(1)) for m in _BULLET_RE.finditer(raw)
-            if _clean_item(m.group(1))]
+    items = []
+    for index, match in enumerate(_BULLET_RE.finditer(raw)):
+        if index >= _BULLET_SCAN_WINDOW:
+            break
+        item = _clean_item(match.group(1))
+        if item:
+            items.append(item)
+    return items
 
 
 def _ordinal_steps(text: str) -> list[str]:
@@ -456,11 +1005,10 @@ def _ordinal_steps(text: str) -> list[str]:
     marks: list[tuple[int, int, int]] = []  # (order, start, end)
     lowered = text.lower()
     for i, word in enumerate(_ORDINALS_EN):
-        for m in re.finditer(r"\b" + word + r"\b", lowered, flags=re.ASCII):
+        for m in _en_rx(word).finditer(lowered):
             marks.append((i, m.start(), m.end()))
     for i, word in enumerate(_ORDINALS_HI):
-        for m in re.finditer(r"(?<![%s])%s(?![%s])" % (_DEVA, re.escape(word),
-                                                      _DEVA), text):
+        for m in _hi_rx(word).finditer(text):
             marks.append((i + 100, m.start(), m.end()))
     marks.sort(key=lambda t: t[1])
     ordered = [m for m in marks if m[0] < 100]
@@ -537,7 +1085,7 @@ def _timeline_payload(raw: str, norm: str) -> Optional[dict]:
         label = ""
         for line in lines:
             if str(year) in line:
-                label = _clean_item(re.sub(r"\b%d\b" % year, "", line))
+                label = _clean_item(_year_rx(year).sub("", line))
                 break
         events.append({"year": year, "label": label or str(year)})
     payload: dict = {"events": events}
@@ -565,12 +1113,62 @@ def _steps_type(subject: Optional[str], norm: str) -> str:
     return VisualType.FLOWCHART.value
 
 
+# Function words carry no reference: a side-word like "are" (from a
+# "differences between A and B are small" bleed) must never attribute
+# a bullet to that side. Casefold-compared (covers EN + roman HI).
+_SIDE_STOPWORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been",
+    "being", "am", "do", "does", "did", "have", "has", "had", "of",
+    "in", "on", "at", "to", "for", "with", "from", "by", "as", "and",
+    "or", "but", "it", "its", "this", "that", "these", "those",
+    "both", "each", "than", "then", "so", "such", "no", "not", "very",
+    "more", "most", "are", "can", "will", "would", "should",
+    "hai", "hain", "ho", "hoga", "hote", "hoti", "hota", "tha",
+    "thi", "they", "ka", "ki", "ke", "ko", "se", "mein", "men",
+    "par", "per", "aur", "ya", "kya", "jo", "woh", "wo", "ye",
+    "yeh", "vah", "ve", "kaun", "ne", "bhi", "hi", "na", "to", "toh",
+})
+
+
+def _side_patterns(side: str, skip: frozenset = frozenset()) -> list:
+    """Word-level mention matchers for one comparison side.
+
+    A side like "Chilika lake" is mentioned by any of its words
+    ("Chilika ..."), not only by the full string -- bullets use bare
+    names. Words with 3+ characters match case-insensitively on
+    script-aware boundaries; shorter words (abbreviations like "UP",
+    single letters like "X") match case-sensitively so "up"/"next"
+    never count as mentions. Punctuation-only tokens, stopwords,
+    and `skip` words (shared by both sides -- they cannot tell the
+    sides apart) are skipped.
+    """
+    patterns = []
+    for word in re.split(r"\s+", side):
+        if not re.search(r"\w", word):
+            continue
+        folded = word.casefold()
+        if folded in _SIDE_STOPWORDS or folded in skip:
+            continue
+        # Script-aware boundaries: plain \b fails Devanagari words
+        # ending in vowel signs (ा is a mark, not a \w char), so
+        # guard with word-chars + the whole Devanagari block.
+        rx = (r"(?<![\w%s])%s(?![\w%s])"
+              % (_DEVA, re.escape(word), _DEVA))
+        if len(word) >= 3:
+            patterns.append(re.compile(rx, re.IGNORECASE))
+        else:
+            patterns.append(re.compile(rx))
+    return patterns
+
+
 def _comparison_payload(norm: str, raw: str) -> Optional[dict]:
     left = right = ""
     for pattern in _CMP_RES:
         for match in pattern.finditer(norm):
-            cand_left = _clean_item(match.group(1), 60).strip("\"' ")
-            cand_right = _clean_item(match.group(2), 60).strip("\"' ")
+            cand_left = _strip_lead(
+                _clean_item(match.group(1), 60).strip("\"' "))
+            cand_right = _strip_lead(
+                _clean_item(match.group(2), 60).strip("\"' "))
             if cand_left and cand_right and cand_left != cand_right:
                 left, right = cand_left, cand_right
                 break
@@ -582,16 +1180,27 @@ def _comparison_payload(norm: str, raw: str) -> Optional[dict]:
     if len(bullets) < COMPARISON_MIN_BULLETS:
         return None
     left_pts, right_pts, common = [], [], []
+    # Words shared by both sides ("Sabha" in "Lok Sabha"/"Rajya
+    # Sabha") match every bullet, so they are excluded: only
+    # discriminating words can attribute a point to one side.
+    left_words = {w.casefold() for w in re.split(r"\s+", left)}
+    right_words = {w.casefold() for w in re.split(r"\s+", right)}
+    shared = frozenset(left_words & right_words)
+    left_pats = _side_patterns(left, shared)
+    right_pats = _side_patterns(right, shared)
     for bullet in bullets:
-        folded = bullet.casefold()
-        in_left = left.casefold() in folded
-        in_right = right.casefold() in folded
+        in_left = any(p.search(bullet) for p in left_pats)
+        in_right = any(p.search(bullet) for p in right_pats)
         if in_left and not in_right:
             left_pts.append(bullet)
         elif in_right and not in_left:
             right_pts.append(bullet)
         else:
             common.append(bullet)
+    if not left_pts and not right_pts:
+        # No point is attributed to either side: a sided comparison
+        # would be fiction, so yield to safer fallbacks (or None).
+        return None
     return {
         "left_title": left,
         "right_title": right,
@@ -610,7 +1219,8 @@ def _cause_effect_payload(raw: str) -> Optional[dict]:
     return {"causes": causes, "effects": effects}
 
 
-def _cycle_payload(norm: str, raw: str) -> Optional[dict]:
+def _cycle_payload(norm: str, raw: str,
+                   intents: tuple[str, ...]) -> Optional[dict]:
     if not any(rx.search(norm) for rx in _CYCLE_RES):
         return None
     stages = _numbered_items(raw)
@@ -622,6 +1232,11 @@ def _cycle_payload(norm: str, raw: str) -> Optional[dict]:
             for chunk in sections["stages"]:
                 stages.extend(_split_list(chunk))
     if len(stages) < 3:
+        # Bare bullets are weak cycle evidence: they count only when the
+        # question itself asks about the cycle (not about features of
+        # something merely cycle-named).
+        if "cycle" not in intents or "features" in intents:
+            return None
         stages = _bullets(raw)
     if len(stages) < 3:
         return None
@@ -632,11 +1247,19 @@ def _classification_payload(norm: str, raw: str) -> Optional[dict]:
     root = ""
     inline_items: list[str] = []
     for pattern in _CLASSIFY_RES:
-        match = pattern.search(norm)
-        if match:
-            root = _clean_item(match.group(1), 60)
+        for match in pattern.finditer(norm):
+            candidate = _clean_item(match.group(1), 60)
+            items: list[str] = []
             if match.lastindex == 2 and match.group(2):
-                inline_items = _split_list(match.group(2))
+                items = _split_list(match.group(2))
+            if not root:
+                root = candidate
+            if items:
+                # An explicit "X: a, b, c" pair is self-describing:
+                # it wins over a bare earlier "types of Y".
+                root, inline_items = candidate, items
+                break
+        if inline_items:
             break
     bullets = _bullets(raw)
     groups: list[dict] = []
@@ -664,13 +1287,19 @@ def _mind_payload(raw: str) -> Optional[dict]:
     for line in raw.splitlines():
         top = _TOP_BULLET_RE.match(line)
         if top:
+            if len(branches) >= MAX_BRANCHES:
+                # This and all later lines can only extend branches
+                # the [:MAX_BRANCHES] slice drops anyway.
+                break
             current = {"name": _clean_item(top.group(2), 60), "children": []}
             branches.append(current)
             continue
         sub = _SUB_BULLET_RE.match(line)
         if sub and current is not None:
+            if len(current["children"]) >= MAX_BRANCH_CHILDREN:
+                continue
             item = _clean_item(sub.group(1))
-            if item and len(current["children"]) < MAX_BRANCH_CHILDREN:
+            if item:
                 current["children"].append(item)
     branches = branches[:MAX_BRANCHES]
     children = sum(len(b["children"]) for b in branches)
@@ -679,7 +1308,8 @@ def _mind_payload(raw: str) -> Optional[dict]:
     return {"branches": branches}
 
 
-def _concept_payload(norm: str, raw: str, question: str) -> Optional[dict]:
+def _concept_construction(norm: str) -> Optional[dict]:
+    """Explicit "X comprises/includes A, B, C" hub statement, if viable."""
     for pattern in _CONCEPT_RES:
         for match in pattern.finditer(norm):
             center = _clean_item(match.group(1), 60)
@@ -687,6 +1317,18 @@ def _concept_payload(norm: str, raw: str, question: str) -> Optional[dict]:
             if len(satellites) >= CONCEPT_MIN_ITEMS:
                 return {"center": center,
                         "satellites": satellites[:MAX_SATELLITES]}
+    return None
+
+
+def _concept_payload(norm: str, raw: str, question: str,
+                     skip_bullet_fallback: bool = False
+                     ) -> Optional[dict]:
+    construction = _concept_construction(norm)
+    if construction:
+        return construction
+    if skip_bullet_fallback:
+        # A more specific panels reading already fired for these items.
+        return None
     bullets = _bullets(raw)
     if not CONCEPT_MIN_ITEMS <= len(bullets) <= CONCEPT_MAX_BULLETS:
         return None
@@ -701,6 +1343,208 @@ def _infographic_payload(raw: str, explanation: str) -> Optional[dict]:
     if len(bullets) < INFOGRAPHIC_MIN_BULLETS:
         return None
     return {"points": bullets[:MAX_POINTS]}
+
+
+_TOP_ITEM_RE = re.compile(
+    r"^[ ]{0,1}(?:[•▪·\-*+]|\d{1,2}[.)])\s+(.+?)\s*$")
+
+
+def _flat_items(raw: str) -> list[str]:
+    """Top-level bullets/numbered items (indent of at most one space)."""
+    items = []
+    scanned = 0
+    for line in raw.splitlines():
+        match = _TOP_ITEM_RE.match(line)
+        if match:
+            if scanned >= _BULLET_SCAN_WINDOW:
+                break
+            scanned += 1
+            item = _clean_item(match.group(1))
+            if item:
+                items.append(item)
+    return items
+
+
+def _has_sub_bullets(raw: str) -> bool:
+    return any(_SUB_BULLET_RE.match(line) for line in raw.splitlines())
+
+
+_FEATURE_LABELS = (
+    "features", "feature", "characteristics", "characteristic",
+    "measures", "measure", "provisions", "provision",
+    "functions", "function", "dimensions", "dimension",
+    "aspects", "aspect", "विशेषताएँ", "विशेषताएं", "विशेषता",
+    "लक्षण", "उपाय", "प्रावधान", "आयाम",
+)
+
+
+def _features_frame(intents: tuple[str, ...], raw: str) -> bool:
+    """True when the text asks for features/measures-type content.
+
+    Either the question carries the ``features`` interrogative frame or
+    the structure text has an explicit features-style labelled section
+    ("Features:", "उपाय:", ...).
+    """
+    if "features" in intents:
+        return True
+    sections = _labeled_sections(raw, {"features": _FEATURE_LABELS})
+    return bool(sections["features"])
+
+
+def _panels_payload(raw: str, norm: str,
+                    intents: tuple[str, ...]) -> Optional[dict]:
+    """2x2 panels evidence: exactly four flat items + a features frame.
+
+    Yields to an explicit "X comprises ..." hub statement (a hub
+    reading is more faithful there) and never fires for nested lists
+    (those belong to mind_map).
+    """
+    if "recall" in intents:
+        return None
+    if _has_sub_bullets(raw):
+        return None
+    items = _flat_items(raw)
+    if len(items) != PANELS_COUNT:
+        return None
+    if not _features_frame(intents, raw):
+        return None
+    if _concept_construction(norm) is not None:
+        return None
+    return {"panels": [{"text": item} for item in items]}
+
+
+_MECHANISM_ROLES: dict[str, tuple[str, ...]] = {
+    "source": ("source", "input", "origin", "स्रोत"),
+    "delivery": ("delivery", "carrier", "vector", "medium", "वाहक",
+                "माध्यम"),
+    "target": ("target", "destination", "site", "लक्ष्य"),
+    "action": ("action", "process", "reaction", "interaction", "क्रिया",
+              "अभिक्रिया"),
+    "result": ("result", "output", "outcome", "effect", "परिणाम",
+              "प्रभाव"),
+}
+
+
+def _mechanism_role_pattern() -> "re.Pattern[str]":
+    variant_to_key: dict[str, str] = {}
+    for key, variants in _MECHANISM_ROLES.items():
+        for variant in variants:
+            variant_to_key[variant.lower()] = key
+    ordered = sorted(variant_to_key, key=len, reverse=True)
+    return re.compile(
+        r"^(?:[•▪·\-*+]\s+|\d{1,2}[.)]\s+)?(%s)\s*[:：]\s*(.+?)\s*$"
+        % "|".join(re.escape(v) for v in ordered), re.IGNORECASE)
+
+
+def _mechanism_segments(raw: str) -> list[dict]:
+    """Ordered mechanism stages from the author's own text.
+
+    Role-labelled lines first ("Source: ...", bare or numbered or
+    bulleted), else plain numbered items, else plain top-level bullets.
+    Order is always the text order; roles are only the labels the text
+    itself uses. No stage or role is ever invented.
+    """
+    role_rx = _mechanism_role_pattern()
+    variant_to_key: dict[str, str] = {}
+    for key, variants in _MECHANISM_ROLES.items():
+        for variant in variants:
+            variant_to_key[variant.lower()] = key
+    role_lines = []
+    for line in raw.splitlines():
+        match = role_rx.match(line.strip())
+        if match:
+            label = _clean_item(match.group(2))
+            if label:
+                role_lines.append({
+                    "label": label,
+                    "role": variant_to_key[match.group(1).lower()],
+                    "role_text": match.group(1).strip(),
+                })
+    if len(role_lines) >= MECHANISM_MIN_STAGES:
+        return role_lines[:MAX_STEPS]
+    numbered = _numbered_items(raw)
+    if len(numbered) >= MECHANISM_MIN_STAGES:
+        return [{"label": label, "role": None, "role_text": ""}
+                for label in numbered[:MAX_STEPS]]
+    flat = _flat_items(raw)
+    if len(flat) >= MECHANISM_MIN_STAGES:
+        return [{"label": label, "role": None, "role_text": ""}
+                for label in flat[:MAX_STEPS]]
+    return []
+
+
+def _mechanism_payload(raw: str,
+                       intents: tuple[str, ...]) -> Optional[dict]:
+    """Mechanism evidence: >=3 explicit ordered stages plus either a
+    mechanism interrogative frame or >=2 distinct author-given roles."""
+    segments = _mechanism_segments(raw)
+    if len(segments) < MECHANISM_MIN_STAGES:
+        return None
+    roles = {seg["role"] for seg in segments if seg["role"]}
+    if "mechanism" not in intents and len(roles) < 2:
+        return None
+    return {"stages": segments}
+
+
+_SPATIAL_RES = (
+    re.compile(r"\bvia\b", re.IGNORECASE),
+    re.compile(r"\broute\b", re.IGNORECASE),
+    re.compile(r"\bflows?\s+from\b", re.IGNORECASE),
+    re.compile(r"\bpass(?:es|ed)?\s+through\b", re.IGNORECASE),
+    re.compile(r"\bjoins?\b", re.IGNORECASE),
+    re.compile(r"\bruns?\s+(from|through|to)\b", re.IGNORECASE),
+    re.compile(r"\bconnects?\b", re.IGNORECASE),
+    re.compile(r"\breaches?\b", re.IGNORECASE),
+    re.compile(r"\bfrom\b.{0,60}\bto\b", re.IGNORECASE),
+    re.compile(r"मार्ग"),
+    re.compile(r"होकर"),
+    re.compile(r"बहती"),
+    re.compile(r"बहता"),
+    re.compile(r"मिलती"),
+    re.compile(r"मिलता"),
+    re.compile(r"जोड़ता"),
+    re.compile(r"जोड़ती"),
+    re.compile(r"से\s+.+\s+तक"),
+)
+
+
+def _chain_links(text: str) -> list[dict]:
+    """Ordered distinct places, or [] without movement phrasing."""
+    if not any(rx.search(text) for rx in _SPATIAL_RES):
+        return []
+    links = []
+    seen: set[str] = set()
+    for place in _ordered_places(text):
+        if place["id"] not in seen:
+            seen.add(place["id"])
+            links.append(place)
+    return links
+
+
+def _chain_payload(raw: str, expl_text: str) -> Optional[dict]:
+    """Route-chain evidence: >=3 distinct curated places in mention
+    order plus spatial-movement phrasing. No coordinates are involved:
+    the chain order is the author's own mention order. The
+    explanation's order wins when it independently evidences the
+    chain (endpoint summaries in the question must not scramble the
+    solution's route order); otherwise question+explanation order.
+    """
+    links = _chain_links(expl_text)
+    if len(links) < CHAIN_MIN_LINKS:
+        links = _chain_links(raw)
+    if len(links) < CHAIN_MIN_LINKS:
+        return None
+    payload: dict = {"links": [_place_payload(p)
+                               for p in links[:MAX_LINKS]]}
+    if len(links) > MAX_LINKS:
+        payload["shown_of"] = [MAX_LINKS, len(links)]
+    return payload
+
+
+def _route_covers(routes: list[dict], link_ids: list[str]) -> bool:
+    """True when a sourced route connects every chain link."""
+    wanted = set(link_ids)
+    return any(wanted <= set(r.get("place_ids", [])) for r in routes)
 
 
 # ---------------------------------------------------------------------------
@@ -733,17 +1577,33 @@ def _title_for(question: str, subject: Optional[str]) -> str:
 def decide_visual(question: object,
                   options: tuple = (),
                   explanation: object = "",
-                  subject_hint: Optional[str] = None) -> Optional[VisualSpec]:
+                  subject_hint: Optional[str] = None,
+                  correct_answer: object = "") -> Optional[VisualSpec]:
     """Decide the single best visual for a solution, or None.
 
-    `options` are used only for subject detection -- never for visual
-    content. Deterministic: identical inputs always yield an identical
-    spec (or identical None).
+    The decision is driven by the question's interrogative intent plus
+    structural evidence in the explanation (steps, bullets, years,
+    labelled sections, ordered place mentions). `options` are used
+    only for subject detection and `correct_answer` only to focus a
+    map on the answered place -- neither ever contributes visual
+    content or initiates a visual on its own. Deterministic:
+    identical inputs always yield an identical spec (or identical
+    None).
     """
     question_text = _norm(question)
     expl_text = _norm(explanation)
     raw = "%s\n%s" % (question or "", explanation or "")
     norm = "%s %s" % (question_text, expl_text)
+
+    intents = classify_intent(question_text)
+    if "assertion" in intents:
+        # Assertion/matching questions hold unevaluated claims, so only
+        # the authoritative explanation may supply structure evidence.
+        struct_raw = str(explanation or "")
+        struct_norm = expl_text
+    else:
+        struct_raw = raw
+        struct_norm = norm
 
     subjects = load_subjects()["subjects"]
     valid_ids = {entry["id"] for entry in subjects}
@@ -760,64 +1620,177 @@ def decide_visual(question: object,
     q_places = find_places(question_text)
     places = q_places or find_places(expl_text)
     usable = usable_places(places)
+    located_q = _is_location_question(question_text)
+    route_ask = "route" in intents
+    relation_ask = _is_relation_question(question_text)
+    set_ask = _is_set_question(question_text)
+    if (set_ask or relation_ask) and q_places and len(usable) < 2:
+        # Set/relation asks are about a collection: when the question
+        # names only part of it, the explanation may supply the other
+        # NAMED members (never invented ones). Where-asks and the
+        # content-set rule stay question-scoped.
+        have = {p["id"] for p in q_places}
+        extra = [p for p in find_places(expl_text) if p["id"] not in have]
+        usable = usable_places(q_places + extra)
+    recall_block = (
+        "recall" in intents
+        and not located_q
+        and not _has_location_phrasing(expl_text)
+    )
+    # Question-requirement gate: a place mention alone never earns a
+    # map. The question must ask something spatial (location, route,
+    # or relation -- each with answerable evidence), ask to enumerate
+    # a geo-framed set of 2+ places, or the content must present 3+
+    # places (the same 3+ bar every structure gate uses). Route
+    # geometry resolves before the gate so a single-place route ask
+    # maps only when drawable geometry actually exists.
+    shown = usable[:MAX_PLACES]
+    base_id = select_base(shown) if shown else ""
+    map_routes: list[dict] = []
+    if shown:
+        base_bbox = load_base_maps()["bases"][base_id]["bbox"]
+        for route in find_routes(question_text + "\n" + expl_text):
+            verts = route["vertices"]
+            inside = sum(1 for lon, lat in verts
+                         if point_in_bbox(lon, lat, base_bbox))
+            if inside >= 2:
+                map_routes.append(route)
+    geo_framed = subject in MAP_SUBJECTS or subject is None
+    ask_ok = (
+        located_q
+        or (relation_ask and len(usable) >= 2)
+        or (route_ask and (len(usable) >= 2 or map_routes))
+    )
     map_allowed = (
         bool(usable)
         and not _is_extent_question(question_text)
-        and (subject in MAP_SUBJECTS or subject is None
-             or _is_location_question(question_text))
+        and not recall_block
+        and (ask_ok
+             or (set_ask and geo_framed and len(usable) >= 2)
+             or (geo_framed and len(usable) >= 3))
     )
     if map_allowed:
         assert usable  # for type-checkers; guaranteed by map_allowed
-        shown = usable[:MAX_PLACES]
         payload: dict = {
-            "base": shown[0]["region"],
+            "base": base_id,
             "places": [_place_payload(p) for p in shown],
+            "routes": [{"id": r["id"], "name_en": r["name_en"],
+                        "name_hi": r.get("name_hi", ""),
+                        "vertices": [[lon, lat] for lon, lat in
+                                     r["vertices"]]}
+                       for r in map_routes],
         }
         notes: list[str] = []
         if len(usable) > MAX_PLACES:
             notes.append("showing %d of %d places"
                          % (MAX_PLACES, len(usable)))
+        focus: Optional[str] = None
+        usable_ids = {p["id"] for p in usable}
+        for place in usable_places(find_places(str(correct_answer or ""))):
+            if place["id"] in usable_ids:
+                focus = place["id"]
+                break
+        payload["focus"] = focus
         visual = (VisualType.REGIONAL_MAP.value if len(usable) >= 2
                   else VisualType.LOCATION_MAP.value)
-        return VisualSpec(visual_type=visual, subject=subject,
-                          title=_title_for(question_text, subject),
-                          payload=payload, notes=tuple(notes))
+        map_spec: Optional[VisualSpec] = VisualSpec(
+            visual_type=visual, subject=subject,
+            title=_title_for(question_text, subject),
+            payload=payload, notes=tuple(notes),
+            evidence=("intent=%s" % _intent_tag(intents),
+                      "places=%d" % len(usable),
+                      "focus=%s" % (focus or "none"))
+            + ((("routes=%d" % len(map_routes),)
+                if map_routes else ())))
+    else:
+        map_spec = None
 
     # -- structure visuals (content-derived) ---------------------------
-    if len(norm.strip()) < MIN_STRUCTURE_CHARS:
-        return None
+    if len(struct_norm.strip()) < MIN_STRUCTURE_CHARS:
+        return map_spec
 
     candidates: dict[str, dict] = {}
-    timeline = _timeline_payload(raw, norm)
+    bits: dict[str, str] = {}
+    timeline = _timeline_payload(struct_raw, struct_norm)
     if timeline:
         candidates[VisualType.TIMELINE.value] = timeline
-    steps = _steps_payload(raw, norm)
-    if steps:
-        candidates[_steps_type(subject, norm)] = steps
-    comparison = _comparison_payload(norm, raw)
+        bits[VisualType.TIMELINE.value] = "years=%d" % len(
+            timeline["events"])
+    wants_flow = not ("features" in intents
+                      and "process" not in intents
+                      and "mechanism" not in intents)
+    if wants_flow:
+        steps = _steps_payload(struct_raw, struct_norm)
+        if steps:
+            steps_type = _steps_type(subject, struct_norm)
+            candidates[steps_type] = steps
+            bits[steps_type] = "steps=%d" % len(steps["steps"])
+    mechanism = _mechanism_payload(struct_raw, intents)
+    if mechanism:
+        candidates[VisualType.MECHANISM.value] = mechanism
+        roles = {s["role"] for s in mechanism["stages"] if s["role"]}
+        bits[VisualType.MECHANISM.value] = "stages=%d/roles=%d" % (
+            len(mechanism["stages"]), len(roles))
+    comparison = _comparison_payload(struct_norm, struct_raw)
     if comparison:
         candidates[VisualType.COMPARISON.value] = comparison
-    cause_effect = _cause_effect_payload(raw)
+        bits[VisualType.COMPARISON.value] = "sides=2/points=%d" % (
+            len(comparison["left_points"])
+            + len(comparison["right_points"]) + len(comparison["common"]))
+    cause_effect = _cause_effect_payload(struct_raw)
     if cause_effect:
         candidates[VisualType.CAUSE_EFFECT.value] = cause_effect
-    cycle = _cycle_payload(norm, raw)
+        bits[VisualType.CAUSE_EFFECT.value] = "causes=%d/effects=%d" % (
+            len(cause_effect["causes"]), len(cause_effect["effects"]))
+    cycle = _cycle_payload(struct_norm, struct_raw, intents)
     if cycle:
         candidates[VisualType.CYCLE.value] = cycle
-    classification = _classification_payload(norm, raw)
+        bits[VisualType.CYCLE.value] = "stages=%d" % len(cycle["stages"])
+    classification = _classification_payload(struct_norm, struct_raw)
     if classification:
         candidates[VisualType.CLASSIFICATION.value] = classification
-    mind = _mind_payload(raw)
-    if mind:
-        candidates[VisualType.MIND_MAP.value] = mind
-    concept = _concept_payload(norm, raw, question_text)
-    if concept:
-        candidates[VisualType.CONCEPT_MAP.value] = concept
-    infographic = _infographic_payload(raw, str(explanation or ""))
-    if infographic:
-        candidates[VisualType.INFOGRAPHIC.value] = infographic
+        if classification.get("groups"):
+            bits[VisualType.CLASSIFICATION.value] = "groups=%d" % len(
+                classification["groups"])
+        else:
+            bits[VisualType.CLASSIFICATION.value] = "items=%d" % len(
+                classification["items"])
+    chain = _chain_payload(struct_raw, expl_text)
+    if chain:
+        candidates[VisualType.SPATIAL_CHAIN.value] = chain
+        bits[VisualType.SPATIAL_CHAIN.value] = "links=%d" % len(
+            chain["links"])
+    panels = _panels_payload(struct_raw, struct_norm, intents)
+    if panels:
+        candidates[VisualType.PANELS.value] = panels
+        bits[VisualType.PANELS.value] = "panels=%d" % len(
+            panels["panels"])
+    if "recall" not in intents:
+        mind = _mind_payload(struct_raw)
+        if mind:
+            candidates[VisualType.MIND_MAP.value] = mind
+            bits[VisualType.MIND_MAP.value] = "branches=%d/children=%d" % (
+                len(mind["branches"]),
+                sum(len(b["children"]) for b in mind["branches"]))
+        concept = _concept_payload(struct_norm, struct_raw, question_text,
+                                   skip_bullet_fallback=panels is not None)
+        if concept:
+            candidates[VisualType.CONCEPT_MAP.value] = concept
+            if _concept_construction(struct_norm) is not None:
+                bits[VisualType.CONCEPT_MAP.value] = "satellites=%d" % len(
+                    concept["satellites"])
+            else:
+                bits[VisualType.CONCEPT_MAP.value] = "bullets=%d" % len(
+                    concept["satellites"])
+        infographic = _infographic_payload(struct_raw,
+                                           str(explanation or ""))
+        if infographic:
+            candidates[VisualType.INFOGRAPHIC.value] = infographic
+            bits[VisualType.INFOGRAPHIC.value] = "points=%d" % len(
+                infographic["points"])
 
     if not candidates:
-        return None
+        return map_spec
     preferred: list[str] = []
     if subject:
         for entry in subjects:
@@ -830,26 +1803,51 @@ def decide_visual(question: object,
               if t not in preferred and t not in FALLBACK_TYPES
               and t in SUPPORTED_TYPES]
     order += [t for t in FALLBACK_TYPES if t in SUPPORTED_TYPES]
-    for visual_type in order:
+    matched = [t for t in order
+               if t in candidates and t not in FALLBACK_TYPES
+               and _TYPE_INTENTS.get(t, set()) & set(intents)]
+    pool = matched or [t for t in order if t in candidates]
+    for visual_type in pool:
         if visual_type in candidates:
-            return VisualSpec(
+            struct_spec = VisualSpec(
                 visual_type=visual_type, subject=subject,
                 title=_title_for(question_text, subject),
-                payload=candidates[visual_type], notes=())
-    return None
+                payload=candidates[visual_type], notes=(),
+                evidence=("intent=%s" % _intent_tag(intents),
+                          bits[visual_type]))
+            if map_spec is not None and not (
+                    set(intents) & STRUCTURE_OVERRIDE_FRAMES):
+                if (visual_type == VisualType.SPATIAL_CHAIN.value
+                        and "route" in intents
+                        and "location" not in intents
+                        and chain is not None
+                        and not _route_covers(
+                            map_routes,
+                            [link["id"] for link in chain["links"]])):
+                    # A route ask wants the ordered journey: dots on a
+                    # map cannot show it, so the chain wins -- unless
+                    # the question is an explicit where-ask or a
+                    # sourced route covers the same links (then the
+                    # map draws the real geometry).
+                    return struct_spec
+                return map_spec
+            return struct_spec
+    return map_spec
 
 
 def safe_decide_visual(question: object,
                        options: tuple = (),
                        explanation: object = "",
-                       subject_hint: Optional[str] = None
+                       subject_hint: Optional[str] = None,
+                       correct_answer: object = ""
                        ) -> Optional[VisualSpec]:
     """Wrapper that never raises: returns None on any internal error.
 
     Future PDF wiring must use this so visuals stay strictly optional.
     """
     try:
-        return decide_visual(question, options, explanation, subject_hint)
+        return decide_visual(question, options, explanation, subject_hint,
+                             correct_answer)
     except Exception:
         logger.exception("Visual decision failed; continuing without visual")
         return None

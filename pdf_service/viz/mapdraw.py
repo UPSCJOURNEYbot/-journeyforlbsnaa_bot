@@ -9,11 +9,11 @@ a coarse teaching sketch is never mistaken for a survey map.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Optional
 
 from ..render import BRAND
 from . import textstyle
-from .engine import load_base_maps
+from .engine import load_base_maps, point_in_bbox
 
 NAVY = (20, 40, 90)
 INK = (30, 30, 30)
@@ -21,6 +21,7 @@ MUTED = (110, 110, 110)
 GRID = (214, 218, 224)
 LAND_FILL = (233, 238, 245)
 MARKER = (178, 34, 34)
+ROUTE = (0, 102, 153)
 
 MIN_MAP_W = 45.0
 MIN_MAP_H = 32.0
@@ -28,6 +29,7 @@ PAD = 2.0
 CAPTION_H = 6.0
 
 KIND_LABELS = {
+    "country": "Country",
     "city": "City",
     "river": "River",
     "mountain": "Peak",
@@ -170,6 +172,97 @@ def _place_labels(pdf: Any, markers: list[tuple[float, float]],
     return placed
 
 
+def _clip_segment(ax: float, ay: float, bx: float, by: float,
+                  bbox: list) -> Optional[tuple]:
+    """Liang-Barsky clip of AB to the bbox (lon/lat space).
+
+    Returns the inside portion as ((x1, y1), (x2, y2)) or None when
+    the segment lies fully outside. Deterministic pure arithmetic.
+    """
+    x0, y0, x1, y1 = bbox
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        if point_in_bbox(ax, ay, bbox):
+            return ((ax, ay), (ax, ay))
+        return None
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, ax - x0), (dx, x1 - ax),
+                 (-dy, ay - y0), (dy, y1 - ay)):
+        if p == 0:
+            if q < 0:
+                return None
+        else:
+            r = q / p
+            if p < 0:
+                t0 = max(t0, r)
+            else:
+                t1 = min(t1, r)
+            if t0 > t1:
+                return None
+    return ((ax + t0 * dx, ay + t0 * dy),
+            (ax + t1 * dx, ay + t1 * dy))
+
+
+def _clip_runs(verts: list, bbox: list) -> list[list[tuple]]:
+    """Clipped drawing runs for a vertex chain (standard map crop).
+
+    A chain exiting and re-entering yields several runs; runs
+    shorter than two distinct points are dropped (nothing to draw).
+    """
+    def flush(run):
+        if len({(round(x, 9), round(y, 9)) for x, y in run}) >= 2:
+            runs.append(run)
+
+    runs: list[list[tuple]] = []
+    current: list[tuple] = []
+    for (ax, ay), (bx, by) in zip(verts, verts[1:]):
+        kept = _clip_segment(ax, ay, bx, by, bbox)
+        if kept is None:
+            flush(current)
+            current = []
+            continue
+        (cx, cy), (dx, dy) = kept
+        if current and point_in_bbox(ax, ay, bbox):
+            # Genuine joint inside the frame: chain (the clipped
+            # start equals the joint exactly).
+            current.append((dx, dy))
+        else:
+            # Re-entry after outside stretch: new run (never chord
+            # across the outside bulge).
+            flush(current)
+            current = [(cx, cy), (dx, dy)]
+    flush(current)
+    return runs
+
+
+def _draw_routes(pdf: Any, routes: list[dict], bbox: list,
+                 box: tuple) -> None:
+    """Sourced route polylines clipped to the frame, with dots only
+    at true termini inside the frame (a river leaving the map simply
+    ends at the edge, the standard atlas crop; routes with fewer
+    than two vertices inside are skipped as stubs).
+    """
+    for route in routes or []:
+        verts = route.get("vertices", [])
+        if len(verts) < 2:
+            continue
+        inside = sum(1 for lon, lat in verts
+                     if point_in_bbox(lon, lat, bbox))
+        if inside < 2:
+            continue
+        pdf.set_draw_color(*ROUTE)
+        pdf.set_line_width(0.7)
+        for run in _clip_runs(verts, bbox):
+            pts = [project(lon, lat, bbox, box) for lon, lat in run]
+            for start, end in zip(pts, pts[1:]):
+                pdf.line(start[0], start[1], end[0], end[1])
+        pdf.set_fill_color(*ROUTE)
+        for lon, lat in (verts[0], verts[-1]):
+            if point_in_bbox(lon, lat, bbox):
+                cx, cy = project(lon, lat, bbox, box)
+                pdf.ellipse(cx - 1.2, cy - 1.2, 2.4, 2.4, style="F")
+
+
 def _draw_markers(pdf: Any, places: list[dict], bbox: list,
                   box: tuple) -> None:
     markers = [project(p["lon"], p["lat"], bbox, box) for p in places]
@@ -237,7 +330,8 @@ def _draw_north_arrow(pdf: Any, box: tuple) -> None:
 
 def draw_map(pdf: Any, *, base_id: str, places: list[dict],
              rect: tuple[float, float, float, float],
-             title: str = "") -> None:
+             title: str = "",
+             routes: Optional[list[dict]] = None) -> None:
     """Draw a bordered locator map inside `rect` = (x, y, w, h) in mm.
 
     Raises ValueError for an unknown base id or a rect smaller than the
@@ -255,6 +349,7 @@ def draw_map(pdf: Any, *, base_id: str, places: list[dict],
     box = _fitted_box(bbox, inner)
     _draw_graticule(pdf, base, bbox, box)
     _draw_land(pdf, base, bbox, box)
+    _draw_routes(pdf, routes or [], bbox, box)
     if places:
         _draw_markers(pdf, places, bbox, box)
     _draw_scale_bar(pdf, bbox, box)

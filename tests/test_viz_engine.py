@@ -96,7 +96,7 @@ class DataLayerCases(unittest.TestCase):
         self.assertEqual(set(viz.SUPPORTED_TYPES),
                          set(engine.ALL_TYPES) - {"historical_map",
                                                   "labelled_diagram"})
-        self.assertEqual(len(viz.SUPPORTED_TYPES), 12)
+        self.assertEqual(len(viz.SUPPORTED_TYPES), 15)
         union = set()
         for entry in viz.load_subjects()["subjects"]:
             union.update(entry["preferred"])
@@ -112,7 +112,7 @@ class DataLayerCases(unittest.TestCase):
         ids = [p["id"] for p in places]
         self.assertEqual(len(ids), len(set(ids)))
         kinds = {"city", "river", "mountain", "lake", "monument",
-                 "battlefield", "landmark"}
+                 "battlefield", "landmark", "country"}
         for place in places:
             self.assertTrue(place["name_en"])
             self.assertTrue(place["name_hi"])
@@ -124,11 +124,12 @@ class DataLayerCases(unittest.TestCase):
 
     def test_places_match_region_base_or_flagged(self):
         bases = viz.load_base_maps()["bases"]
-        self.assertNotIn("world", bases, "no world base in milestone 1")
+        # Milestone B: india + world + africa bases, every place inside
+        # its own region bbox (a region without a base would stay
+        # unmapped -- see test_usable_requires_base).
+        self.assertEqual(set(bases), {"india", "world", "africa"})
         for place in viz.load_places()["places"]:
-            base = bases.get(place["region"])
-            if base is None:
-                continue  # accuracy rule: never mapped (tested elsewhere)
+            base = bases[place["region"]]
             self.assertTrue(engine.point_in_bbox(place["lon"], place["lat"],
                                                  base["bbox"]),
                             "%s outside its region bbox" % place["id"])
@@ -290,11 +291,16 @@ class PlaceCases(unittest.TestCase):
     def test_usable_requires_base(self):
         london = viz.find_places("Where is London?")
         self.assertEqual([p["id"] for p in london], ["london"])
-        self.assertEqual(viz.usable_places(london), [],
-                         "world has no base map -> never mapped")
+        # Milestone B ships the world base, so London is mappable.
+        self.assertEqual([p["id"] for p in viz.usable_places(london)],
+                         ["london"])
         delhi = viz.find_places("Delhi")
         self.assertEqual([p["id"] for p in viz.usable_places(delhi)],
                          ["delhi"])
+        # ... while a region without a base stays unmappable.
+        self.assertEqual(viz.usable_places(
+            [{"id": "x", "region": "atlantis", "lon": 0.0, "lat": 0.0}]),
+            [])
 
 
 class DecideMapCases(unittest.TestCase):
@@ -318,8 +324,16 @@ class DecideMapCases(unittest.TestCase):
         self.assertIsNone(viz.decide_visual(
             "Where is the city of Xyzabc located?"))
 
-    def test_no_base_no_visual(self):
-        self.assertIsNone(viz.decide_visual("Where is London?"))
+    def test_world_base_maps_london(self):
+        # Milestone B: the world base exists, so London earns an
+        # honest locator map (the no-base rule itself is pinned by
+        # test_usable_requires_base with a synthetic region).
+        spec = viz.decide_visual("Where is London?")
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.visual_type, "location_map")
+        self.assertEqual(spec.payload["base"], "world")
+        self.assertEqual([p["id"] for p in spec.payload["places"]],
+                         ["london"])
 
     def test_extent_question_no_map(self):
         self.assertIsNone(viz.decide_visual(

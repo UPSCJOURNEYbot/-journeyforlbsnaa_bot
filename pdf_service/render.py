@@ -122,6 +122,12 @@ def answer_letters(correct: object, option_count: int) -> str:
 # ── Phase 4 M2: professional series setup (optional, lenient) ─────────
 _SETUP_IMAGE_MAX_BYTES = 6 * 1024 * 1024
 _SETUP_IMAGE_MAX_PX = 800
+# Pre-decode pixel cap (header-only check): a small file can still describe
+# a gigapixel image, and full-decoding it would spike RAM (a 117 KB
+# 6000x6000 PNG costs ~275 MB transient). 16 MP is far beyond any logo or
+# watermark need (both downscale to <= 800 px) while keeping the worst
+# transient under ~100 MB.
+_SETUP_IMAGE_MAX_MP = 16_000_000
 
 
 def _setup_str(value: object, limit: int) -> str:
@@ -168,6 +174,10 @@ def _setup_image(value: object, *, wash: bool = False):
         from PIL import Image
 
         img = Image.open(BytesIO(raw))
+        width, height = img.size  # header only: no pixels decoded yet
+        if (width <= 0 or height <= 0
+                or width * height > _SETUP_IMAGE_MAX_MP):
+            return None
         img.load()
         img = img.convert("RGB")
         img.thumbnail((_SETUP_IMAGE_MAX_PX, _SETUP_IMAGE_MAX_PX))
@@ -207,6 +217,7 @@ class _SeriesSetup:
         self.candidate_fields: list[str] = []
         self.answer_key = True
         self.solutions = True
+        self.answer_sheet = False
         self.visuals = "auto"
         self.marks_correct = 2.0
         self.marks_negative = -0.66
@@ -235,6 +246,8 @@ class _SeriesSetup:
             self.answer_key = ak if isinstance(ak, bool) else True
             so = data.get("solutions", True)
             self.solutions = so if isinstance(so, bool) else True
+            sh = data.get("answer_sheet", False)
+            self.answer_sheet = sh if isinstance(sh, bool) else False
             vi = data.get("visuals", "auto")
             self.visuals = vi if vi in ("auto", "yes", "no") else "auto"
             self.marks_correct = _setup_float(data.get("marks_correct"),
@@ -444,10 +457,16 @@ def _maybe_solution_visual(doc: _Doc, question: dict,
         from pdf_service.viz import engine as viz_engine
         from pdf_service.viz import mapdraw, templates
 
+        opts = list(question.get("options", []) or [])
+        answer_id = question.get("correct_option_id", -1)
+        correct = (opts[answer_id]
+                   if isinstance(answer_id, int)
+                   and 0 <= answer_id < len(opts) else "")
         spec = viz_engine.safe_decide_visual(
             question.get("question", ""),
-            tuple(question.get("options", []) or []),
-            question.get("explanation", ""))
+            tuple(opts),
+            question.get("explanation", ""),
+            correct_answer=correct)
         if spec is None:
             return
         pdf = doc.pdf
@@ -463,7 +482,8 @@ def _maybe_solution_visual(doc: _Doc, question: dict,
         if is_map:
             mapdraw.draw_map(pdf, base_id=spec.payload["base"],
                              places=spec.payload["places"], rect=rect,
-                             title=spec.title)
+                             title=spec.title,
+                             routes=spec.payload.get("routes", []))
         else:
             templates.draw_diagram(pdf, spec, rect)
         pdf.set_xy(pdf.l_margin, top + height + 3)
@@ -738,6 +758,92 @@ def _detailed_solutions(doc: _Doc, questions: list[dict],
         pdf.ln(2)
 
 
+def _answer_sheet(doc: _Doc, questions: list[dict],
+                  setup: _SeriesSetup) -> None:
+    """Detachable candidate bubble sheet (studio `answer_sheet` only).
+
+    Prints the series identity (test/booklet/subject) plus candidate
+    write-in boxes, then one bubble row per question with exactly as many
+    circles as the question has options. Rows are drawn at explicit
+    coordinates in two columns, so a row can never straddle a page break;
+    circles are stroke-only outlines -- the sheet leaks no answers.
+    """
+    pdf = doc.pdf
+    doc.heading("Answer Sheet", size=14)
+    id_bits = []
+    if setup.test_number:
+        id_bits.append(f"Test No: {setup.test_number}")
+    if setup.booklet_display:
+        id_bits.append(f"Booklet: {setup.booklet_display}")
+    if setup.subject:
+        id_bits.append(f"Subject: {setup.subject}")
+    if id_bits:
+        pdf.set_font("hind", "B", 10)
+        pdf.multi_cell(0, 5.4, "    ".join(id_bits),
+                       new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+        pdf.ln(1)
+    fields = setup.candidate_fields or ["Candidate Name", "Roll Number",
+                                        "Date"]
+    for label in fields[:7]:
+        pdf.set_font("hind", "", 10)
+        short = label[:28]
+        pdf.cell(56, 7, short + ":", new_x=doc._XPos.RIGHT,
+                 new_y=doc._YPos.TOP)
+        pdf.rect(pdf.get_x(), pdf.get_y() + 0.4, 72, 6.2)
+        pdf.ln(7)
+    pdf.ln(1)
+    pdf.set_font("hind", "", 9)
+    for line in ("• Darken exactly one circle per question with a black or "
+                 "blue pen.",
+                 "• Do not tick, cross, or stray outside the circle.",
+                 "• Rough work elsewhere — this sheet is evaluated as-is."):
+        pdf.multi_cell(0, 4.8, line, new_x=doc._XPos.LMARGIN,
+                       new_y=doc._YPos.NEXT)
+    pdf.ln(2)
+    usable = pdf.w - pdf.l_margin - pdf.r_margin
+    col_w = usable / 2
+    row_h = 7.0
+    idx = 0
+    total = len(questions)
+    last_y = pdf.get_y()
+    first_page = True
+    while idx < total:
+        if not first_page:
+            pdf.add_page()
+        first_page = False
+        y_top = pdf.get_y()
+        per_col = max(1, int((pdf.page_break_trigger - y_top) // row_h))
+        rows_drawn = 0
+        for col in range(2):
+            if idx >= total:
+                break
+            x0 = pdf.l_margin + col * col_w
+            col_rows = 0
+            for _ in range(per_col):
+                if idx >= total:
+                    break
+                n_opts = len(questions[idx].get("options", []) or [])
+                pitch = min(6.2, (col_w - 15) / max(n_opts, 1))
+                diam = max(2.0, min(4.6, pitch - 0.8))
+                y = y_top + col_rows * row_h
+                pdf.set_xy(x0, y)
+                pdf.set_font("hind", "B", 10)
+                pdf.cell(14, row_h, f"Q{idx + 1}")
+                cx = x0 + 14
+                cy = y + (row_h - diam) / 2
+                for k in range(n_opts):
+                    pdf.ellipse(cx, cy, diam, diam, style="D")
+                    pdf.set_xy(cx, cy)
+                    pdf.set_font("hind", "", 7 if diam < 3.5 else 8)
+                    pdf.cell(diam, diam, chr(65 + k), align="C")
+                    cx += pitch
+                idx += 1
+                col_rows += 1
+            rows_drawn = max(rows_drawn, col_rows)
+        last_y = y_top + rows_drawn * row_h
+    pdf.set_xy(pdf.l_margin, min(last_y + 2, pdf.page_break_trigger))
+
+
 def render_testseries_pdf(
     questions: list[dict],
     *,
@@ -781,6 +887,9 @@ def render_testseries_pdf(
         if progress_cb is not None and (i % 25 == 0 or i == total):
             progress_cb(i, total)
     if not inline:
+        if setup.answer_sheet:
+            doc.pdf.add_page()
+            _answer_sheet(doc, questions, setup)
         if setup.answer_key:
             doc.pdf.add_page()
             _answer_key_grid(doc, questions)
@@ -789,6 +898,9 @@ def render_testseries_pdf(
             if not setup.answer_key:
                 doc.pdf.add_page()
             _detailed_solutions(doc, questions, setup.visuals)
+    elif setup.answer_sheet:
+        doc.pdf.add_page()
+        _answer_sheet(doc, questions, setup)
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
