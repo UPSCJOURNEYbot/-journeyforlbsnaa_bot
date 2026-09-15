@@ -7,6 +7,7 @@ pins for every derived number.
 
 from __future__ import annotations
 
+import ast
 import json
 import unittest
 from pathlib import Path
@@ -97,8 +98,13 @@ class SelectBaseCases(unittest.TestCase):
 
 
 class RoutesFileCases(unittest.TestCase):
-    def test_shipped_file_is_empty_but_valid(self):
-        self.assertEqual(viz.load_routes(), {"routes": []})
+    def test_shipped_file_has_nine_rivers(self):
+        # Milestone C populated the data-gated routes file (empty in B).
+        routes = viz.load_routes()["routes"]
+        self.assertEqual(
+            sorted(r["id"] for r in routes),
+            ["brahmaputra", "ganga", "godavari", "indus", "kaveri",
+             "krishna", "narmada", "tapi", "yamuna"])
 
     def test_map_payload_always_has_routes_key(self):
         spec = decide("Where is London?")
@@ -210,6 +216,7 @@ class FakePDF:
     def __init__(self):
         self.calls: list[tuple] = []
         self.color: tuple = (0, 0, 0)
+        self.fill: tuple = (255, 255, 255)
 
     def _rec(self, name, *args):
         self.calls.append((name, args))
@@ -219,6 +226,7 @@ class FakePDF:
         self._rec("draw", *a)
 
     def set_fill_color(self, *a):
+        self.fill = tuple(a)
         self._rec("fill", *a)
 
     def set_text_color(self, *a):
@@ -243,7 +251,7 @@ class FakePDF:
         self._rec("polygon", len(a[0]))
 
     def ellipse(self, *a, **k):
-        self._rec("ellipse", *a)
+        self._rec("ellipse", *(self.fill + tuple(a)))
 
     def line(self, *a):
         self._rec("line", *(self.color + tuple(a)))
@@ -411,9 +419,12 @@ class OfflineCases(unittest.TestCase):
                 self.assertNotIn(token, src, name)
 
     def test_builder_is_stdlib_only(self):
-        import ast
-        tree = ast.parse((VIZ_DIR / "tools" / "build_geo.py").read_text(
-            encoding="utf-8"))
+        for tool in ("build_geo.py", "build_routes.py"):
+            tree = ast.parse((VIZ_DIR / "tools" / tool).read_text(
+                encoding="utf-8"))
+            self._assert_stdlib(tree, tool)
+
+    def _assert_stdlib(self, tree, tool):
         # pdf_service = first-party local import (validator reuse);
         # everything else must be stdlib (no network, no third party).
         allowed = {"__future__", "argparse", "io", "json", "math",
@@ -422,11 +433,11 @@ class OfflineCases(unittest.TestCase):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     self.assertIn(alias.name.split(".")[0], allowed,
-                                  alias.name)
+                                  "%s:%s" % (tool, alias.name))
             elif isinstance(node, ast.ImportFrom):
                 self.assertTrue(
                     (node.module or "").split(".")[0] in allowed
-                    or node.level > 0, node.module)
+                    or node.level > 0, "%s:%s" % (tool, node.module))
 
 
 if __name__ == "__main__":

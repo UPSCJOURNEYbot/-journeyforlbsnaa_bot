@@ -8,8 +8,11 @@ The engine is intentionally conservative (accuracy-first):
   uses the smallest base map containing every shown place.
 * Routes are drawn only from sourced vertex geometry: every route
   entry needs a provenance note, dataset place references, and
-  vertices inside a mappable base. Route questions without a sourced
-  route keep the ordered place chain instead of invented lines.
+  vertices inside a mappable base. A route attaches when at least
+  two of its vertices fall inside the chosen base and is then drawn
+  clipped to the map frame (standard atlas crop); route questions
+  without a drawable sourced route keep the ordered place chain
+  instead of invented lines.
 * Diagram templates only re-structure text already present in the
   question/explanation (steps, bullets, years, labelled sections).
   They never assert facts of their own, and quiz *options* are never
@@ -1390,8 +1393,9 @@ def decide_visual(question: object,
         base_bbox = load_base_maps()["bases"][base_id]["bbox"]
         for route in find_routes(question_text + "\n" + expl_text):
             verts = route["vertices"]
-            if all(point_in_bbox(lon, lat, base_bbox)
-                   for lon, lat in verts):
+            inside = sum(1 for lon, lat in verts
+                         if point_in_bbox(lon, lat, base_bbox))
+            if inside >= 2:
                 map_routes.append(route)
         payload: dict = {
             "base": base_id,

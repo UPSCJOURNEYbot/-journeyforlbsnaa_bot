@@ -172,26 +172,95 @@ def _place_labels(pdf: Any, markers: list[tuple[float, float]],
     return placed
 
 
+def _clip_segment(ax: float, ay: float, bx: float, by: float,
+                  bbox: list) -> Optional[tuple]:
+    """Liang-Barsky clip of AB to the bbox (lon/lat space).
+
+    Returns the inside portion as ((x1, y1), (x2, y2)) or None when
+    the segment lies fully outside. Deterministic pure arithmetic.
+    """
+    x0, y0, x1, y1 = bbox
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        if point_in_bbox(ax, ay, bbox):
+            return ((ax, ay), (ax, ay))
+        return None
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, ax - x0), (dx, x1 - ax),
+                 (-dy, ay - y0), (dy, y1 - ay)):
+        if p == 0:
+            if q < 0:
+                return None
+        else:
+            r = q / p
+            if p < 0:
+                t0 = max(t0, r)
+            else:
+                t1 = min(t1, r)
+            if t0 > t1:
+                return None
+    return ((ax + t0 * dx, ay + t0 * dy),
+            (ax + t1 * dx, ay + t1 * dy))
+
+
+def _clip_runs(verts: list, bbox: list) -> list[list[tuple]]:
+    """Clipped drawing runs for a vertex chain (standard map crop).
+
+    A chain exiting and re-entering yields several runs; runs
+    shorter than two distinct points are dropped (nothing to draw).
+    """
+    def flush(run):
+        if len({(round(x, 9), round(y, 9)) for x, y in run}) >= 2:
+            runs.append(run)
+
+    runs: list[list[tuple]] = []
+    current: list[tuple] = []
+    for (ax, ay), (bx, by) in zip(verts, verts[1:]):
+        kept = _clip_segment(ax, ay, bx, by, bbox)
+        if kept is None:
+            flush(current)
+            current = []
+            continue
+        (cx, cy), (dx, dy) = kept
+        if current and point_in_bbox(ax, ay, bbox):
+            # Genuine joint inside the frame: chain (the clipped
+            # start equals the joint exactly).
+            current.append((dx, dy))
+        else:
+            # Re-entry after outside stretch: new run (never chord
+            # across the outside bulge).
+            flush(current)
+            current = [(cx, cy), (dx, dy)]
+    flush(current)
+    return runs
+
+
 def _draw_routes(pdf: Any, routes: list[dict], bbox: list,
                  box: tuple) -> None:
-    """Sourced route polylines with endpoint dots.
-
-    A route is drawn only whole: any vertex outside the base bbox
-    skips the route rather than drawing a partial (dishonest) line.
+    """Sourced route polylines clipped to the frame, with dots only
+    at true termini inside the frame (a river leaving the map simply
+    ends at the edge, the standard atlas crop; routes with fewer
+    than two vertices inside are skipped as stubs).
     """
     for route in routes or []:
         verts = route.get("vertices", [])
-        if len(verts) < 2 or not all(
-                point_in_bbox(lon, lat, bbox) for lon, lat in verts):
+        if len(verts) < 2:
             continue
-        pts = [project(lon, lat, bbox, box) for lon, lat in verts]
+        inside = sum(1 for lon, lat in verts
+                     if point_in_bbox(lon, lat, bbox))
+        if inside < 2:
+            continue
         pdf.set_draw_color(*ROUTE)
         pdf.set_line_width(0.7)
-        for start, end in zip(pts, pts[1:]):
-            pdf.line(start[0], start[1], end[0], end[1])
+        for run in _clip_runs(verts, bbox):
+            pts = [project(lon, lat, bbox, box) for lon, lat in run]
+            for start, end in zip(pts, pts[1:]):
+                pdf.line(start[0], start[1], end[0], end[1])
         pdf.set_fill_color(*ROUTE)
-        for cx, cy in (pts[0], pts[-1]):
-            pdf.ellipse(cx - 1.2, cy - 1.2, 2.4, 2.4, style="F")
+        for lon, lat in (verts[0], verts[-1]):
+            if point_in_bbox(lon, lat, bbox):
+                cx, cy = project(lon, lat, bbox, box)
+                pdf.ellipse(cx - 1.2, cy - 1.2, 2.4, 2.4, style="F")
 
 
 def _draw_markers(pdf: Any, places: list[dict], bbox: list,
