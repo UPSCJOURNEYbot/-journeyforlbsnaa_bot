@@ -101,6 +101,24 @@ GENERIC_ORDER = (
 # mere "there are bullets" fallback.
 FALLBACK_TYPES = ("mind_map", "concept_map", "panels", "infographic")
 
+# Rule 13: the interrogative intent each explicit structure type answers
+# natively. When the question carries such an intent AND a matching
+# candidate exists, matching candidates race among themselves before the
+# static order (a timeline answers a chronology ask better than a
+# same-text route chain). Fallback types never match: they stay last by
+# design. mind_map is absent: nested bullets answer any frame.
+_TYPE_INTENTS = {
+    "timeline": {"chronology"},
+    "comparison": {"comparison"},
+    "cause_effect": {"causal"},
+    "cycle": {"cycle"},
+    "process": {"process"},
+    "flowchart": {"process"},
+    "classification": {"classify"},
+    "mechanism": {"mechanism"},
+    "spatial_chain": {"route"},
+}
+
 # Question frames that ask for an explicit structure. When such a frame
 # is present AND structure evidence exists, the structure visual answers
 # the question better than a topic map, so it wins over maps ("what are
@@ -616,6 +634,9 @@ _CHRONOLOGY_RES = (
     re.compile(r"\boccurred?\s+first\b", re.IGNORECASE),
     re.compile(r"कालानुक्रम"),
     re.compile(r"कालक्रम"),
+    re.compile(r"घटनाक्रम"),
+    re.compile(r"सही\s+क्रम"),
+    re.compile(r"क्रम\s+में\s+(?:लग|व्यवस्थित|सजा)"),
 )
 
 _PROCESS_INTENT_RES = (
@@ -1538,7 +1559,11 @@ def decide_visual(question: object,
               if t not in preferred and t not in FALLBACK_TYPES
               and t in SUPPORTED_TYPES]
     order += [t for t in FALLBACK_TYPES if t in SUPPORTED_TYPES]
-    for visual_type in order:
+    matched = [t for t in order
+               if t in candidates and t not in FALLBACK_TYPES
+               and _TYPE_INTENTS.get(t, set()) & set(intents)]
+    pool = matched or [t for t in order if t in candidates]
+    for visual_type in pool:
         if visual_type in candidates:
             struct_spec = VisualSpec(
                 visual_type=visual_type, subject=subject,
