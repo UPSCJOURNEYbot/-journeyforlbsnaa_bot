@@ -1130,6 +1130,41 @@ class ArchitectureTests(unittest.TestCase):
             "pdf_service/fonts/NotoColorEmoji-LICENSE-OFL.txt",
             "tests/test_phase1_create_import.py",
             "tests/test_phase1_result_pdf.py",
+            # Phase 2 milestones A-F + corrections + Rule-13 adversarial
+            # + remaining-work audit (PR #28): viz engine, test-series
+            # renderer/wizard/parsers and their suites (testseries
+            # handler paths already listed above).
+            "pdf_service/render.py",
+            "pdf_service/viz/__init__.py",
+            "pdf_service/viz/engine.py",
+            "pdf_service/viz/geo_base.json",
+            "pdf_service/viz/geo_places.json",
+            "pdf_service/viz/geo_routes.json",
+            "pdf_service/viz/mapdraw.py",
+            "pdf_service/viz/subjects.json",
+            "pdf_service/viz/templates.py",
+            "pdf_service/viz/textstyle.py",
+            "pdf_service/viz/tools/build_geo.py",
+            "pdf_service/viz/tools/build_routes.py",
+            "tests/m3_seeds.py",
+            "tests/test_phase2_adversarial_viz.py",
+            "tests/test_phase2_correction_question_first.py",
+            "tests/test_phase2_milestone_a.py",
+            "tests/test_phase2_milestone_b.py",
+            "tests/test_phase2_milestone_c.py",
+            "tests/test_phase2_milestone_d.py",
+            "tests/test_phase2_milestone_e.py",
+            "tests/test_phase2_milestone_f.py",
+            "tests/test_phase2_verification_master.py",
+            "tests/test_testseries_answersheet.py",
+            "tests/test_testseries_create.py",
+            "tests/test_testseries_matrix.py",
+            "tests/test_testseries_pagesafety.py",
+            "tests/test_testseries_parser_fixes.py",
+            "tests/test_testseries_security.py",
+            "tests/test_viz_engine.py",
+            "tests/test_viz_integration.py",
+            "tests/test_viz_m3.py",
         }
         for path in changed:
             self.assertIn(path, allowed, f"unexpected change: {path}")
