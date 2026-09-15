@@ -1118,6 +1118,18 @@ class ArchitectureTests(unittest.TestCase):
             "tests/test_deploy_health_gate.py",
             "tests/test_part3_aiquiz_schedule.py",
             "tests/test_telegram_crypto_fallback.py",
+            # Phase-1 (PR #27): canonical MCQ parser, creator import
+            # handlers, Indic ActualText patch/audit, bundled emoji font
+            # and Phase-1 suites (other Phase-1 paths already listed above).
+            "quizbot/creator_bot/handlers/quiz_creation.py",
+            "quizbot/creator_bot/handlers/quiz_editing.py",
+            "quizbot/creator_bot/parsing.py",
+            "quizbot/runner_bot/wp_indic_compat.py",
+            "quizbot/runner_bot/wp_indic_tounicode.py",
+            "pdf_service/fonts/NotoColorEmoji.subset.ttf",
+            "pdf_service/fonts/NotoColorEmoji-LICENSE-OFL.txt",
+            "tests/test_phase1_create_import.py",
+            "tests/test_phase1_result_pdf.py",
         }
         for path in changed:
             self.assertIn(path, allowed, f"unexpected change: {path}")
