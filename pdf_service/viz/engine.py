@@ -793,9 +793,10 @@ _CYCLE_RES = (
 
 _CLASSIFY_RES = (
     re.compile(r"(?:types?|kinds?)\s+of\s+([^:;.\n?]{3,60})"
-               r"(?::\s*([^.\n]{3,200}))?", re.IGNORECASE),
+               r"(?::(?!\s*[\u2022\-*])\s*([^.\n]{3,200}))?",
+               re.IGNORECASE),
     re.compile(r"([^:;.\n?]{3,60}?)\s*के\s+प्रकार"
-               r"(?:\s*[:：]\s*([^.\n]{3,200}))?"),
+               r"(?:\s*[:：](?!\s*[\u2022\-*])\s*([^.\n]{3,200}))?"),
 )
 
 _CONCEPT_RES = (
@@ -1018,11 +1019,19 @@ def _classification_payload(norm: str, raw: str) -> Optional[dict]:
     root = ""
     inline_items: list[str] = []
     for pattern in _CLASSIFY_RES:
-        match = pattern.search(norm)
-        if match:
-            root = _clean_item(match.group(1), 60)
+        for match in pattern.finditer(norm):
+            candidate = _clean_item(match.group(1), 60)
+            items: list[str] = []
             if match.lastindex == 2 and match.group(2):
-                inline_items = _split_list(match.group(2))
+                items = _split_list(match.group(2))
+            if not root:
+                root = candidate
+            if items:
+                # An explicit "X: a, b, c" pair is self-describing:
+                # it wins over a bare earlier "types of Y".
+                root, inline_items = candidate, items
+                break
+        if inline_items:
             break
     bullets = _bullets(raw)
     groups: list[dict] = []

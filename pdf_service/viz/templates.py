@@ -109,7 +109,8 @@ def layout_timeline(n: int, x: float, y: float, w: float
                              align="L" if right else "R"))
         elements.append(_box(cx - 8.0, yy + 1.0, 16.0, 5.0,
                              "__YEAR__%d" % i, size=6.5, bold=True,
-                             fill=NAVY, line=NAVY, color=WHITE))
+                             fill=NAVY, line=NAVY, color=WHITE,
+                             max_lines=1))
         dot_x = bx if right else bx + box_w
         elements.append(_dot((dot_x, yy + row_h / 2.0), 1.4))
         elements.append(_line((cx, yy + row_h / 2.0),
