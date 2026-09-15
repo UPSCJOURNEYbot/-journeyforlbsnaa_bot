@@ -74,6 +74,11 @@ EN_MATRIX = {
                   "Target: immune cells"),
     "spatial_chain": ("Trace the route from London to Tokyo.",
                       WORLD_ROUTE),
+    "three_d": ("Describe the 3D layers of the Earth's crust with depth profile and relief.",
+                "• Crust is the outermost solid layer.\n"
+                "• Mantle is the thick middle layer with depth.\n"
+                "• Outer core is liquid with high temperature.\n"
+                "• Inner core is solid with extreme pressure."),
 }
 
 HI_MATRIX = {
@@ -124,6 +129,11 @@ HI_MATRIX = {
     "spatial_chain": ("लंदन से बीजिंग तक का मार्ग बताइए।",
                       "यह मार्ग लंदन से शुरू होकर मॉस्को होकर "
                       "बीजिंग जाता है।"),
+    "three_d": ("पृथ्वी की परतों की 3D संरचना और गहराई प्रोफ़ाइल तथा उच्चावच बताइए।",
+                "• भूपर्पटी सबसे बाहरी ठोस परत है।\n"
+                "• मेंटल मध्य की मोटी परत है जिसमें गहराई है।\n"
+                "• बाहरी क्रोड तरल है और उच्च तापमान है।\n"
+                "• आंतरिक क्रोड ठोस है और अत्यधिक दबाव है।"),
 }
 
 HINGLISH = {
@@ -181,6 +191,7 @@ MAXIMAL = {
     "spatial_chain": {"links": [{"name_en": "Linktown %d" % i,
                                  "name_hi": "कड़ी %d" % i}
                                 for i in range(6)]},
+    "three_d": {"layers": [{"label": LONG % i} for i in range(6)]},
 }
 
 # Row gap absorbing text overhang per layout (0 = fits its own box).

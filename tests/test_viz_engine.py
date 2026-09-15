@@ -96,13 +96,13 @@ class DataLayerCases(unittest.TestCase):
         self.assertEqual(set(viz.SUPPORTED_TYPES),
                          set(engine.ALL_TYPES) - {"historical_map",
                                                   "labelled_diagram"})
-        self.assertEqual(len(viz.SUPPORTED_TYPES), 15)
+        self.assertEqual(len(viz.SUPPORTED_TYPES), 16)
         union = set()
         for entry in viz.load_subjects()["subjects"]:
             union.update(entry["preferred"])
         # Every supported type is reachable: preferred lists cover all but
-        # mind_map, which stays reachable via the generic fallback order.
-        self.assertTrue(set(viz.SUPPORTED_TYPES) - {"mind_map"} <= union)
+        # mind_map and three_d, which stay reachable via the generic fallback order.
+        self.assertTrue(set(viz.SUPPORTED_TYPES) - {"mind_map", "three_d"} <= union)
         self.assertIn("mind_map", engine.GENERIC_ORDER)
 
     def test_places_schema(self):

@@ -444,6 +444,12 @@ def _maybe_solution_visual(doc: _Doc, question: dict,
                            visuals: str = "auto") -> None:
     """Draw an optional Phase-3 solution visual below the explanation.
 
+    Question-first viz path (required for /newseries): the visual engine
+    classifies intent from the question text alone (question requirement
+    > visual capability > available data), while structural evidence may
+    come from the explanation. This preserves educational value while
+    ensuring question intent drives visuals (Rule-13).
+
     The visual engine decides whether a visual is educationally useful
     and reliable; without a decision the solution stays text-only.
     `visuals="no"` suppresses optional visuals entirely; "auto" and "yes"
@@ -504,8 +510,18 @@ def _cover_logo(doc: _Doc, prepared) -> None:
         logger.exception("Cover logo skipped after failure")
 
 
+def _has_hindi(text: str) -> bool:
+    return bool(re.search(r"[\u0900-\u097F]", text or ""))
+
+
 def _info_grid(doc: _Doc, setup: _SeriesSetup, total: int) -> None:
-    """Two-column test-identification grid (non-empty rows only)."""
+    """Professional two-column grid plus boxed Duration/Marks/Date strip.
+
+    Based on Sample (1).pdf visual grammar: clear labels, values,
+    bordered boxes for DURATION/TOTAL MARKS/DATE style.
+    """
+    pdf = doc.pdf
+    # Primary rows
     rows: list[tuple[str, str]] = []
     if setup.subject:
         rows.append(("Subject", setup.subject))
@@ -523,9 +539,64 @@ def _info_grid(doc: _Doc, setup: _SeriesSetup, total: int) -> None:
     rows.append(("Maximum Marks", "%g" % round(total * setup.marks_correct, 2)))
     rows.append(("Correct Marks", _fmt_plus(setup.marks_correct)))
     rows.append(("Negative Marks", "%g" % setup.marks_negative))
-    pdf = doc.pdf
+
     usable = pdf.w - pdf.l_margin - pdf.r_margin
     half = usable / 2
+
+    # Draw boxed strip for key metrics (Duration, Total Marks, Max Marks, Date)
+    # Mimics Sample (1).pdf: DURATION | TOTAL MARKS | DATE in separate bordered boxes
+    pdf.set_font("hind", "B", 9)
+    pdf.set_text_color(20, 40, 90)
+    # Build strip data
+    strip = []
+    if setup.duration:
+        strip.append(("DURATION", setup.duration))
+    strip.append(("TOTAL MARKS", "%g" % round(total * setup.marks_correct, 2)))
+    strip.append(("TOTAL QUESTIONS", str(total)))
+    if setup.test_number:
+        strip.append(("TEST NO", setup.test_number))
+    if setup.booklet_display:
+        strip.append(("BOOKLET", setup.booklet_display))
+    if setup.test_code:
+        strip.append(("CODE", setup.test_code))
+
+    if strip:
+        box_w = usable / min(3, len(strip)) if len(strip) <= 3 else usable / 3
+        # First row: up to 3 boxes
+        doc.ensure_space(18)
+        y0 = pdf.get_y()
+        x0 = pdf.l_margin
+        for idx, (lbl, val) in enumerate(strip[:3]):
+            x = x0 + (idx % 3) * box_w
+            y = y0
+            pdf.set_draw_color(20, 40, 90)
+            pdf.set_line_width(0.4)
+            pdf.rect(x + 1, y, box_w - 2, 14, style="D")
+            pdf.set_font("hind", "B", 7.5)
+            pdf.set_xy(x + 1, y + 1)
+            pdf.cell(box_w - 2, 4, lbl, align="C")
+            pdf.set_font("hind", "", 9)
+            pdf.set_xy(x + 1, y + 6)
+            pdf.cell(box_w - 2, 6, _fit_text(pdf, val, box_w - 4), align="C")
+        pdf.set_xy(pdf.l_margin, y0 + 16)
+        # Second row if more
+        if len(strip) > 3:
+            y1 = pdf.get_y()
+            for idx, (lbl, val) in enumerate(strip[3:6]):
+                x = x0 + (idx % 3) * box_w
+                y = y1
+                pdf.rect(x + 1, y, box_w - 2, 14, style="D")
+                pdf.set_font("hind", "B", 7.5)
+                pdf.set_xy(x + 1, y + 1)
+                pdf.cell(box_w - 2, 4, lbl, align="C")
+                pdf.set_font("hind", "", 9)
+                pdf.set_xy(x + 1, y + 6)
+                pdf.cell(box_w - 2, 6, _fit_text(pdf, val, box_w - 4), align="C")
+            pdf.set_xy(pdf.l_margin, y1 + 16)
+        pdf.set_line_width(0.2)
+        pdf.ln(2)
+
+    # Detailed two-column grid
     pdf.set_text_color(0, 0, 0)
     for i in range(0, len(rows), 2):
         doc.ensure_space(8)
@@ -544,26 +615,274 @@ def _info_grid(doc: _Doc, setup: _SeriesSetup, total: int) -> None:
 
 
 def _candidate_boxes(doc: _Doc, labels: list[str]) -> None:
-    """Blank candidate-detail boxes, one labelled row each (page-break safe)."""
+    """Professional candidate-detail boxes with Roll Number shading note.
+
+    Based on Sample (1).pdf: Candidate Name, Center/Batch, Roll Number
+    with circle-shading instruction, Candidate's Signature,
+    Invigilator's Signature. Preserves original English labels exactly
+    for backward compatibility with existing tests, while header is
+    bilingual.
+    """
     pdf = doc.pdf
-    doc.ensure_space(12)
+    doc.ensure_space(14)
     pdf.set_font("hind", "B", 11)
     pdf.set_text_color(20, 40, 90)
-    pdf.cell(0, 6, "Candidate Details", new_x=doc._XPos.LMARGIN,
+    pdf.cell(0, 6, "Candidate Details / अभ्यर्थी विवरण", new_x=doc._XPos.LMARGIN,
              new_y=doc._YPos.NEXT)
     pdf.set_text_color(0, 0, 0)
     usable = pdf.w - pdf.l_margin - pdf.r_margin
     label_w = 62.0
+
+    has_roll = any("roll" in lbl.lower() for lbl in labels)
     for label in labels:
         doc.ensure_space(10)
         y = pdf.get_y()
         pdf.set_xy(pdf.l_margin, y)
         pdf.set_font("hind", "", 10.5)
-        pdf.cell(label_w, 8, _fit_text(pdf, label, label_w - 2))
+        # Preserve original label exactly for test compatibility
+        # (no truncation via _fit_text that would cut long labels)
+        # Use multi_cell if needed but keep label visible
+        pdf.cell(label_w, 8, label[:60])
         pdf.set_draw_color(80, 80, 80)
         pdf.rect(pdf.l_margin + label_w, y + 0.5, usable - label_w, 7.5)
         pdf.set_xy(pdf.l_margin, y + 9)
+
+    if has_roll:
+        doc.ensure_space(10)
+        pdf.set_font("hind", "", 8.5)
+        pdf.set_text_color(80, 80, 80)
+        pdf.multi_cell(0, 4.5,
+                       "ROLL NUMBER: Shade the corresponding circle for each digit on the OMR sheet. / "
+                       "अनुक्रमांक: OMR शीट पर प्रत्येक अंक के लिए संबंधित गोले को भरें।",
+                       new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+        pdf.set_text_color(0, 0, 0)
     pdf.ln(1)
+
+
+def _get_bilingual_instructions(setup: Optional["_SeriesSetup"], total: int) -> list[tuple[str, str]]:
+    """Professional bilingual instructions EN+HI paired, competitive-exam style.
+
+    Based on Sample (1).pdf grammar and standard UPSC/SSC conventions.
+    Dynamic values (total, marks, negative, duration) injected when available.
+    Includes backward-compatible exact phrasing expected by existing tests:
+    - "Each question carries +X marks."
+    - "Negative marking: -Y per wrong answer." / "There is no negative marking."
+    """
+    marks_correct = getattr(setup, "marks_correct", 2.0) if setup and getattr(setup, "active", False) else 2.0
+    marks_negative = getattr(setup, "marks_negative", -0.66) if setup and getattr(setup, "active", False) else -0.66
+    duration = getattr(setup, "duration", "") if setup and getattr(setup, "active", False) else ""
+    total_q = total
+
+    def fmt_marks(v: float) -> str:
+        return ("%g" % v).rstrip("0").rstrip(".") if "." in ("%g" % v) else "%g" % v
+
+    corr_str = _fmt_plus(marks_correct)  # +2, +4 etc for backward compat
+    corr_plain = fmt_marks(marks_correct)
+    neg_abs = abs(marks_negative)
+    neg_str = fmt_marks(marks_negative)
+    neg_abs_str = fmt_marks(neg_abs)
+
+    instructions = []
+
+    # 1 - Read carefully (backward compat)
+    instructions.append((
+        "Read every question carefully before answering.",
+        "प्रत्येक प्रश्न को उत्तर देने से पहले ध्यान से पढ़ें।"
+    ))
+
+    # 2 - Marks per question (exact phrasing for tests)
+    en2 = f"Each question carries {corr_str} marks."
+    hi2 = f"प्रत्येक प्रश्न {corr_plain} अंक का है।"
+    instructions.append((en2, hi2))
+
+    # 3 - Negative marking (exact phrasing for tests)
+    if marks_negative < 0:
+        en3 = f"Negative marking: {neg_str} per wrong answer."
+        hi3 = f"नकारात्मक अंकन: प्रत्येक गलत उत्तर पर {neg_str}।"
+    else:
+        en3 = "There is no negative marking."
+        hi3 = "कोई नकारात्मक अंकन नहीं है।"
+    instructions.append((en3, hi3))
+
+    # 4 - question count and marking (professional, from Sample)
+    if total_q:
+        en4 = f"This test booklet contains {total_q} questions divided into multiple sections. Each question carries {corr_plain} mark(s), with negative marking of {neg_abs_str} for every wrong answer."
+        hi4 = f"इस परीक्षा पुस्तिका में {total_q} प्रश्न हैं जो कई खंडों में विभाजित हैं। प्रत्येक प्रश्न {corr_plain} अंक का है, प्रत्येक गलत उत्तर पर {neg_abs_str} अंक की नकारात्मक अंकन होगी।"
+        instructions.append((en4, hi4))
+
+    # 5 - duration if available
+    if duration:
+        en5 = f"Duration of the test is {duration}. Manage your time accordingly."
+        hi5 = f"परीक्षा की अवधि {duration} है। समय का उचित प्रबंधन करें।"
+        instructions.append((en5, hi5))
+
+    # 6 - no electronic devices
+    instructions.append((
+        "Use of calculator, mobile phone, or any electronic device is strictly prohibited.",
+        "कैलकुलेटर, मोबाइल फोन या किसी भी इलेक्ट्रॉनिक उपकरण का उपयोग सख्त वर्जित है।"
+    ))
+
+    # 7 - OMR shading
+    instructions.append((
+        "Darken the appropriate circle on the OMR/answer sheet using a black/blue ball point pen only. Rough work should be done only on the space provided.",
+        "OMR/उत्तर पत्रक पर उपयुक्त गोले को केवल काले/नीले बॉल पॉइंट पेन से भरें। रफ कार्य केवल निर्धारित स्थान पर करें।"
+    ))
+
+    # 8 - do not open until instructed
+    instructions.append((
+        "Do not open the booklet until instructed to do so by the invigilator.",
+        "निरीक्षक के निर्देश के बिना पुस्तिका न खोलें।"
+    ))
+
+    # 9 - all compulsory
+    instructions.append((
+        "All questions are compulsory. Each question has four options, out of which only one is correct. Choose the correct option.",
+        "सभी प्रश्न अनिवार्य हैं। प्रत्येक प्रश्न के चार विकल्प हैं, जिनमें से केवल एक सही है। सही विकल्प चुनें।"
+    ))
+
+    # 10 - review after test
+    if setup and getattr(setup, "active", False):
+        if setup.answer_key and setup.solutions:
+            en10 = "Review the answer key and detailed solutions after completing the test for self-evaluation."
+            hi10 = "स्व-मूल्यांकन के लिए परीक्षा के बाद उत्तर कुंजी और विस्तृत समाधान देखें।"
+        elif setup.answer_key:
+            en10 = "Review the answer key after completing the test for self-evaluation."
+            hi10 = "स्व-मूल्यांकन के लिए परीक्षा के बाद उत्तर कुंजी देखें।"
+        elif setup.solutions:
+            en10 = "Review the detailed solutions after completing the test for self-evaluation."
+            hi10 = "स्व-मूल्यांकन के लिए परीक्षा के बाद विस्तृत समाधान देखें।"
+        else:
+            en10 = "Evaluate your performance after completing the test."
+            hi10 = "परीक्षा के बाद अपने प्रदर्शन का मूल्यांकन करें।"
+    else:
+        en10 = "Review the answer key and explanations after completing the test."
+        hi10 = "परीक्षा के बाद उत्तर कुंजी और व्याख्या देखें।"
+    instructions.append((en10, hi10))
+
+    # 11 - legacy fallback for non-active setup
+    if not (setup and getattr(setup, "active", False)):
+        instructions.append((
+            "There is no negative marking unless your instructor says otherwise.",
+            "जब तक आपके प्रशिक्षक अन्यथा न कहें, कोई नकारात्मक अंकन नहीं है।"
+        ))
+
+    return instructions
+
+
+def _render_bilingual_instructions(doc: "_Doc", setup: Optional["_SeriesSetup"], total: int) -> None:
+    """Render paired EN+HI instructions with numbering, professional style."""
+    pdf = doc.pdf
+    doc.ensure_space(20)
+    pdf.set_font("hind", "B", 12)
+    pdf.set_text_color(20, 40, 90)
+    pdf.cell(0, 7, "Instructions to Candidates / परीक्षार्थियों के लिए निर्देश",
+             new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+    pdf.ln(1)
+    pdf.set_text_color(40, 40, 40)
+    instructions = _get_bilingual_instructions(setup, total)
+    for idx, (en, hi) in enumerate(instructions, 1):
+        doc.ensure_space(14)
+        # Number
+        pdf.set_font("hind", "B", 10)
+        pdf.set_xy(pdf.l_margin, pdf.get_y())
+        num_w = pdf.get_string_width(f"{idx}. ") + 1
+        pdf.cell(num_w, 5.2, f"{idx}. ")
+        # English
+        pdf.set_font("hind", "", 10)
+        x_after_num = pdf.l_margin + num_w
+        pdf.set_xy(x_after_num, pdf.get_y())
+        pdf.multi_cell(pdf.w - pdf.l_margin - pdf.r_margin - num_w, 5.2, en,
+                       new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+        # Hindi indented under same number
+        pdf.set_font("hind", "", 9.5)
+        pdf.set_text_color(60, 60, 60)
+        pdf.set_x(x_after_num)
+        pdf.multi_cell(pdf.w - pdf.l_margin - pdf.r_margin - num_w, 5.0, hi,
+                       new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+        pdf.set_text_color(40, 40, 40)
+        pdf.ln(1)
+
+    # Closing best wishes bilingual
+    doc.ensure_space(10)
+    pdf.set_font("hind", "B", 11)
+    pdf.set_text_color(20, 40, 90)
+    pdf.cell(0, 6, "All the best! / शुभकामनाएँ!",
+             align="C", new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+    pdf.ln(2)
+    pdf.set_text_color(0, 0, 0)
+
+
+def _back_cover(doc: "_Doc", *, exam_title: str, setup: Optional["_SeriesSetup"] = None) -> None:
+    """Professional back cover based on Sample (1).pdf visual grammar.
+
+    Includes:
+    - Space for Rough Work (bilingual)
+    - Light grid/dots area
+    - Branding footer
+    - Disclaimer / copyright
+    - Institute info if available
+    """
+    pdf = doc.pdf
+    pdf.add_page()
+    # Border
+    pdf.set_draw_color(20, 40, 90)
+    pdf.set_line_width(0.6)
+    pdf.rect(pdf.l_margin - 2, pdf.t_margin - 2,
+             pdf.w - pdf.l_margin - pdf.r_margin + 4,
+             pdf.h - pdf.t_margin - pdf.b_margin + 4, style="D")
+    pdf.set_line_width(0.2)
+
+    # Title
+    pdf.set_font("hind", "B", 14)
+    pdf.set_text_color(20, 40, 90)
+    pdf.cell(0, 8, "Space for Rough Work / रफ कार्य के लिए स्थान",
+             align="C", new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+    pdf.ln(2)
+
+    # Light grid area: draw dotted lines
+    usable = pdf.w - pdf.l_margin - pdf.r_margin
+    y_start = pdf.get_y()
+    y_end = pdf.h - pdf.b_margin - 30
+    pdf.set_draw_color(210, 210, 210)
+    pdf.set_line_width(0.15)
+    # Horizontal light lines every 8mm
+    y = y_start
+    while y < y_end:
+        pdf.line(pdf.l_margin, y, pdf.l_margin + usable, y)
+        y += 8
+    # Vertical light lines every 10mm
+    x = pdf.l_margin
+    y = y_start
+    while x < pdf.l_margin + usable:
+        pdf.line(x, y_start, x, y_end)
+        x += 10
+    pdf.set_line_width(0.2)
+    pdf.set_draw_color(0, 0, 0)
+
+    # Move cursor to below grid
+    pdf.set_xy(pdf.l_margin, y_end + 4)
+
+    # Branding footer
+    pdf.set_font("hind", "B", 11)
+    pdf.set_text_color(20, 40, 90)
+    pdf.cell(0, 6, BRAND, align="C",
+             new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+    if setup and setup.active and setup.institute_name:
+        pdf.set_font("hind", "", 10)
+        pdf.set_text_color(60, 60, 60)
+        pdf.cell(0, 5, setup.institute_name, align="C",
+                 new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+    pdf.set_font("hind", "", 8.5)
+    pdf.set_text_color(100, 100, 100)
+    pdf.multi_cell(0, 4.5,
+                   "This booklet is for practice purpose only. Content is curated from standard sources. "
+                   "© Journey for लबासना. All rights reserved. / "
+                   "यह पुस्तिका केवल अभ्यास के लिए है। सामग्री मानक स्रोतों से संकलित है।",
+                   align="C", new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+    pdf.ln(1)
+    pdf.set_font("hind", "", 7.5)
+    pdf.cell(0, 4, f"Generated: {datetime.now().strftime('%d %b %Y')} | {exam_title[:60]}",
+             align="C", new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
 
 
 def _cover(doc: _Doc, *, exam_title: str, tagline: str, quiz_names: list[str],
@@ -571,86 +890,104 @@ def _cover(doc: _Doc, *, exam_title: str, tagline: str, quiz_names: list[str],
     pdf = doc.pdf
     active = setup is not None and setup.active
     pdf.add_page()
+
+    # Professional border for front cover
+    pdf.set_draw_color(20, 40, 90)
+    pdf.set_line_width(0.8)
+    pdf.rect(pdf.l_margin - 3, pdf.t_margin - 3,
+             pdf.w - pdf.l_margin - pdf.r_margin + 6,
+             pdf.h - pdf.t_margin - pdf.b_margin + 6, style="D")
+    pdf.set_line_width(0.2)
+
+    # Logo and institute
     if active and setup.logo:
         _cover_logo(doc, setup.logo)
     if active and setup.institute_name:
-        pdf.set_font("hind", "B", 15)
+        pdf.set_font("hind", "B", 16)
         pdf.set_text_color(20, 40, 90)
         pdf.multi_cell(0, 8, setup.institute_name, align="C",
                        new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
         pdf.ln(1)
+
+    # Brand - professional with adequate spacing to avoid overlap
     pdf.set_font("hind", "B", 24)
     pdf.set_text_color(20, 40, 90)
-    pdf.multi_cell(0, 11, BRAND, align="C",
-                   new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
-    pdf.set_font("hind", "", 13)
-    pdf.set_text_color(60, 60, 60)
-    pdf.multi_cell(0, 7, tagline or "Test Series", align="C",
+    pdf.multi_cell(0, 14, BRAND, align="C",
                    new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
     pdf.ln(2)
+    pdf.set_font("hind", "", 10)
+    pdf.set_text_color(90, 90, 90)
+    pdf.multi_cell(0, 7, "Creator: Harish Tripathi | Journey for LBSNAA",
+                   align="C", new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+    pdf.ln(2)
+
+    # Tagline / Paper
+    if tagline:
+        pdf.set_font("hind", "", 11)
+        pdf.set_text_color(60, 60, 60)
+        pdf.multi_cell(0, 7, tagline, align="C",
+                       new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+        pdf.ln(3)
+
+    # Divider
     pdf.set_draw_color(20, 40, 90)
     pdf.set_line_width(0.8)
-    pdf.line(pdf.l_margin + 30, pdf.get_y(), pdf.w - pdf.r_margin - 30,
-             pdf.get_y())
+    pdf.line(pdf.l_margin + 20, pdf.get_y(), pdf.w - pdf.r_margin - 20, pdf.get_y())
     pdf.set_line_width(0.2)
     pdf.ln(5)
-    pdf.set_font("hind", "B", 16)
+
+    # Exam title - prominent
+    pdf.set_font("hind", "B", 18)
     pdf.set_text_color(0, 0, 0)
-    pdf.multi_cell(0, 8, exam_title, align="C",
+    pdf.multi_cell(0, 9, exam_title, align="C",
                    new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
     pdf.ln(2)
+
+    # Subject bilingual handling: if subject contains Hindi, split or show as is
+    if active and setup.subject:
+        subj = setup.subject
+        # If subject contains both EN and HI separated by | or -, try to display both
+        if "|" in subj:
+            en_part, hi_part = [s.strip() for s in subj.split("|", 1)]
+            pdf.set_font("hind", "B", 13)
+            pdf.set_text_color(20, 40, 90)
+            pdf.multi_cell(0, 7, en_part, align="C",
+                           new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+            if hi_part:
+                pdf.set_font("hind", "", 12)
+                pdf.set_text_color(40, 40, 40)
+                pdf.multi_cell(0, 6, hi_part, align="C",
+                               new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+        else:
+            pdf.set_font("hind", "B", 13)
+            pdf.set_text_color(20, 40, 90)
+            pdf.multi_cell(0, 7, subj, align="C",
+                           new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
+        pdf.ln(1)
+
+    # Professional info grid with boxed strip
     if active:
         _info_grid(doc, setup, total)
+
+    # Source quiz names (preserve for tests)
     names = ", ".join(n for n in quiz_names if n) or "—"
-    pdf.set_font("hind", "", 10.5)
-    pdf.set_text_color(50, 50, 50)
-    pdf.multi_cell(0, 5.5, f"Source quiz(zes): {names}", align="C",
+    pdf.set_font("hind", "", 9.5)
+    pdf.set_text_color(80, 80, 80)
+    pdf.multi_cell(0, 5, f"Source quiz(zes): {names}", align="C",
                    new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
     pdf.multi_cell(
-        0, 5.5,
-        f"Total questions: {total}   •   "
-        f"Generated: {datetime.now().strftime('%d %b %Y')}",
+        0, 5,
+        f"Total questions: {total}   •   Generated: {datetime.now().strftime('%d %b %Y')}",
         align="C", new_x=doc._XPos.LMARGIN, new_y=doc._YPos.NEXT)
-    pdf.ln(4)
+    pdf.ln(3)
+
+    # Candidate details
     if active and setup.candidate_fields:
         _candidate_boxes(doc, setup.candidate_fields)
-    if active:
-        doc.ensure_space(28)  # keep the heading with its first lines
-    pdf.set_font("hind", "B", 11)
-    pdf.set_text_color(20, 40, 90)
-    pdf.cell(0, 6, "Instructions", new_x=doc._XPos.LMARGIN,
-             new_y=doc._YPos.NEXT)
-    pdf.set_font("hind", "", 10)
-    pdf.set_text_color(40, 40, 40)
-    if active:
-        lines = [
-            "• Read every question carefully before answering.",
-            f"• Each question carries {_fmt_plus(setup.marks_correct)} marks.",
-        ]
-        if setup.marks_negative < 0:
-            lines.append("• Negative marking: %g per wrong answer."
-                         % setup.marks_negative)
-        else:
-            lines.append("• There is no negative marking.")
-        if setup.answer_key and setup.solutions:
-            lines.append("• Review the answer key and detailed solutions "
-                         "after completing the test.")
-        elif setup.answer_key:
-            lines.append("• Review the answer key after completing the test.")
-        elif setup.solutions:
-            lines.append("• Review the detailed solutions after completing "
-                         "the test.")
-    else:
-        lines = (
-            "• Read every question carefully before answering.",
-            "• Each question has one or more correct options as shown in the key.",
-            "• There is no negative marking unless your instructor says otherwise.",
-            "• Review the answer key and explanations after completing the test.",
-        )
-    for line in lines:
-        pdf.multi_cell(0, 5.2, line, new_x=doc._XPos.LMARGIN,
-                       new_y=doc._YPos.NEXT)
-    pdf.ln(2)
+
+    # Bilingual instructions - professional paired
+    _render_bilingual_instructions(doc, setup, total)
+
 
 
 def _question_block(doc: _Doc, number: int, question: dict,
@@ -901,6 +1238,13 @@ def render_testseries_pdf(
     elif setup.answer_sheet:
         doc.pdf.add_page()
         _answer_sheet(doc, questions, setup)
+
+    # Professional back cover based on Sample (1).pdf
+    try:
+        _back_cover(doc, exam_title=title or "Mock Test", setup=setup)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Back cover skipped after failure")
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)

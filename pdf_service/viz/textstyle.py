@@ -142,6 +142,7 @@ BADGES = {
     "panels": "Four Panels",
     "mechanism": "Mechanism",
     "spatial_chain": "Route Chain",
+    "three_d": "3D Layers",
 }
 
 
