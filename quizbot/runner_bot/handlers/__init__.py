@@ -9,13 +9,17 @@ from __future__ import annotations
 
 from telegram.ext import Application
 
-from . import admin, ai_quiz, mix, mistakes, pdf_quiz, poll_quiz, podcast, quiz_play, reports, scheduling, setup_wizard, stats, translation, weakquiz
+from . import admin, ai_quiz, buildtest, mix, mistakes, pdf_quiz, poll_quiz, podcast, pyq, quiz_play, reminders, reports, revise, scheduling, setup_wizard, stats, translation, weakquiz
 
 _MODULES = (
     quiz_play,     # /start, /pause, /resume, /stop, /leaderboard, /slow, /fast, /normal, poll answers
     setup_wizard,  # qs_* quiz-setup wizard callbacks
     mistakes,      # /mistakes mistake-revision (Phase D)
+    revise,        # /revise spaced-repetition queue (Phase H)
     weakquiz,      # /weakquiz weak-topic targeted practice (Phase E)
+    pyq,           # /pyq previous-year-question practice (Phase H)
+    buildtest,     # /buildtest custom test builder (Phase H)
+    reminders,     # /remind daily study reminders (Phase H)
     stats,         # /stats, /xp -- personal XP/level/streak card (Phase C UI)
     poll_quiz,     # /pollquiz, /pollstop
     mix,           # /mix

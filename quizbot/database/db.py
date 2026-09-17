@@ -137,6 +137,12 @@ class Database:
         from quizbot.analytics.gamification import ensure_gamification_indexes
         await ensure_gamification_indexes(db)
 
+        # Phase H daily reminders: exactly one settings row per user, and a
+        # cheap (enabled, user_id) scan for the scheduler tick. SRS itself
+        # adds NO collection/index -- it is a projection of user_mistakes.
+        await db.user_reminders.create_index("user_id", unique=True)
+        await db.user_reminders.create_index([("enabled", 1), ("user_id", 1)])
+
     async def close(self) -> None:
         if self._client is not None:
             self._client.close()

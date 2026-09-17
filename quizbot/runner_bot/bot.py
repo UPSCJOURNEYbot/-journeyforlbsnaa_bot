@@ -19,6 +19,7 @@ from quizbot.shared import config
 from . import handlers
 from .creator_bridge import register_creator_bridge
 from .handlers.admin import watchdog_loop
+from .handlers.reminders_tick import start_reminder_tick
 from .handlers.scheduling import init_schedule_manager
 from .state import tasks
 
@@ -28,13 +29,14 @@ scheduler = AsyncIOScheduler()
 
 
 async def post_init(application: Application) -> None:
-    """Runs once after Application.initialize() -- starts the scheduler and
-    the background watchdog task."""
+    """Runs once after Application.initialize() -- starts the scheduler, the
+    daily-reminder tick and the background watchdog task."""
     manager = init_schedule_manager(scheduler, application.bot)
     scheduler.start()
     await manager.restore()
+    start_reminder_tick(scheduler, application.bot)
     tasks.spawn(watchdog_loop(), name="watchdog")
-    logger.info("Runner Bot post_init complete (scheduler + watchdog started).")
+    logger.info("Runner Bot post_init complete (scheduler + reminders + watchdog started).")
 
 
 async def post_shutdown(application: Application) -> None:

@@ -1302,6 +1302,29 @@ class MistakeRepository:
         )
         return [_clean(r) async for r in cursor]
 
+    #: Phase H SRS projection: the Phase D revision fields PLUS the bounded
+    #: review timeline. Kept separate on purpose -- Phase D/E reads stay lean,
+    #: only the schedule (which must know what was answered when) pays for
+    #: `revision_history`.
+    _SRS_PROJECTION = {
+        **_REVISION_PROJECTION,
+        "revision_history": 1,
+    }
+
+    async def query_srs_rows(
+        self, user_id: int, *, limit: int = REVISION_CANDIDATE_CAP,
+    ) -> list[dict]:
+        """Bounded mistake rows INCLUDING their review timeline (Phase H).
+
+        Same deterministic ordering as :meth:`query_revision_rows`, so the
+        schedule and the revision menu never disagree about what exists."""
+        cursor = (
+            self.col.find({"user_id": user_id}, self._SRS_PROJECTION)
+            .sort(self._REVISION_SORT)
+            .limit(int(limit))
+        )
+        return [_clean(r) async for r in cursor]
+
     async def list_mistake_topics(self, user_id: int, limit: int = 20) -> list[dict]:
         """Distinct topics actually present in THIS user's mistake rows.
 
@@ -1345,6 +1368,56 @@ class MistakeRepository:
             {"$set": {"status": self.STATUS_RESOLVED,
                       "resolved_at": _now_iso(), "updated_at": _now_iso()}},
         )
+
+
+class ReminderRepository:
+    """Phase H daily-reminder settings (opt-in, one row per user).
+
+    Deliberately tiny: one document per user holding ONLY the opt-in flag, the
+    IST time and the content kind, plus the at-most-once-per-day guard
+    (``last_sent_day``). Everything a reminder *says* is derived from existing
+    mistake/XP records -- nothing analytical is duplicated here.
+    """
+
+    def __init__(self, db: Database):
+        self.db = db
+        self.col = db.collection("user_reminders")
+
+    _PROJECTION = {
+        "_id": 0, "user_id": 1, "enabled": 1, "time": 1, "content": 1,
+        "last_sent_day": 1, "last_sent_at": 1,
+    }
+
+    async def get(self, user_id: int) -> Optional[dict]:
+        return _clean(await self.col.find_one({"user_id": user_id},
+                                              projection=self._PROJECTION))
+
+    async def upsert(self, user_id: int, fields: dict) -> None:
+        """Create-or-update this user's settings row (idempotent)."""
+        now = _now_iso()
+        payload = {k: v for k, v in fields.items() if k in {
+            "enabled", "time", "content", "last_sent_day", "last_sent_at",
+        }}
+        payload["updated_at"] = now
+        await self.col.update_one(
+            {"user_id": user_id},
+            {"$set": payload, "$setOnInsert": {"user_id": user_id, "created_at": now}},
+            upsert=True,
+        )
+
+    async def list_enabled(self, limit: int = 200) -> list[dict]:
+        """Bounded read of opted-in rows (the scheduler's only query shape)."""
+        cursor = (
+            self.col.find({"enabled": True}, self._PROJECTION)
+            .sort("user_id", 1)
+            .limit(int(limit))
+        )
+        return [_clean(r) async for r in cursor]
+
+    async def stats(self) -> dict:
+        enabled = await self.col.count_documents({"enabled": True})
+        total = await self.col.count_documents({})
+        return {"total": total, "enabled": enabled}
 
 
 class CreatorSettingsRepository:

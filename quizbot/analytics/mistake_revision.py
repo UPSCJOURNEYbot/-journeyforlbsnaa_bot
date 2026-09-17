@@ -142,6 +142,12 @@ def group_mistakes(rows: list[dict]) -> list[dict]:
                 "first_wrong_at": None,
                 "last_wrong_at": None,
                 "last_correct_at": None,
+                # Phase H: merged, bounded review timeline across every origin
+                # row of this content group (empty for the lean projections
+                # that do not request `revision_history`, e.g. Phase D/E
+                # reads). The SRS projection consumes it; nothing here is a
+                # new stored field.
+                "history": [],
             }
             by_key[key] = group
             ordered.append(key)
@@ -179,6 +185,12 @@ def group_mistakes(rows: list[dict]) -> list[dict]:
         group.setdefault("_subject", []).extend([s for s in subjects if s])
         group.setdefault("_topic", []).extend([t for t in topics if t])
         group.setdefault("_diff", []).extend([d for d in diffs if d])
+        # Phase H: merge this row's bounded review timeline into the group's.
+        # Absent on the lean Phase D/E projections -> stays [] (no behaviour
+        # change for those callers).
+        history = row.get("revision_history")
+        if isinstance(history, list):
+            group["history"].extend(h for h in history if isinstance(h, dict))
 
     groups = []
     for key in ordered:
@@ -186,6 +198,15 @@ def group_mistakes(rows: list[dict]) -> list[dict]:
         g["subject"] = _mode_label(g.pop("_subject"))
         g["topic"] = _mode_label(g.pop("_topic"))
         g["difficulty"] = _mode_label(g.pop("_diff"))
+        # Chronological merge of every origin row's entries (stable for
+        # untimestamped legacy entries).
+        g["history"] = sorted(
+            g["history"],
+            key=lambda e: (
+                to_epoch(e.get("at")) is not None,
+                to_epoch(e.get("at")) or 0.0,
+            ),
+        )
         # De-duplicate origins defensively (same qid/q_index repeated in input).
         uniq, seen = [], set()
         for o in g["origins"]:
@@ -380,9 +401,27 @@ class MistakeRevisionService:
             groups, mode, size=size, topic=topic, now=now,
             offset=page or 0,
         )
+        built = await self.build_from_groups(
+            user_id, selected, mode=mode, now=now,
+        )
+        built.update({"topic": topic, "page": page})
+        return built
 
+    async def build_from_groups(
+        self, user_id: int, selected: list[dict], *,
+        mode: str = MODE_SMART, now: Any = None,
+    ) -> dict:
+        """Turn an already-selected list of content groups into the canonical
+        question list + fold map the DM engine plays.
+
+        Shared by Phase D (`select_groups`) and Phase H SRS (`/revise`), so
+        there is exactly ONE live-vs-snapshot resolution path: unchanged live
+        content wins, the immutable snapshot is the fallback, and a group with
+        neither is excluded (never fabricated).
+        """
+        user_id = self._require_user(user_id)
         questions, origins_by_index, reasons, excluded = [], [], [], 0
-        # Bounded live-quiz cache (at most `size` distinct stored quizzes).
+        # Bounded live-quiz cache (at most `len(selected)` distinct quizzes).
         quiz_cache: dict[str, Optional[dict]] = {}
 
         # Pre-fetch every immutable snapshot the selected groups might need in
@@ -410,7 +449,7 @@ class MistakeRevisionService:
             })
 
         return {
-            "user_id": user_id, "mode": mode, "topic": topic, "page": page,
+            "user_id": user_id, "mode": mode,
             "questions": questions, "origins_by_index": origins_by_index,
             "reasons": reasons, "excluded": excluded,
             "selected": len(selected), "size": len(questions),

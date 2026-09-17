@@ -52,6 +52,9 @@
 | **Access Control** | Free and paid quiz tiers, batch access, auth-chat lists, optional premium gate |
 | **Analytics** | Per-user performance, leaderboards, sectional score breakdowns |
 | **Gamification** | XP with a hard 200/day cap, formula-based levels, IST daily streaks — `/stats` (alias `/xp`) |
+| **Smart Revision** | Mistakes (`/mistakes`), weak-topic practice (`/weakquiz`), spaced repetition queue (`/revise`) with 1→3→7→16→35-day intervals |
+| **Question Bank** | Previous-year practice (`/pyq`) from year-tagged questions and a custom test builder (`/buildtest`) over quizzes you own, played or that are public |
+| **Daily Reminders** | Opt-in IST study nudge (`/remind`) driven by your own due cards and streak — at most once a day, never when there's nothing to say |
 | **HTML Reports** | Self-contained interactive HTML scorecards — question navigator, KaTeX/Markdown rendering, dark/light theme |
 | **Mini App** | Visual in-Telegram quiz player (practice + exam mode) as a Telegram WebApp |
 | **Inline Sharing** | Share any quiz by ID via inline query, with a working Play button |
