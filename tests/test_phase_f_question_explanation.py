@@ -1094,6 +1094,16 @@ class ArchitectureTests(unittest.TestCase):
             "Dockerfile",
             "deploy_vps.sh",
             "requirements.txt",
+            # ... plus the Phase C user-facing layer (gamification command
+            # UI): /stats + /xp handler, its read-only profile API additions
+            # in gamification.py, help/features/menu/README wiring and the
+            # offline menu-audit script:
+            "README.md",
+            "verify_command_menu.py",
+            "quizbot/creator_bot/handlers/admin.py",
+            "quizbot/runner_bot/handlers/__init__.py",
+            "quizbot/runner_bot/handlers/stats.py",
+            "tests/test_phase_g_stats_command.py",
             "quizbot/shared/config.py",
             "quizbot/shared/utils/netguard.py",
             "quizbot/creator_bot/handlers/testseries_create.py",

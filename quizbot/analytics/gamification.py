@@ -199,6 +199,35 @@ def level_for_xp(total_xp: int) -> int:
     return level
 
 
+def level_progress(total_xp: int) -> dict:
+    """Read-only progress of ``total_xp`` inside its level band.
+
+    Returns ``{"level", "level_floor_xp", "next_level_xp", "xp_in_level",
+    "xp_to_next", "progress_percent"}``. ``progress_percent`` is clamped to
+    0..100; L1's floor is 0 XP and every band has a positive span, so the
+    function is total (never raises, never divides by zero) for any input.
+    """
+    xp = max(0, int(total_xp or 0))
+    level = level_for_xp(xp)
+    floor = level_threshold(level)
+    nxt = level_threshold(level + 1)
+    span = max(1, nxt - floor)
+    in_level = max(0, xp - floor)
+    return {
+        "level": level,
+        "level_floor_xp": floor,
+        "next_level_xp": nxt,
+        "xp_in_level": in_level,
+        "xp_to_next": max(0, nxt - xp),
+        "progress_percent": min(100, round(in_level * 100 / span)),
+    }
+
+
+def previous_day(day_key: str) -> str:
+    """The IST calendar day immediately before ``day_key``."""
+    return (_day_index(day_key) - timedelta(days=1)).isoformat()
+
+
 # ---------------------------------------------------------------------------
 # Streaks (Part 10) -- pure transition
 # ---------------------------------------------------------------------------
@@ -804,6 +833,51 @@ class GamificationService:
         )
         await self._release_guard("applied_attempts", user_id, key)
         return result
+
+    # -- read-only profile API (the /stats command's only data source) -----
+
+    async def get_profile(self, user_id: int, *, at: Optional[str] = None) -> dict:
+        """Read-only profile for display (``/stats`` / ``/xp``).
+
+        Never writes and never raises for a missing user: an unknown user gets
+        the all-zero profile (``exists=False``), so the zero state is a real,
+        testable return value rather than an exception path.
+
+        Display semantics applied on top of the stored document:
+          * ``xp_earned_today`` counts only when the stored ``xp_day`` IS the
+            reference IST day (a stale counter from an older day displays 0,
+            mirroring how the cap will actually treat it);
+          * ``current_streak`` displays the stored value only while the streak
+            is alive (activity today or yesterday IST); a lapsed streak
+            displays 0 while ``longest_streak`` keeps its record;
+          * ``current_level`` is re-derived from ``total_xp`` so the display
+            can never disagree with the level formula.
+        """
+        user_id = self._require_user(user_id)
+        doc = await self.users.find_one({"user_id": user_id})
+        today = local_day_key(at)
+        last_day = doc.get("last_activity_day") if doc else None
+        alive = last_day in (today, previous_day(today))
+        earned_today = int(doc.get("xp_earned_today") or 0) if doc else 0
+        if doc is None or doc.get("xp_day") != today:
+            earned_today = 0
+        total_xp = int(doc.get("total_xp") or 0) if doc else 0
+        progress = level_progress(total_xp)
+        return {
+            "user_id": user_id,
+            "exists": doc is not None,
+            "total_xp": total_xp,
+            "xp_earned_today": earned_today,
+            "daily_cap": DAILY_XP_CAP,
+            "xp_remaining_today": max(0, DAILY_XP_CAP - earned_today),
+            "current_level": progress["level"],
+            "current_streak": int(doc.get("current_streak") or 0) if alive and doc else 0,
+            "streak_alive": bool(alive and doc),
+            "longest_streak": int(doc.get("longest_streak") or 0) if doc else 0,
+            "last_activity_day": last_day,
+            "total_completions": int(doc.get("total_completions") or 0) if doc else 0,
+            "level_progress": progress,
+        }
 
     # -- public boundary ---------------------------------------------------
 
