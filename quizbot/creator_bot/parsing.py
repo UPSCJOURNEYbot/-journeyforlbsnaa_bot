@@ -161,12 +161,13 @@ def _pad_table_blocks(text: str) -> str:
 # ---------------------------------------------------------------------------
 _LETTERS = [chr(c) for c in range(ord("A"), ord("J") + 1)]  # A-J (10)
 _DEV_LABELS = list("कखगघङचछजझञ")           # exactly 10 valid Devanagari labels
-_DEV_OUT_OF_RANGE = set("टठडढणतथदधनपफबभमयरलळवशषसह")
+_DEV_OOR_LABELS = list("टठडढणतथदधनपफबभमयरलळवशषसह")
+_DEV_OUT_OF_RANGE = set(_DEV_OOR_LABELS)
 _LATIN_HEAD_RE = re.compile(r"^([A-Ja-j])\s*[).:：\-–—]\s*(.*)$")
 # A-Z beyond J and Devanagari beyond ञ are out of range
-_LATIN_OOR_RE = re.compile(r"^[K-PR-Zk-pr-z]\s*[).:：\-–—]")  # excludes Q/q (Q.5 badges)
+_LATIN_OOR_RE = re.compile(r"^([K-PR-Zk-pr-z])\s*[).:：\-–—]")  # excludes Q/q (Q.5 badges)
 _DEV_HEAD_RE = re.compile(r"^([क-ञ])\s*[).:：\-–—]\s*(.*)$")
-_DEV_OOR_RE = re.compile(r"^[ट-ह]\s*[).:：\-–—]")
+_DEV_OOR_RE = re.compile(r"^([ट-ह])\s*[).:：\-–—]")
 _NUM_HEAD_RE = re.compile(r"^(\d{1,2})\s*[):：]\s*(.*)$")  # no dot: "1. Stem" is a question badge
 _PAREN_NUM_STMT_RE = re.compile(r"^\(\s*\d{1,3}\s*[).]?")
 
@@ -188,6 +189,10 @@ def _head_match(line: str):
     recognised the same as bare labels.
     """
     raw = line.strip()
+    # A markdown table row is never an option label. ``_pad_table_blocks``
+    # isolates tables so their numbered rows cannot be read as options.
+    if raw.startswith("|"):
+        return None
     # Parenthesised numbers -- "(1) Statement ..." -- enumerate statements
     # inside a stem; they are never option labels.
     if re.match(r"^\(\s*\d{1,3}\s*[).]?", raw):
@@ -197,13 +202,15 @@ def _head_match(line: str):
     if m:
         lab = m.group(1).upper()
         return "lat", ord(lab) - ord("A"), m.group(2).strip()
-    if _LATIN_OOR_RE.match(s):
-        return "oor", -1, s
+    m = _LATIN_OOR_RE.match(s)
+    if m:
+        return "oor", ord(m.group(1).upper()) - ord("A"), s
     m = _DEV_HEAD_RE.match(s)
     if m:
         return "dev", _DEV_LABELS.index(m.group(1)), m.group(2).strip()
-    if _DEV_OOR_RE.match(s):
-        return "oor", -1, s
+    m = _DEV_OOR_RE.match(s)
+    if m:
+        return "oor", MAX_OPTIONS + _DEV_OOR_LABELS.index(m.group(1)), s
     m = _NUM_HEAD_RE.match(s)
     if m:
         return "num", int(m.group(1)) - 1, m.group(2).strip()
@@ -388,7 +395,7 @@ def _core_parse(blk: str):
     # Classify every line once.
     heads: list[tuple[int, str, int, str]] = []  # (line_idx, kind, idx, rest)
     answer_specs: list[tuple[int, str]] = []
-    oor = False
+    oor_idx: list[int] = []
     for i, raw in enumerate(lines):
         st = raw.strip()
         if not st:
@@ -400,7 +407,7 @@ def _core_parse(blk: str):
         if hm is not None:
             kind, idx, rest = hm
             if kind == "oor":
-                oor = True
+                oor_idx.append(idx)
             else:
                 heads.append((i, kind, idx, rest))
         deco = _strip_decoration(st)
@@ -417,8 +424,15 @@ def _core_parse(blk: str):
     typed_heads = [(i, k, idx, rest) for (i, k, idx, rest) in heads
                    if kind_pref and k == kind_pref]
 
-    # Out-of-range label (K-Z, Devanagari beyond ञ) = too many options.
-    if oor and kind_pref in ("lat", "dev"):
+    # An out-of-range label (K-Z, Devanagari beyond ञ) proves "more than 10
+    # options" only when it continues the run of labels actually in use
+    # ("A) .. J) K)"). A line that merely *looks* like one after decoration
+    # stripping -- a parenthesised Assertion/Reason marker "(R)" becoming
+    # "R)" -- is stem content, never an eleventh option.
+    max_used_label = max((idx for _i, _k, idx, _r in typed_heads), default=-1)
+    oor_overflow = any(idx == max_used_label + 1 for idx in oor_idx)
+
+    if oor_overflow and kind_pref in ("lat", "dev"):
         return None, RE_TOO_MANY_OPTIONS, "more than 10 labelled options", []
     if typed_heads:
         over = [idx for _, _, idx, _ in typed_heads if idx >= MAX_OPTIONS]
@@ -545,7 +559,7 @@ def _core_parse(blk: str):
     explanation = _collect_explanation(lines[tail_start:])
 
     # Structural validation.
-    if oor:
+    if oor_overflow:
         return None, RE_TOO_MANY_OPTIONS, "more than 10 labelled options", []
     n_heads = len(typed_heads)
     if n_heads and n_heads > MAX_OPTIONS:
@@ -836,13 +850,66 @@ def _split_packed(chunk_lines: list[str]) -> list[tuple[Optional[int], list[str]
     return pieces
 
 
+def _starts_with_answer_para(piece: list[str]) -> bool:
+    """True when a chunk opens with an ``Answer:``/``Correct answer:`` line.
+
+    Markdown exports commonly place the answer in its own paragraph, so a
+    blank line sits between the options and their answer and the chunk
+    boundary falls in the middle of the question.
+    """
+    for raw in piece:
+        st = raw.strip()
+        if st:
+            return bool(_ANSWER_LINE_RE.match(_strip_decoration(st)))
+    return False
+
+
+def _same_question_shape(before: dict, after: dict) -> bool:
+    """True when a merge left the question text and option list identical.
+
+    Used to accept a re-joined answer paragraph only when it contributed an
+    answer and nothing else: a paragraph can never smuggle text in as an
+    option, and never displaces the stem.
+    """
+    if _norm_text(before.get("question")) != _norm_text(after.get("question")):
+        return False
+    opts_before = [_norm_text(o) for o in before.get("options") or []]
+    opts_after = [_norm_text(o) for o in after.get("options") or []]
+    return opts_before == opts_after
+
+
 def _candidate_blocks(q_lines: list[str]):
     """Produce (ordinal, block_text) candidates from the question area."""
-    # Blank-delimited raw chunks.
-    raw_chunks: list[list[str]] = [[]]
+    # Blank-delimited raw chunks. A blank line padded around a markdown
+    # table by ``_pad_table_blocks`` is not a real boundary: splitting there
+    # would cut a question away from its own table (and from the statement
+    # and options that follow it).
+    prev_nonblank: list[Optional[str]] = []
+    last = None
     for ln in q_lines:
+        prev_nonblank.append(last)
+        if ln.strip():
+            last = ln
+    next_nonblank: list[Optional[str]] = [None] * len(q_lines)
+    following = None
+    for i in range(len(q_lines) - 1, -1, -1):
+        next_nonblank[i] = following
+        if q_lines[i].strip():
+            following = q_lines[i]
+
+    def _table_padding(i: int) -> bool:
+        before, after = prev_nonblank[i], next_nonblank[i]
+        return bool((before and _TABLE_LINE_RE.match(before.strip()))
+                    or (after and _TABLE_LINE_RE.match(after.strip())))
+
+    raw_chunks: list[list[str]] = [[]]
+    for i, ln in enumerate(q_lines):
         if ln.strip():
             raw_chunks[-1].append(ln)
+        elif _table_padding(i):
+            # Keep the visual break, drop the chunk boundary.
+            if raw_chunks[-1] and raw_chunks[-1][-1].strip():
+                raw_chunks[-1].append("")
         else:
             if raw_chunks[-1]:
                 raw_chunks.append([])
@@ -877,6 +944,21 @@ def _candidate_blocks(q_lines: list[str]):
             prev_res = parse_question_block_strict(
                 "\n".join(prev), require_answer=False)
             prev_has_question = prev_res.question is not None
+            if prev_has_question and _starts_with_answer_para(piece) \
+                    and prev_res.question.get("correct_option_id") is None:
+                # A standalone "Answer: B" paragraph belongs to the
+                # preceding question when that question is complete apart
+                # from its answer. The merge is accepted only when the
+                # combined block parses outright AND the paragraph changed
+                # neither the stem nor the options -- so an answer
+                # paragraph can never add an option, and a question that
+                # already carries an answer is never re-opened.
+                joined = "\n".join(prev).strip() + "\n\n" + text
+                merged_res = parse_question_block_strict(joined)
+                if merged_res.question is not None and _same_question_shape(
+                        prev_res.question, merged_res.question):
+                    merged[-1] = (prev_o, prev + [""] + piece)
+                    continue
             if starts_with_options and not has_q_head and not has_q_mark:
                 # "Bare options" chunk belongs to the previous stem.
                 merged[-1] = (prev_o, prev + [""] + piece)
@@ -929,9 +1011,14 @@ _SOLN_PREFIX_RE = re.compile(
 # A bare EXPLANATIONS/SOLUTIONS header INSIDE the key region switches the
 # rest of the region to solutions-only: ordinal-headed lines there are
 # explanations by number, never key rows ("1. Delhi is capital." must not
-# read as answer D). Carries no payload by construction.
+# read as answer D). Carries no payload by construction. A leading
+# qualifier ("Detailed Solutions", "Complete Solutions") is the same
+# header: without it the follow-on rows are re-read as answer-key rows and
+# every question whose real answer is not the first option is rejected.
+_SOLN_QUALIFIER = r"(?:DETAILED|DETAIL|FULL|COMPLETE|EXPLAINED|MODEL)"
 _SOLN_REGION_HEADER_RE = re.compile(
-    r"^\s*(?:EXPLANATIONS?|SOLUTIONS?|व्याख्या|समाधान|हल)\s*[:：#-]?[ ]*$",
+    r"^\s*(?:" + _SOLN_QUALIFIER + r"\s+)*"
+    r"(?:EXPLANATIONS?|SOLUTIONS?|व्याख्या|समाधान|हल)\s*[:：#-]?[ ]*$",
     re.I)
 # Ordinal-headed line inside the solutions region: explanation by number.
 _SOLN_ROW_RE = re.compile(
@@ -1005,6 +1092,18 @@ def _parse_key_section(k_lines: list[str]):
             text = m.group(1).strip() or text
         soln.setdefault(ordn, []).append(text)
 
+    def solution_payload(text: str) -> str:
+        """Solution prose only: a bare "Answer: A" row carries no solution.
+
+        Mirrors the existing guard that never attaches an answer line as
+        prose, so "Q1.  Answer: A" contributes an answer association without
+        pasting "Answer: A" on top of the real solution text.
+        """
+        text = text.strip()
+        if text and _ANSWER_LINE_RE.match(_strip_decoration(text)):
+            return ""
+        return text
+
     def record_row(n, idx, rest):
         nonlocal rows_found, current_ord
         rows_found += 1
@@ -1037,15 +1136,17 @@ def _parse_key_section(k_lines: list[str]):
             ms = _SOLN_PREFIX_RE.match(st)
             if ms and not indented:
                 current_ord = int(ms.group(1))
-                if ms.group(2).strip():
-                    attach_solution(current_ord, ms.group(2))
+                payload = solution_payload(ms.group(2))
+                if payload:
+                    attach_solution(current_ord, payload)
                 used = True
             else:
                 m = _SOLN_ROW_RE.match(st)
                 if m and not indented:
                     current_ord = int(m.group(1))
-                    if m.group(2).strip():
-                        attach_solution(current_ord, m.group(2))
+                    payload = solution_payload(m.group(2))
+                    if payload:
+                        attach_solution(current_ord, payload)
                     used = True
         else:
             # Lines carrying several pairs ("Q1-B, Q2-B") take priority over
@@ -1123,10 +1224,105 @@ def _parse_key_section(k_lines: list[str]):
 
 
 # ---------------------------------------------------------------------------
+# Running page furniture (PDF headers/footers)
+# ---------------------------------------------------------------------------
+# A page header/footer repeats verbatim on every page ("Journey for LBSNAA
+# • Page 2 / 30"). When a page break falls inside a question, that line
+# lands between the options and defeats the continuation rejoin, so the
+# question loses part of its option list. Only provably repetitive AND
+# provably non-content lines are treated as furniture.
+_PAGE_FURNITURE_MIN_REPEATS = 3
+_PAGE_FURNITURE_MAX_LEN = 120
+# Page footers differ only by their page number ("Page 2 / 30", "Page 3 / 30"),
+# so repeats are counted after masking digit runs. Short lines are excluded
+# from the masked count so repeated single tokens ("A", "Q7") are never
+# mistaken for furniture.
+_PAGE_FURNITURE_MIN_MASKED_LEN = 12
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def _drop_running_page_furniture(text: str) -> str:
+    """Remove repeated running page headers/footers from a document.
+
+    Returns ``text`` unchanged when nothing qualifies. A line must clear
+    every content guard below before it can count as furniture, so option
+    labels, question badges, question text, answer/explanation keywords and
+    table rows are never removed.
+    """
+    lines = text.split("\n")
+    counts: dict[str, int] = {}
+    masked_counts: dict[str, int] = {}
+    for ln in lines:
+        st = ln.strip()
+        if not st:
+            continue
+        counts[st] = counts.get(st, 0) + 1
+        if len(st) >= _PAGE_FURNITURE_MIN_MASKED_LEN:
+            key = _DIGITS_RE.sub("#", st)
+            masked_counts[key] = masked_counts.get(key, 0) + 1
+    if not counts:
+        return text
+
+    def is_furniture(st: str) -> bool:
+        exact = counts.get(st, 0) >= _PAGE_FURNITURE_MIN_REPEATS
+        masked = (len(st) >= _PAGE_FURNITURE_MIN_MASKED_LEN
+                  and masked_counts.get(_DIGITS_RE.sub("#", st), 0)
+                  >= _PAGE_FURNITURE_MIN_REPEATS)
+        if not exact and not masked:
+            return False
+        if len(st) > _PAGE_FURNITURE_MAX_LEN:
+            return False
+        if "?" in st or "？" in st:
+            return False
+        if st.startswith("|"):                 # markdown table row
+            return False
+        if _head_match(st):                    # option label
+            return False
+        if _line_starts_question(st):          # question badge
+            return False
+        deco = _strip_decoration(st)
+        if _ANSWER_LINE_RE.match(deco) or _STOP_IN_OPT_RE.match(deco):
+            return False
+        return True
+
+    kept = [ln for ln in lines if not is_furniture(ln.strip())]
+    if len(kept) == len(lines):
+        return text
+    out: list[str] = []
+    for ln in kept:
+        # Removal can leave doubled blank lines behind; collapse them so
+        # chunk boundaries stay exactly where the author put them.
+        if not ln.strip() and out and not out[-1].strip():
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # Document entry point
 # ---------------------------------------------------------------------------
 def parse_question_document(text: str, *, allow_multiple_answer: bool = False
                             ) -> DocumentParseResult:
+    """Parse a whole document, preferring the reading that keeps the most
+    questions (and, at equal counts, reports the fewest skipped blocks).
+
+    Running page furniture is removed only when doing so is a strict
+    improvement, so this normalisation can never lose a question that the
+    raw text already yielded.
+    """
+    result = _parse_document_body(text, allow_multiple_answer=allow_multiple_answer)
+    cleaned = _drop_running_page_furniture(text)
+    if cleaned != text:
+        alternative = _parse_document_body(
+            cleaned, allow_multiple_answer=allow_multiple_answer)
+        if (len(alternative.questions), -len(alternative.skipped)) > \
+                (len(result.questions), -len(result.skipped)):
+            return alternative
+    return result
+
+
+def _parse_document_body(text: str, *, allow_multiple_answer: bool = False
+                         ) -> DocumentParseResult:
     warnings: list[str] = []
     if text is None or not str(text).strip():
         return DocumentParseResult(
