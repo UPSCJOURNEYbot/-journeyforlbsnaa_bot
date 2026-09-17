@@ -35,6 +35,8 @@ pdfquiz - Reply to a PDF to build a quiz from it
 mix - Mix questions from several quiz IDs
 weakquiz - Practise your weakest topics (personal revision)
 mistakes - Review your recorded mistakes (personal revision)
+stats - Show your XP, level and IST daily streak (alias: /xp)
+xp - Alias of /stats: your XP, level and streak profile
 leaderboard - Show the live top-10 leaderboard
 result - Show your most recent quiz result
 pause - Pause the running quiz (group admins)

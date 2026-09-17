@@ -51,6 +51,7 @@
 | **Editing** | Shuffle questions, retitle, adjust timers, add/remove questions |
 | **Access Control** | Free and paid quiz tiers, batch access, auth-chat lists, optional premium gate |
 | **Analytics** | Per-user performance, leaderboards, sectional score breakdowns |
+| **Gamification** | XP with a hard 200/day cap, formula-based levels, IST daily streaks — `/stats` (alias `/xp`) |
 | **HTML Reports** | Self-contained interactive HTML scorecards — question navigator, KaTeX/Markdown rendering, dark/light theme |
 | **Mini App** | Visual in-Telegram quiz player (practice + exam mode) as a Telegram WebApp |
 | **Inline Sharing** | Share any quiz by ID via inline query, with a working Play button |
