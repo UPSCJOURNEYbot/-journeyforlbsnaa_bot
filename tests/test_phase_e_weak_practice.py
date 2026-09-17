@@ -472,6 +472,12 @@ class FakeCollection:
                 if flag and "_id" in doc:
                     out["_id"] = doc["_id"]
             elif flag:
+                if k in doc:
+                    # Mongo fidelity: projecting an ARRAY field returns the
+                    # whole array (the previous behaviour kept only the first
+                    # element, which silently truncated `revision_history`).
+                    out[k] = doc[k]
+                    continue
                 vals = _path_values(doc, k.split("."))
                 v = vals[0] if vals else None
                 if v is not None:
@@ -479,6 +485,10 @@ class FakeCollection:
         return out
 
     async def find_one(self, filt=None, sort=None, projection=None):
+        if isinstance(sort, dict) and projection is None:
+            # pymongo accepts `find_one(filter, projection)` positionally; keep
+            # the fake faithful instead of treating a projection as a sort key.
+            sort, projection = None, sort
         self.queries += 1
         rows = [d for d in self.docs if _matches(d, filt or {})]
         if sort:

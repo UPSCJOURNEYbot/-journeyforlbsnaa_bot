@@ -35,6 +35,10 @@ pdfquiz - Reply to a PDF to build a quiz from it
 mix - Mix questions from several quiz IDs
 weakquiz - Practise your weakest topics (personal revision)
 mistakes - Review your recorded mistakes (personal revision)
+revise - Spaced repetition: revise what is due today
+pyq - Practise previous-year questions from your bank
+buildtest - Build a custom test (size, source, topics)
+remind - Daily study reminder in IST (on/off/time)
 stats - Show your XP, level and IST daily streak (alias: /xp)
 xp - Alias of /stats: your XP, level and streak profile
 leaderboard - Show the live top-10 leaderboard

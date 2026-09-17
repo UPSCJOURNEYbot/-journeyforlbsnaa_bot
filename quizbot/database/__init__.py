@@ -21,6 +21,7 @@ from .repositories import (
     QuizPrefsRepository,
     BatchRepository,
     PodcastKeyRepository,
+    ReminderRepository,
 )
 
 __all__ = [
@@ -42,4 +43,5 @@ __all__ = [
     "QuizPrefsRepository",
     "BatchRepository",
     "PodcastKeyRepository",
+    "ReminderRepository",
 ]

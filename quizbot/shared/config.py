@@ -80,6 +80,19 @@ REQUIRED_SUB_CHANNEL: str | None = _env("REQUIRED_SUB_CHANNEL")
 FREE_BOT: bool = _env_bool("FREE_BOT", True)
 
 # ---------------------------------------------------------------------------
+# Phase H — daily reminders (opt-in per user via /remind)
+#
+# The scheduler tick is a plain APScheduler interval job (the same scheduler
+# that already drives scheduled quizzes). Settings live in MongoDB, so a
+# restart loses nothing; reminders are at most once per IST day per user.
+# ---------------------------------------------------------------------------
+REMINDERS_ENABLED: bool = _env_bool("REMINDERS_ENABLED", True)
+REMINDER_TICK_MINUTES: int = _env_int("REMINDER_TICK_MINUTES", 15) or 15
+REMINDER_BATCH_LIMIT: int = _env_int("REMINDER_BATCH_LIMIT", 200) or 200
+REMINDER_MAX_LATENESS_MINUTES: int = _env_int("REMINDER_MAX_LATENESS_MINUTES", 180) or 180
+
+
+# ---------------------------------------------------------------------------
 # Payments (Razorpay)
 # ---------------------------------------------------------------------------
 RAZORPAY_KEY_ID: str | None = _env("RAZORPAY_KEY_ID")
