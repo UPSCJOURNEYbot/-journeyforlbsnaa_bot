@@ -339,6 +339,100 @@ class CommandReplyCases(unittest.TestCase):
 
 
 # ===========================================================================
+# 4b. Dispatch order: nothing registered EARLIER may swallow /stats or /xp
+# ===========================================================================
+
+class DispatchOrderCases(unittest.TestCase):
+    """PTB runs ONE handler per update per group (first match wins). This
+    pins that in the REAL registration order (runner modules + creator
+    bridge), the FIRST handler matching '/stats' and '/xp' is the stats
+    handler -- so no earlier CommandHandler/filter can ever intercept them
+    and leave the user with silence (the live-bot failure signature)."""
+
+    @classmethod
+    def _build_app(cls):
+        from telegram import Bot, User
+        from telegram.ext import Application
+
+        from quizbot.runner_bot.creator_bridge import register_creator_bridge
+        from quizbot.runner_bot.handlers import register as runner_register
+
+        app = (Application.builder()
+               .token("123456:FAKE-TOKEN-FOR-UNIT-TESTS").build())
+        runner_register(app)           # वही order जो build_application() करता है
+        register_creator_bridge(app)
+
+        async def fake_get_me(self=None, *a, **kw):
+            self._bot_user = User(id=999, is_bot=True, first_name="SimBot",
+                                  username="JourneyForLabsnaaBot")
+            return self._bot_user
+
+        orig_get_me = Bot.get_me
+        Bot.get_me = fake_get_me  # offline only: no getMe network call
+        try:
+            _run(app.bot.initialize())
+        finally:
+            Bot.get_me = orig_get_me
+        return app
+
+    def _first_match(self, app, text, chat_type):
+        from datetime import datetime, timezone as tz
+
+        from telegram import Chat, Message, MessageEntity, Update, User
+
+        uid = UID_A if chat_type == "private" else UID_B
+        chat = Chat(id=(uid if chat_type == "private" else -100123), type=chat_type)
+        msg = Message(
+            message_id=1, date=datetime.now(tz.utc), chat=chat,
+            from_user=User(id=uid, first_name="T", is_bot=False),
+            text=text,
+            entities=[MessageEntity(type=MessageEntity.BOT_COMMAND,
+                                    offset=0, length=len(text))],
+        )
+        msg.set_bot(app.bot)  # check_update uses message.get_bot() shortcuts
+        upd = Update(update_id=1, message=msg)
+        upd.set_bot(app.bot)
+
+        matches = []
+        for i, h in enumerate(app.handlers[0]):
+            try:
+                r = h.check_update(upd)
+            except Exception:
+                continue  # non-command handlers cannot match a text command
+            if r is not None and r is not False:
+                matches.append((i, h))
+        return matches
+
+    def test_stats_and_xp_not_intercepted(self):
+        app = self._build_app()
+        group0 = app.handlers[0]
+        stats_idx, stats_h = next(
+            (i, h) for i, h in enumerate(group0)
+            if isinstance(h, CommandHandler)
+            and "stats" in getattr(h, "commands", set())
+        )
+        for text in ("/stats", "/xp", "/stats@JourneyForLabsnaaBot",
+                     "/XP", "/Xp@JourneyForLabsnaaBot"):
+            for chat_type in ("private", "group", "supergroup"):
+                matches = self._first_match(app, text, chat_type)
+                self.assertTrue(matches, f"{text} in {chat_type}: NO handler matched")
+                first_idx, first_h = matches[0]
+                self.assertIs(
+                    first_h, stats_h,
+                    f"{text} in {chat_type}: intercepted at position {first_idx} "
+                    f"before the stats handler at {stats_idx}")
+                self.assertEqual(first_idx, stats_idx)
+
+    def test_control_commands_still_dispatch(self):
+        """Sanity: the same probe matches /result and /help, so a PASS above
+        is not vacuous."""
+        app = self._build_app()
+        for text in ("/result", "/help"):
+            matches = self._first_match(app, text, "private")
+            self.assertTrue(matches, f"control {text} matched nothing")
+
+
+# ===========================================================================
 # 5. XP integration through the REAL completion boundary
 # ===========================================================================
 

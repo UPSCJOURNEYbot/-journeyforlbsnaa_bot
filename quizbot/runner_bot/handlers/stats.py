@@ -138,3 +138,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def register(application: Application) -> None:
     """Register ``/stats`` + ``/xp`` (one handler, both names, all chats)."""
     application.add_handler(CommandHandler(COMMAND_NAMES, stats_command))
+    # Startup log marker: after a deploy/restart, grep the service logs for
+    # this line to confirm the RUNNING process actually has the /stats+ /xp
+    # handlers (the BotFather menu alone proves nothing about the runtime).
+    logger.info("Registered commands: /stats, /xp (gamification profile card)")
