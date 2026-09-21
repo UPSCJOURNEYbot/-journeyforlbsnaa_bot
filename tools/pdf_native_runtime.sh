@@ -121,7 +121,30 @@ have_pkg_manager() {
   command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1
 }
 
-pkg_installed() { dpkg -s "$1" >/dev/null 2>&1; }
+# Print the concrete dpkg package names that can satisfy one canonical
+# package. Keep this table explicit: Debian/Ubuntu package transitions are
+# package-specific, and fuzzy matching could let an unrelated package pass.
+pkg_satisfying_names() {
+  case "$1" in
+    libglib2.0-0)
+      # Ubuntu 24.04 (Noble) renamed this package for the 64-bit time_t ABI.
+      printf '%s\n' libglib2.0-0 libglib2.0-0t64
+      ;;
+    *)
+      printf '%s\n' "$1"
+      ;;
+  esac
+}
+
+pkg_installed() {
+  local candidate
+  while IFS= read -r candidate; do
+    if dpkg -s "$candidate" >/dev/null 2>&1; then
+      return 0
+    fi
+  done < <(pkg_satisfying_names "$1")
+  return 1
+}
 
 apt_install_core() {
   have_pkg_manager || fail \
@@ -267,36 +290,44 @@ USAGE
   exit 0
 }
 
-cmd="${1:-install}"
-[ $# -gt 0 ] && shift
-NO_VERIFY=0
-for arg in "$@"; do
-  case "$arg" in
-    --no-verify) NO_VERIFY=1 ;;
-    -h|--help|help) usage ;;
-    *) fail "Unknown argument: $arg (see --help)" ;;
-  esac
-done
+main() {
+  local cmd="${1:-install}"
+  [ "$#" -gt 0 ] && shift
+  local NO_VERIFY=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --no-verify) NO_VERIFY=1 ;;
+      -h|--help|help) usage ;;
+      *) fail "Unknown argument: $arg (see --help)" ;;
+    esac
+  done
 
-case "$cmd" in
-  install)
-    apt_install_core
-    if [ "$NO_VERIFY" -eq 0 ]; then
+  case "$cmd" in
+    install)
+      apt_install_core
+      if [ "$NO_VERIFY" -eq 0 ]; then
+        verify_runtime
+      else
+        log "verification skipped (--no-verify) — the caller MUST verify separately before serving traffic."
+      fi
+      ;;
+    verify)
       verify_runtime
-    else
-      log "verification skipped (--no-verify) — the caller MUST verify separately before serving traffic."
-    fi
-    ;;
-  verify)
-    verify_runtime
-    ;;
-  print-packages)
-    print_packages
-    ;;
-  print-optional-packages)
-    print_optional_packages
-    ;;
-  *)
-    usage
-    ;;
-esac
+      ;;
+    print-packages)
+      print_packages
+      ;;
+    print-optional-packages)
+      print_optional_packages
+      ;;
+    *)
+      usage
+      ;;
+  esac
+}
+
+# Unit tests source this file to exercise package-name resolution without
+# provisioning the host. Direct execution keeps the normal CLI behavior.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
