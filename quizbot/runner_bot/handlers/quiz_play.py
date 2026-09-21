@@ -44,7 +44,11 @@ from quizbot.shared.rich_quiz import (
 )
 from quizbot.shared.utils import is_premium_user
 
-from ..pdf_reports import render_quiz_pdf
+from ..pdf_reports import (
+    format_pdf_backend_error,
+    pdf_backend_health,
+    render_quiz_pdf,
+)
 from quizbot.analytics.runtime import build_question_results
 from quizbot.analytics.service import AnalyticsService
 
@@ -1324,13 +1328,14 @@ async def _send_pdf_report(
         quiz_name = quiz_data.get("quiz_name", "Unnamed Quiz")
 
         loop = asyncio.get_running_loop()
-        pdf_ok = await loop.run_in_executor(
-            None, render_quiz_pdf, quiz_name, chat_title, orig_questions, leaderboard,
-            full_polls, neg_val, cm_val, pdf_path, sections, bg_image_b64, do_shuffle_opts, "classic",
-        )
+        pdf_ok = False
+        try:
+            pdf_ok = await loop.run_in_executor(
+                None, render_quiz_pdf, quiz_name, chat_title, orig_questions, leaderboard,
+                full_polls, neg_val, cm_val, pdf_path, sections, bg_image_b64, do_shuffle_opts, "classic",
+            )
 
-        if pdf_ok and os.path.exists(pdf_path):
-            try:
+            if pdf_ok and os.path.exists(pdf_path):
                 caption = (
                     f"\U0001F4C4 <b>{esc(quiz_name)}</b>\n\U0001F4DA {esc(chat_title)}\n"
                     f"\U0001F465 {len(leaderboard)} participant(s)\n\n"
@@ -1342,18 +1347,26 @@ async def _send_pdf_report(
                         caption=caption, parse_mode=ParseMode.HTML,
                         **({"message_thread_id": thread_id} if thread_id else {}),
                     )
-            finally:
-                try:
-                    os.remove(pdf_path)
-                except OSError:
-                    pass
-        else:
-            # Rendering failed (e.g. WeasyPrint native libraries missing).
-            # Tell the user instead of silently producing nothing.
+        finally:
+            # Always remove the temp file — success, render failure, or an
+            # exception mid-send — so a failed render never leaks a partial
+            # PDF into $TMPDIR.
+            try:
+                os.remove(pdf_path)
+            except OSError:
+                pass
+
+        if not pdf_ok:
+            # Rendering failed (native stack missing, pip drift, or a
+            # render-time crash). render_quiz_pdf already logged the exact
+            # underlying exception; add the structured backend diagnosis
+            # (which libraries are missing + exact remediation) to the
+            # operator journal, and tell the user instead of silently
+            # producing nothing.
             logger.error(
-                "PDF report render returned failure for chat=%s qid=%s "
-                "(check WeasyPrint/Pango install)", chat_id,
-                quiz_data.get("qid"),
+                "PDF report render returned failure for chat=%s qid=%s.\n%s",
+                chat_id, quiz_data.get("qid"),
+                format_pdf_backend_error(pdf_backend_health()),
             )
             try:
                 await ctx.bot.send_message(

@@ -1,21 +1,23 @@
 FROM python:3.11-slim
 
-# System deps required by weasyprint (PDF generation) and PyMuPDF.
-# fonts-noto-core/fonts-deva provide Noto Sans Devanagari so Hindi renders
-# in the WeasyPrint result PDF even without internet font fetching.
-# fonts-noto-color-emoji provides color emoji (check/mark/trophy/medals) used
-# in the report header and leaderboard; a subset is also @font-face bundled.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libcairo2 \
-    libffi-dev shared-mime-info fonts-liberation fonts-noto-core fonts-deva \
-    fonts-noto-color-emoji \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
+# Native WeasyPrint/Pango PDF runtime. The package set is maintained in
+# tools/pdf_native_runtime.sh — the single source of truth (it also handles
+# newer-release package renames such as libgdk-pixbuf2.0-0 ->
+# libgdk-pixbuf-4.0-0). --no-verify: WeasyPrint is pip-installed in a later
+# layer, so the FULL-stack render gate below is what proves this image.
+# System fonts (Noto core / Devanagari / color emoji) come from the same
+# tool so Hindi renders in the WeasyPrint result PDF even without internet
+# font fetching; a Hind subset is additionally @font-face bundled in-repo.
+COPY tools/pdf_native_runtime.sh /app/tools/pdf_native_runtime.sh
+RUN bash /app/tools/pdf_native_runtime.sh install --no-verify
+
 COPY requirements.txt .
-RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libffi-dev shared-mime-info \
+    ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin \
+    && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Fail the image build if the WeasyPrint stack cannot render (pins protect

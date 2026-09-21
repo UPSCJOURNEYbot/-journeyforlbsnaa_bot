@@ -8,8 +8,10 @@
 #   2. Fast-forwards to origin/main (never force-pushes, never discards local data).
 #   3. Preserves .env as-is (NEVER overwrites it) and validates required keys
 #      WITHOUT printing secret values.
-#   4. Installs OS packages (ffmpeg, tesseract, weasyprint libs) + Python venv +
-#      requirements.txt — the same dependencies the repo already declares.
+#   4. Installs OS packages (ffmpeg, tesseract) + the native WeasyPrint/
+#      Pango PDF runtime (single source of truth: tools/pdf_native_runtime.sh)
+#      + Python venv + requirements.txt — the same dependencies the repo
+#      already declares.
 #   5. Verifies the SINGLE-BOT build (exactly one python-telegram-bot polling
 #      client) before starting anything.
 #   6. Installs/enables a systemd unit that runs ONE process:
@@ -202,14 +204,17 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if [ "$SKIP_APT" -eq 0 ] && command -v apt-get >/dev/null 2>&1; then
-  log "Installing OS packages (ffmpeg, tesseract, weasyprint libs) ..."
+  # NOTE: the WeasyPrint native library/font set (libpango*, libharfbuzz0b,
+  # fonts-noto-*) is NOT listed here — it is provisioned in step 3a by
+  # tools/pdf_native_runtime.sh, the single source of truth for that set
+  # (it also handles newer-release package renames such as
+  # libgdk-pixbuf2.0-0 -> libgdk-pixbuf-4.0-0 and verifies the result).
+  log "Installing OS packages (ffmpeg, tesseract) ..."
   $SUDO apt-get update
   $SUDO apt-get install -y --no-install-recommends \
     git python3 python3-venv python3-pip \
     ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin \
-    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libcairo2 \
-    libffi-dev shared-mime-info fonts-liberation \
-    fonts-noto-core fonts-deva fonts-noto-color-emoji
+    libffi-dev shared-mime-info
 else
   log "Skipping apt-get (flag or non-Debian system). Ensuring ffmpeg/python exist ..."
   command -v python3 >/dev/null 2>&1 || fail "python3 not found."
@@ -280,6 +285,27 @@ log "Installing requirements.txt (existing pinned dependencies, unchanged) ..."
 # whose removed Stream.transform() broke every report PDF in production with
 # "AttributeError: 'super' object has no attribute 'transform'").
 "$VENV_PY" -m pip install -r "$APP_DIR/requirements.txt"
+
+# ---------------------------------------------------------------------------
+# 3a. Native PDF runtime (single source of truth: tools/pdf_native_runtime.sh).
+#     WeasyPrint's pip side was just installed above; its NATIVE side (the
+#     shared libraries pango/harfbuzz/glib/fontconfig + Hindi/emoji fonts)
+#     is provisioned and PROVEN here — exact sonames loaded via ctypes,
+#     `import weasyprint`, and a tiny real Devanagari render. This runs
+#     BEFORE the service restarts so the deploy aborts loudly instead of
+#     landing a bot that starts fine but fails every result PDF with the
+#     generic "rendering library is unavailable" message. With --no-apt the
+#     host is pre-provisioned: the same verification must still PASS.
+# ---------------------------------------------------------------------------
+[ -f "$APP_DIR/tools/pdf_native_runtime.sh" ] || fail \
+  "tools/pdf_native_runtime.sh missing (checkout incomplete?). Re-run the pull step."
+if [ "$SKIP_APT" -eq 0 ]; then
+  log "Provisioning + verifying the native WeasyPrint/Pango PDF runtime (tools/pdf_native_runtime.sh) ..."
+  bash "$APP_DIR/tools/pdf_native_runtime.sh" install
+else
+  log "--no-apt: verifying the pre-provisioned native WeasyPrint/Pango PDF runtime ..."
+  bash "$APP_DIR/tools/pdf_native_runtime.sh" verify
+fi
 
 # ---------------------------------------------------------------------------
 # 3b. PDF stack self-check (runs BEFORE the service is restarted).

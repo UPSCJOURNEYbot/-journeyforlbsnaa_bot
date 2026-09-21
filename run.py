@@ -43,6 +43,39 @@ async def _run_mini_app() -> None:
     await run_mini_app_server()
 
 
+def _pdf_runtime_preflight() -> None:
+    """Fail fast — with the EXACT cause — when the native WeasyPrint/Pango
+    stack is broken, instead of booting a bot whose every quiz report
+    silently degrades to the generic "rendering library is unavailable"
+    message (the hidden runtime failure this preflight exists to kill).
+
+    The check proves all three layers: the native shared libraries load
+    (ctypes), WeasyPrint imports, and a tiny Devanagari page renders to a
+    real PDF (pdf_reports.pdf_backend_health(probe=True) — the same
+    dependency set tools/pdf_native_runtime.sh provisions).
+
+    Only enforced when the runner bot actually starts: `--only miniapp`
+    never generates quiz PDFs, so a host without the native PDF stack must
+    be allowed to run the Mini App alone (the existing "PDF not needed"
+    mode).
+    """
+    from quizbot.runner_bot import pdf_reports
+
+    health = pdf_reports.pdf_backend_health(probe=True)
+    if health["available"]:
+        logger.info(
+            "PDF native runtime OK (WeasyPrint %s) — %s",
+            health.get("weasyprint"), health.get("detail"),
+        )
+        return
+    logger.error(
+        "PDF native runtime UNAVAILABLE — every quiz result PDF would fail "
+        "with a hidden error. Refusing to start into a broken PDF backend.\n%s",
+        pdf_reports.format_pdf_backend_error(health),
+    )
+    sys.exit(1)
+
+
 async def main(only: str | None) -> None:
     problems = config.validate(bot=only or "both")
     if problems:
@@ -50,6 +83,13 @@ async def main(only: str | None) -> None:
             logger.error("Config problem: %s", p)
         logger.error("Fix the above in your .env file (see .env.example) before starting.")
         sys.exit(1)
+
+    # Native PDF backend preflight: prove WeasyPrint can actually render
+    # (native pango/harfbuzz + a tiny real PDF) BEFORE the bot goes live.
+    # Skipped for --only miniapp: the runner bot (the only quiz-PDF source)
+    # does not start in that mode.
+    if only in (None, "runner", "creator"):
+        _pdf_runtime_preflight()
 
     logger.info("Connecting to MongoDB (db=%s) ...", config.MONGODB_DB_NAME)
     await init_db(config.MONGODB_URI, config.MONGODB_DB_NAME)
