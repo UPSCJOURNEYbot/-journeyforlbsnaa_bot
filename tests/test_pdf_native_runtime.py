@@ -312,6 +312,19 @@ def _run_tool(*args: str, env=None, timeout: int = 180) -> subprocess.CompletedP
     )
 
 
+def _run_sourced_function(
+        function: str, *args: str, env=None,
+        timeout: int = 180) -> subprocess.CompletedProcess:
+    """Source the tool, then invoke one shell function in that same shell."""
+    return subprocess.run(
+        [
+            "bash", "-c", 'source "$1"; shift; "$@"',
+            "pdf-native-runtime-test", str(TOOL), function, *args,
+        ],
+        capture_output=True, text=True, env=env, timeout=timeout,
+    )
+
+
 class NativeRuntimeScriptTests(unittest.TestCase):
 
     def test_script_exists_and_syntax_is_clean(self):
@@ -336,6 +349,62 @@ class NativeRuntimeScriptTests(unittest.TestCase):
         self.assertNotIn("libgdk-pixbuf2.0-0", core)
         self.assertIn("libgdk-pixbuf-4.0-0", optional)
         self.assertIn("libgdk-pixbuf2.0-0", optional)
+
+    def test_t64_package_satisfies_canonical_package(self):
+        # Noble installs libglib2.0-0t64 when apt is asked for the canonical
+        # libglib2.0-0 name. pkg_installed must accept that concrete dpkg
+        # package while the canonical apt package list stays unchanged.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = pathlib.Path(tmp) / "bin"
+            fake_bin.mkdir()
+            fake_dpkg = fake_bin / "dpkg"
+            fake_dpkg.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                "sys.exit(0 if sys.argv[1:] == "
+                "['-s', 'libglib2.0-0t64'] else 1)\n")
+            fake_dpkg.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            r = _run_sourced_function(
+                "pkg_installed", "libglib2.0-0", env=env)
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        core = _run_tool("print-packages").stdout.split()
+        self.assertIn("libglib2.0-0", core)
+        self.assertNotIn("libglib2.0-0t64", core)
+
+    def test_genuinely_missing_package_still_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = pathlib.Path(tmp) / "bin"
+            fake_bin.mkdir()
+            fake_dpkg = fake_bin / "dpkg"
+            fake_dpkg.write_text("#!/bin/sh\nexit 1\n")
+            fake_dpkg.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            r = _run_sourced_function(
+                "pkg_installed", "libglib2.0-0", env=env)
+
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_t64_alias_cannot_satisfy_unrelated_package(self):
+        # An installed glib t64 package must not satisfy pango (or any other
+        # canonical package); aliases are exact and package-specific.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = pathlib.Path(tmp) / "bin"
+            fake_bin.mkdir()
+            fake_dpkg = fake_bin / "dpkg"
+            fake_dpkg.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                "sys.exit(0 if sys.argv[1:] == "
+                "['-s', 'libglib2.0-0t64'] else 1)\n")
+            fake_dpkg.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            r = _run_sourced_function(
+                "pkg_installed", "libpango-1.0-0", env=env)
+
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
 
     @unittest.skipIf(
         NATIVE_OK, "native stack present in this environment; the failure "
@@ -373,6 +442,31 @@ class NativeRuntimeScriptTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("already installed", r.stdout)
         self.assertNotIn("apt-get update", r.stdout)
+
+    def test_full_installed_noble_t64_scenario_is_idempotent_noop(self):
+        # Every package is installed, but Noble exposes glib only under its
+        # concrete t64 dpkg name. Direct script execution must still skip apt.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = pathlib.Path(tmp) / "bin"
+            fake_bin.mkdir()
+            fake_dpkg = fake_bin / "dpkg"
+            fake_dpkg.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                "pkg = sys.argv[2] if sys.argv[1:2] == ['-s'] "
+                "and len(sys.argv) > 2 else ''\n"
+                "sys.exit(1 if pkg == 'libglib2.0-0' else 0)\n")
+            fake_dpkg.chmod(0o755)
+            fake_apt = fake_bin / "apt-get"
+            fake_apt.write_text(
+                "#!/bin/sh\necho 'apt-get unexpectedly called' >&2\nexit 97\n")
+            fake_apt.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            r = _run_tool("install", "--no-verify", env=env, timeout=120)
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("already installed", r.stdout)
+        self.assertNotIn("unexpectedly called", r.stdout + r.stderr)
 
     def test_deploy_scripts_delegate_to_the_tool(self):
         for name in ("deploy_vps.sh", "install_and_run_final.sh",
