@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
+import threading
+import traceback
 from datetime import datetime
 from typing import Any, Literal, Optional
 
@@ -724,6 +727,211 @@ table.leaderboard .name-col { white-space: normal; text-align: left !important;
 .md-table td, .md-table th { overflow-wrap: anywhere; word-break: break-word; }
 """
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Native runtime health — the in-process counterpart of
+# tools/pdf_native_runtime.sh, which is the SINGLE SOURCE OF TRUTH for the
+# native WeasyPrint/Pango dependency set. Keep the two library lists in
+# sync (see the tool's header comment).
+#
+# Background: a host missing the native stack makes WeasyPrint raise
+# `OSError: cannot load library 'pango-1.0-0'`; without this layer that
+# surfaces only as the generic user-facing "rendering library is
+# unavailable" message with a vague operator log line. These functions give
+# the run.py startup preflight, the deploy scripts and the per-failure log
+# lines one accurate, structured diagnosis: exactly which library or import
+# failed, and the exact remediation command.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Exact sonames weasyprint/text/ffi.py dlopens at import time on Linux
+# (WeasyPrint 62.3), paired with the apt package that provides each so a
+# failure translates straight into a remediation command.
+REQUIRED_NATIVE_LIBRARIES: tuple[tuple[str, str], ...] = (
+    ("libgobject-2.0.so.0", "libglib2.0-0"),
+    ("libpango-1.0.so.0", "libpango-1.0-0"),
+    ("libpangoft2-1.0.so.0", "libpangoft2-1.0-0"),
+    ("libharfbuzz.so.0", "libharfbuzz0b"),
+    ("libfontconfig.so.1", "libfontconfig1"),
+)
+
+# Canonical remediation text; mirrors tools/pdf_native_runtime.sh's CORE set.
+PDF_RUNTIME_REMEDIATION = (
+    "sudo bash tools/pdf_native_runtime.sh install "
+    "(or: sudo apt-get install -y --no-install-recommends "
+    "libglib2.0-0 libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 "
+    "libcairo2 libharfbuzz0b libfontconfig1 fonts-noto-core fonts-deva "
+    "fonts-noto-color-emoji fonts-liberation)"
+)
+
+# Exact text of the last backend failure (render or import), kept so an
+# operator reading the journal hours later still sees the precise cause —
+# including native-library OSError text — not just the generic message that
+# was sent to the chat.
+_last_backend_error: Optional[str] = None
+_backend_error_lock = threading.Lock()
+
+
+def native_library_report() -> dict:
+    """Direct ctypes probe of the exact shared libraries WeasyPrint dlopens.
+
+    Returns {"present": {soname: loaded-path}, "missing": [(soname, apt_pkg)]}.
+    Never raises: a ctypes load failure is precisely the signal being looked
+    for (a healthy library simply loads; a missing one raises OSError).
+    """
+    import ctypes
+
+    present: dict[str, Optional[str]] = {}
+    missing: list[tuple[str, str]] = []
+    for soname, apt_pkg in REQUIRED_NATIVE_LIBRARIES:
+        try:
+            lib = ctypes.CDLL(soname)
+        except OSError:
+            missing.append((soname, apt_pkg))
+        else:
+            present[soname] = getattr(lib, "_name", None)
+    return {"present": present, "missing": missing}
+
+
+def _record_backend_error(context: str, exc: BaseException) -> None:
+    """Remember the exact underlying failure (thread-safe) for operator logs."""
+    global _last_backend_error
+    lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    text = f"[{context}] {lines[-1].strip()}"
+    with _backend_error_lock:
+        _last_backend_error = text
+
+
+def _clear_backend_error() -> None:
+    global _last_backend_error
+    with _backend_error_lock:
+        _last_backend_error = None
+
+
+def last_pdf_backend_error() -> Optional[str]:
+    """Exact text of the most recent PDF backend failure, or None."""
+    with _backend_error_lock:
+        return _last_backend_error
+
+
+def _purge_partial_weasyprint_modules() -> None:
+    """Drop half-initialised weasyprint modules after a failed import.
+
+    WeasyPrint dlopens pango late in its package __init__; a failed import
+    can leave a partially initialised module in sys.modules. Trusting it on
+    the next attempt would keep reporting stale failure state (or, worse, a
+    half module that no longer reflects a since-repaired native stack). A
+    failed import means the module is unusable, so removing every
+    weasyprint* entry is always safe: the next import re-runs from scratch.
+    """
+    for name in [n for n in sys.modules
+                 if n == "weasyprint" or n.startswith("weasyprint.")]:
+        sys.modules.pop(name, None)
+
+
+def pdf_backend_health(*, probe: bool = False) -> dict:
+    """Structured health of the in-process WeasyPrint quiz-PDF backend.
+
+    Cheap by default: ctypes load of the required native libraries plus
+    `import weasyprint`. With ``probe=True`` it additionally renders a tiny
+    Devanagari page through the real layout/PDF pipeline — the reliable
+    end-to-end check (used by the run.py startup preflight).
+
+    Returns a dict:
+      available         bool — True only when every executed step passed
+      weasyprint        installed version string, or None
+      missing_libraries list of (soname, apt_package) tuples
+      import_error      exact error text if `import weasyprint` failed
+      probe_error       exact error text if the tiny render failed
+      detail            one-line human summary
+    Never raises.
+    """
+    health: dict[str, Any] = {
+        "available": False,
+        "weasyprint": None,
+        "missing_libraries": [],
+        "import_error": None,
+        "probe_error": None,
+        "detail": "",
+    }
+
+    report = native_library_report()
+    health["missing_libraries"] = report["missing"]
+    if report["missing"]:
+        health["detail"] = (
+            "missing native libraries: "
+            + ", ".join(f"{s} ({p})" for s, p in report["missing"]))
+        return health
+
+    try:
+        import importlib
+        wp = importlib.import_module("weasyprint")
+        health["weasyprint"] = getattr(wp, "__version__", "unknown")
+    except Exception as exc:  # ImportError (pip side) or OSError (native)
+        _purge_partial_weasyprint_modules()
+        health["import_error"] = f"{type(exc).__name__}: {exc}"
+        health["detail"] = f"WeasyPrint import failed: {health['import_error']}"
+        return health
+
+    if not probe:
+        health["available"] = True
+        health["detail"] = (
+            f"weasyprint {health['weasyprint']} importable; "
+            f"{len(report['present'])}/{len(REQUIRED_NATIVE_LIBRARIES)} "
+            "native libraries load")
+        return health
+
+    try:
+        from weasyprint import HTML
+        html = ("<!doctype html><html><head><meta charset='utf-8'>"
+                "<style>@page { size: A4; margin: 2cm; }</style></head>"
+                "<body><h1>PDF backend probe</h1>"
+                "<p>भारत की राजधानी नई दिल्ली है।</p></body></html>")
+        pdf = HTML(string=html).write_pdf()
+        if not (pdf[:5] == b"%PDF-" and len(pdf) > 500):
+            raise RuntimeError(f"probe did not produce a PDF ({len(pdf)} bytes)")
+        health["available"] = True
+        health["detail"] = (
+            f"weasyprint {health['weasyprint']} renders a real PDF "
+            f"({len(pdf)} bytes, Devanagari page)")
+    except Exception as exc:
+        health["probe_error"] = f"{type(exc).__name__}: {exc}"
+        health["detail"] = f"tiny PDF probe failed: {health['probe_error']}"
+    return health
+
+
+def format_pdf_backend_error(health: Optional[dict] = None) -> str:
+    """Operator-facing diagnosis of an unavailable PDF backend.
+
+    Contains the exact underlying cause (the last recorded render/import
+    exception — including native-library OSError text — plus the current
+    structured diagnosis) and the exact remediation command. Log this with
+    ERROR severity; NEVER send it to Telegram users (they get the friendly
+    generic notice instead).
+    """
+    if health is None:
+        health = pdf_backend_health()
+    lines = ["PDF backend unavailable — quiz result PDFs cannot be generated."]
+    last = last_pdf_backend_error()
+    if last:
+        lines.append(f"Last failure detail: {last}")
+    if health["missing_libraries"]:
+        lines.append(
+            "Missing native libraries (apt package in parentheses): "
+            + ", ".join(f"{s} ({p})" for s, p in health["missing_libraries"]))
+    if health["import_error"]:
+        lines.append(f"WeasyPrint import error: {health['import_error']}")
+    if health["probe_error"]:
+        lines.append(f"Render probe error: {health['probe_error']}")
+    if health["weasyprint"]:
+        lines.append(
+            f"WeasyPrint version: {health['weasyprint']} "
+            "(pip side importable; native libraries missing or broken).")
+    lines.append(f"Remediation: {PDF_RUNTIME_REMEDIATION}")
+    lines.append(
+        "Then verify with: bash tools/pdf_native_runtime.sh verify, "
+        "and restart the service.")
+    return "\n".join(lines)
+
+
 def render_quiz_pdf(
     quiz_name: str,
     chat_title: str,
@@ -754,17 +962,29 @@ def render_quiz_pdf(
         # native stack (or a stub) made the first application a no-op.
         wp_indic_compat.apply_weasyprint_indic_actualtext_fix()
         from weasyprint import HTML
-    except ImportError:
-        logger.error("WeasyPrint not installed. Run: pip install weasyprint")
-        return False
-    except Exception as exc:  # native pango/cairo/gdk-pixbuf libs missing
-        # An ImportError is only the missing-package case; a mis-provisioned
-        # host raises OSError ("cannot load library 'pango-1.0-0'") instead.
-        # Degrade to a failure result (caller reports a generic message)
-        # rather than crashing the quiz-end flow in an executor thread.
+    except ImportError as exc:
+        # The pip package itself is missing (or a partial import left no
+        # HTML). Record the exact error so the operator log shows the
+        # precise cause + remediation, then degrade to a failure result
+        # (caller reports the generic user-facing message) rather than
+        # crashing the quiz-end flow in an executor thread.
+        _record_backend_error("weasyprint-import", exc)
+        _purge_partial_weasyprint_modules()
         logger.error(
-            "WeasyPrint unavailable (native rendering libraries missing? "
-            "install pango/cairo/gdk-pixbuf): %s", exc)
+            "WeasyPrint not installed (pip package missing). Run: "
+            "pip install weasyprint. Exact error: %s", exc, exc_info=True)
+        return False
+    except Exception as exc:  # native pango/glib/harfbuzz libs missing
+        # A mis-provisioned host raises OSError ("cannot load library
+        # 'pango-1.0-0'") at import time. Capture the EXACT exception (it
+        # names the missing library) plus remediation for the operator log;
+        # the chat only ever sees the generic friendly message.
+        _record_backend_error("weasyprint-import", exc)
+        _purge_partial_weasyprint_modules()
+        logger.error(
+            "WeasyPrint import failed — native rendering stack unavailable. "
+            "Exact error: %s | Remediation: %s",
+            exc, PDF_RUNTIME_REMEDIATION, exc_info=True)
         return False
 
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
@@ -833,7 +1053,14 @@ def render_quiz_pdf(
 
     try:
         HTML(string=html_content, base_url=".").write_pdf(output_path)
+        _clear_backend_error()
         return True
     except Exception as e:
-        logger.error("WeasyPrint PDF generation failed: %s", e, exc_info=True)
+        # Keep the EXACT exception (pydyf drift, font errors, native
+        # failures at render time, ...) in the operator log with remediation
+        # — the chat-facing path only ever sends the generic notice.
+        _record_backend_error("pdf-render", e)
+        logger.error(
+            "WeasyPrint PDF generation failed: %s | Remediation: %s",
+            e, PDF_RUNTIME_REMEDIATION, exc_info=True)
         return False

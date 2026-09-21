@@ -3,12 +3,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-echo "[1/4] Stopping only this bot..."
+echo "[1/5] Stopping only this bot..."
 pkill -f '[.]venv/bin/python run.py' 2>/dev/null || true
 pkill -f '[p]ython run.py' 2>/dev/null || true
 sleep 1
 
-echo "[2/4] Verifying SINGLE-BOT build..."
+echo "[2/5] Verifying SINGLE-BOT build..."
 ./.venv/bin/python - <<'PY'
 from pathlib import Path
 p=Path('run.py').read_text()
@@ -18,7 +18,7 @@ assert 'register_creator_bridge(application)' in Path('quizbot/runner_bot/bot.py
 print('OK: one Telegram polling client')
 PY
 
-echo "[3/4] Checking environment..."
+echo "[3/5] Checking environment..."
 if [ ! -f .env ]; then echo 'ERROR: .env missing; restore your existing .env first.'; exit 1; fi
 ./.venv/bin/python - <<'PY'
 from pathlib import Path
@@ -32,6 +32,13 @@ if not t: raise SystemExit('ERROR: no bot token found in .env')
 print('OK: bot token present (value hidden)')
 PY
 
-echo "[4/4] Installing requirements and starting..."
+echo "[4/5] Installing requirements..."
 ./.venv/bin/pip install -q -r requirements.txt
+
+echo "[5/5] Provisioning + verifying the native WeasyPrint/Pango PDF runtime..."
+# Single source of truth: tools/pdf_native_runtime.sh. Provisions the exact
+# native library + font set and proves a real WeasyPrint render in this
+# venv, so the bot never starts into a hidden per-quiz PDF failure.
+bash tools/pdf_native_runtime.sh install
+
 exec ./.venv/bin/python run.py

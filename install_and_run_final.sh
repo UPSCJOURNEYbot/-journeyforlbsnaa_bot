@@ -47,4 +47,11 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   fi
 fi
 
+# Native WeasyPrint/Pango PDF runtime (single source of truth:
+# tools/pdf_native_runtime.sh). Provisions the exact native library + font
+# set, then proves a real WeasyPrint render in this venv — aborting here
+# instead of letting the bot start and fail every quiz report with the
+# generic "rendering library is unavailable" message.
+bash tools/pdf_native_runtime.sh install
+
 exec .venv/bin/python run.py
